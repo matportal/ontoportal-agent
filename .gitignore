@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+
+# Python environments
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
