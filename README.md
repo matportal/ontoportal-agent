@@ -11,7 +11,7 @@ Additional documentation lives under `docs/`:
 - `docs/architecture.md` and `docs/developer-guide.md` - internals and extension points
 
 ## Highlights
-- **Retrieval Augmented Generation (RAG)** - Delegates fact-finding to the local `ontoportal-rag`
+- **Retrieval Augmented Generation (RAG)** - Delegates fact-finding to the local `ontoportal-rag-mcp`
   FastAPI service and returns fully cited answers.
 - **Guided editing plans** - Uses LangGraph to classify intents, script ontology mutations, and
   capture change notes before publication.
@@ -79,7 +79,7 @@ Core modules:
 
 ### Prerequisites
 - Python >= 3.11
-- Access to a running OntoPortal RAG FastAPI service (see the separate `ontoportal-rag` project)
+- Access to a running OntoPortal RAG FastAPI service (see the separate `ontoportal-rag-mcp` project)
 - OntoPortal REST API key with submission privileges
 - OpenAI-compatible chat completion model (default: `gpt-4o-mini`)
 
@@ -100,6 +100,8 @@ ONTOAGENT_ONTOPORTAL_API_KEY=matportal-key
 ONTOAGENT_RAG_BASE_URL=http://localhost:8000
 ONTOAGENT_RAG_QUERY_PATH=/api/v1/query
 ONTOAGENT_ONTOLOGY_WORKDIR=/tmp/ontoportal-agent
+ONTOAGENT_MCP_API_KEY=change-me
+ONTOAGENT_MCP_RAG_TOOL_NAME=rag_query
 # Optional overrides
 ONTOAGENT_OPENAI_API_BASE=https://api.openai.com/v1
 ONTOAGENT_LLM_MODEL=gpt-4o-mini
@@ -141,8 +143,10 @@ automatically after sandbox execution.
 
 ### Working with MCP tools
 The agent loads MCP endpoints from `ONTOAGENT_MCP_ENDPOINTS` (comma-separated). Each endpoint must
-expose `/tools` and `/invoke`. The default points to the `ontoportal-rag` MCP adapter at
-`http://localhost:8000/mcp`. Once configured, MCP tools appear in planning outputs and can be
+expose `/tools` and `/invoke`. The default points to the `ontoportal-rag-mcp` MCP adapter at
+`http://localhost:8000/mcp`. Configure `ONTOAGENT_MCP_API_KEY` when the MCP endpoint is protected.
+Use `ONTOAGENT_MCP_RAG_TOOL_NAME` if your MCP server exposes retrieval under a different tool name.
+Once configured, MCP tools appear in planning outputs and can be
 invoked from sandbox code or follow-up actions.
 
 ---
@@ -201,7 +205,7 @@ pytest
 API) to exercise the entire plan/execute/publish loop end-to-end.
 
 ### Troubleshooting tips
-- **Missing citations or slow responses** - Verify the `ontoportal-rag` FastAPI service is running
+- **Missing citations or slow responses** - Verify the `ontoportal-rag-mcp` FastAPI service is running
   and reachable at `ONTOAGENT_RAG_BASE_URL`.
 - **Sandbox failures** - The agent captures stdout from each action; inspect the summary in the
   approval message or open the generated artifacts directly.

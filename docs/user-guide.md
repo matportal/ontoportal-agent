@@ -5,7 +5,7 @@ publishing ontology updates, and extending capabilities with Model Context Proto
 
 ## Prerequisites
 - Python >= 3.11
-- Access to the OntoPortal RAG FastAPI service (see the standalone `ontoportal-rag` project)
+- Access to the OntoPortal RAG FastAPI service (see the standalone `ontoportal-rag-mcp` project)
 - OntoPortal REST API key with submission privileges
 - OpenAI-compatible chat completion model (defaults to `gpt-4o-mini`)
 
@@ -32,6 +32,8 @@ Create `.env` alongside `pyproject.toml` and set the variables you need. Prefixe
 | `ONTOAGENT_ONTOLOGY_WORKDIR` | `ONTOLOGY_WORKDIR` | `/tmp/ontoportal-agent` | Workspace root for sandbox artifacts. |
 | `ONTOAGENT_REQUIRE_MANUAL_APPROVAL` | `REQUIRE_MANUAL_APPROVAL` | `true` | Forces manual review before publishing. |
 | `ONTOAGENT_MCP_ENDPOINTS` | `MCP_ENDPOINTS` | `<RAG_BASE_URL>/mcp` | Comma-separated list of MCP base URLs. |
+| `ONTOAGENT_MCP_API_KEY` | `MCP_API_KEY` | _(unset)_ | Optional shared API key sent as `X-API-Key` for protected MCP endpoints. |
+| `ONTOAGENT_MCP_RAG_TOOL_NAME` | `MCP_RAG_TOOL_NAME` | `rag_query` | MCP tool name used for retrieval before HTTP fallback. |
 
 Example `.env`:
 
@@ -41,6 +43,7 @@ ONTOAGENT_ONTOPORTAL_API_KEY=matportal-key
 ONTOAGENT_RAG_BASE_URL=http://localhost:8000
 ONTOAGENT_REQUIRE_MANUAL_APPROVAL=true
 ONTOAGENT_MCP_ENDPOINTS=http://localhost:8000/mcp
+ONTOAGENT_MCP_API_KEY=change-me
 ```
 
 ## Launch the Chat Interface
@@ -79,8 +82,9 @@ artifacts automatically after sandbox execution and publish-phase validation.
 
 ## Working with MCP Tools
 - Define additional endpoints via `ONTOAGENT_MCP_ENDPOINTS=http://example.com/mcp,http://other/mcp`.
-- Each endpoint must expose `/tools` and `/invoke` in the same style as the `ontoportal-rag`
+- Each endpoint must expose `/tools` and `/invoke` in the same style as the `ontoportal-rag-mcp`
   implementation.
+- Set `ONTOAGENT_MCP_API_KEY` when MCP endpoints enforce key-based authentication.
 - The agent lists available tools during plan generation. Leverage them in follow-up prompts or
   inside sandbox code to tap into downstream services.
 

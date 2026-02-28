@@ -40,7 +40,10 @@ Key directories:
 ## Configuration & MCP Integration
 - Runtime settings are provided through environment variables prefixed with `ONTOAGENT_`.
 - If `ONTOAGENT_MCP_ENDPOINTS` is not set, the agent automatically points to the OntoPortal RAG MCP
-  adapter at `<ONTOAGENT_RAG_BASE_URL>/mcp`.
+  adapter at `<ONTOAGENT_RAG_BASE_URL>/mcp` (`ontoportal-rag-mcp`).
+- `ONTOAGENT_MCP_API_KEY` is forwarded as `X-API-Key` for protected MCP endpoints.
+- Retrieval prefers the MCP `rag_query` tool and falls back to the legacy HTTP endpoint when MCP
+  invocation fails.
 - Register additional MCP endpoints to expose auxiliary tools (e.g. metadata enrichment, validation
   services) without modifying the agent code.
 
