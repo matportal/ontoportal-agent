@@ -106,7 +106,14 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
             ),
         ]
         reply = llm.invoke(messages)
-        state["final_response"] = reply.content
+        llm_content = reply.content if isinstance(reply.content, str) else str(reply.content or "")
+        if llm_content.strip():
+            state["final_response"] = llm_content
+            state["generation_backend"] = f"llm:{settings.llm_model}"
+        else:
+            state["final_response"] = ""
+            state["generation_backend"] = "none"
+            state["generation_error"] = "LLM returned empty content"
         return state
 
     def plan_edit(state: AgentState) -> AgentState:

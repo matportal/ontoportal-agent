@@ -18,3 +18,5 @@ class AgentState(TypedDict, total=False):
     final_response: Optional[str]
     retrieval_backend: Optional[str]
     retrieval_error: Optional[str]
+    generation_backend: Optional[str]
+    generation_error: Optional[str]

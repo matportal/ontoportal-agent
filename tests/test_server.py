@@ -26,6 +26,7 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace(internal_api_token=None))
     dummy_state = {
         "retrieval_backend": "mcp",
+        "generation_backend": "llm:test-model",
         "citations": ["TEST v1"],
         "final_response": "Aluminium is a metallic element.",
     }
@@ -49,6 +50,7 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     assert "text/event-stream" in response.headers["content-type"]
     assert "Assistant request received" in response.text
     assert "retrieval_backend=mcp" in response.text
+    assert "generation_backend=llm:test-model" in response.text
     assert "Aluminium is a metallic element." in response.text
     assert "[DONE]" in response.text
     assert seen["payload"] == {"user_input": "What is aluminium?"}

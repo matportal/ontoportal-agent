@@ -92,6 +92,14 @@ def chat_stream(
             if retrieval_error:
                 yield _sse({"type": "terminal_log", "content": f"retrieval_error={retrieval_error}"})
 
+            generation_backend = final_state.get("generation_backend")
+            if generation_backend:
+                yield _sse({"type": "terminal_log", "content": f"generation_backend={generation_backend}"})
+
+            generation_error = final_state.get("generation_error")
+            if generation_error:
+                yield _sse({"type": "terminal_log", "content": f"generation_error={generation_error}"})
+
             sandbox_output = final_state.get("sandbox_output")
             if sandbox_output:
                 for line in str(sandbox_output).splitlines():
