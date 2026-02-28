@@ -4,14 +4,14 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableLambda
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from rdflib import Graph
 
 from ..config import get_settings
+from ..mcp_client import McpClient, McpInvocationError
 from ..ontology_repository import OntologyRepository, OntologyArtifact
 from ..publishing import OntoPortalPublisher
 from ..rag_client import RagClient
@@ -26,6 +26,10 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
         base_url=settings.openai_api_base,
         model=settings.llm_model,
         temperature=0.0,
+    )
+    mcp_client = McpClient(
+        settings.resolved_mcp_endpoints(),
+        api_key=settings.mcp_api_key,
     )
     rag_client = RagClient()
     publisher = OntoPortalPublisher()
@@ -49,7 +53,26 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
         return state
 
     def retrieve_answer(state: AgentState) -> AgentState:
-        result = rag_client.query(state["user_input"])
+        question = state["user_input"]
+
+        try:
+            mcp_payload = mcp_client.invoke_rag_query(
+                question,
+                tool_name=settings.mcp_rag_tool_name,
+            )
+            sources = mcp_payload.get("sources", [])
+            state["rag_result"] = mcp_payload.get("answer", "")
+            state["citations"] = [
+                f"{src.get('ontology_id', 'unknown')} v{src.get('version', 'unknown')}"
+                for src in sources
+            ]
+            state["retrieval_backend"] = "mcp"
+            return state
+        except (McpInvocationError, KeyError, TypeError, ValueError) as err:
+            state["retrieval_backend"] = "rag-http-fallback"
+            state["retrieval_error"] = str(err)
+
+        result = rag_client.query(question)
         state["rag_result"] = result.answer
         state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
         return state
@@ -210,7 +233,7 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
     graph.set_entry_point("classify")
     graph.add_conditional_edges(
         "classify",
-        RunnableLambda(lambda state: state["intent"]),
+        lambda state: state["intent"],
         {
             "RETRIEVE": "retrieve",
             "EDIT": "plan_edit",
@@ -222,7 +245,7 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
     graph.add_edge("execute_actions", "await_approval")
     graph.add_conditional_edges(
         "await_approval",
-        RunnableLambda(lambda state: "publish" if state.get("auto_publish") else "end"),
+        lambda state: "publish" if state.get("auto_publish") else "end",
         {
             "publish": "publish",
             "end": END,

@@ -34,6 +34,8 @@ class AgentSettings(BaseSettings):
 
     # Model Context Protocol endpoints (comma-separated)
     mcp_endpoints: List[str] = Field(default_factory=list, alias="MCP_ENDPOINTS")
+    mcp_api_key: Optional[str] = Field(default=None, alias="MCP_API_KEY")
+    mcp_rag_tool_name: str = Field(default="rag_query", alias="MCP_RAG_TOOL_NAME")
 
     @field_validator("mcp_endpoints", mode="before")
     @classmethod
