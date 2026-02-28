@@ -120,48 +120,23 @@ def chat_stream(
                     if not isinstance(update, dict):
                         continue
                     for node_name, node_state in update.items():
-                        yield _sse({"type": "terminal_log", "content": f"reasoning_step={node_name}"})
                         if isinstance(node_state, dict):
                             final_state.update(node_state)
-                            if node_name == "classify" and node_state.get("intent"):
-                                yield _sse({"type": "terminal_log", "content": f"intent={node_state['intent']}"})
-                            if node_name == "retrieve" and node_state.get("retrieval_backend"):
-                                yield _sse(
-                                    {
-                                        "type": "terminal_log",
-                                        "content": f"retrieval_backend={node_state['retrieval_backend']}",
-                                    }
-                                )
 
-            retrieval_backend = final_state.get("retrieval_backend")
-            if retrieval_backend:
-                yield _sse({"type": "terminal_log", "content": f"retrieval_backend={retrieval_backend}"})
-
-            retrieval_error = final_state.get("retrieval_error")
-            if retrieval_error:
-                yield _sse({"type": "terminal_log", "content": f"retrieval_error={retrieval_error}"})
-
-            generation_backend = final_state.get("generation_backend")
-            if generation_backend:
-                yield _sse({"type": "terminal_log", "content": f"generation_backend={generation_backend}"})
-
-            generation_error = final_state.get("generation_error")
-            if generation_error:
-                yield _sse({"type": "terminal_log", "content": f"generation_error={generation_error}"})
+            model_reasoning = final_state.get("generation_reasoning")
+            if model_reasoning:
+                yield _sse({"type": "model_reasoning", "content": str(model_reasoning)})
 
             generation_usage = final_state.get("generation_usage")
             if isinstance(generation_usage, dict):
-                for key in ("model", "prompt_tokens", "completion_tokens", "reasoning_tokens", "total_tokens"):
-                    value = generation_usage.get(key)
-                    if value is not None:
-                        yield _sse({"type": "terminal_log", "content": f"generation_{key}={value}"})
+                yield _sse({"type": "usage", "content": generation_usage})
 
             sandbox_output = final_state.get("sandbox_output")
             if sandbox_output:
                 for line in str(sandbox_output).splitlines():
                     clean = line.strip()
                     if clean:
-                        yield _sse({"type": "terminal_log", "content": clean})
+                        yield _sse({"type": "status", "message": clean})
 
             final_response = (
                 final_state.get("final_response")
@@ -172,13 +147,7 @@ def chat_stream(
                 yield _sse({"type": "delta", "content": chunk})
         except Exception as exc:  # pragma: no cover - smoke tests cover happy path.
             logger.exception("Assistant stream failed: %s", exc)
-            yield _sse(
-                {
-                    "type": "status",
-                    "message": "Assistant backend failed while handling the request.",
-                }
-            )
-            yield _sse({"type": "terminal_log", "content": str(exc)})
+            yield _sse({"type": "delta", "content": "Assistant backend failed while handling the request."})
         yield _sse_done()
 
     return StreamingResponse(

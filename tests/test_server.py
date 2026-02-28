@@ -25,8 +25,7 @@ def test_chat_stream_requires_internal_token_when_configured(monkeypatch):
 def test_chat_stream_emits_sse_payload(monkeypatch):
     monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace(internal_api_token=None))
     dummy_state = {
-        "retrieval_backend": "mcp",
-        "generation_backend": "llm:test-model",
+        "generation_reasoning": "- Picked BWMD because it has explicit Aluminium classes.",
         "generation_usage": {
             "model": "test-model",
             "prompt_tokens": 12,
@@ -59,13 +58,11 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
     assert "Assistant request received" in response.text
-    assert "retrieval_backend=mcp" in response.text
-    assert "generation_backend=llm:test-model" in response.text
-    assert "generation_model=test-model" in response.text
-    assert "generation_prompt_tokens=12" in response.text
-    assert "generation_completion_tokens=34" in response.text
-    assert "generation_reasoning_tokens=7" in response.text
-    assert "generation_total_tokens=46" in response.text
+    assert "\"type\": \"model_reasoning\"" in response.text
+    assert "Picked BWMD because it has explicit Aluminium classes." in response.text
+    assert "\"type\": \"usage\"" in response.text
+    assert "\"model\": \"test-model\"" in response.text
+    assert "\"reasoning_tokens\": 7" in response.text
     assert "Aluminium is a metallic element." in response.text
     assert "[DONE]" in response.text
     assert seen["payload"] == {"user_input": "What is aluminium?"}

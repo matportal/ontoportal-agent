@@ -21,3 +21,4 @@ class AgentState(TypedDict, total=False):
     generation_backend: Optional[str]
     generation_error: Optional[str]
     generation_usage: Optional[Dict[str, Any]]
+    generation_reasoning: Optional[str]

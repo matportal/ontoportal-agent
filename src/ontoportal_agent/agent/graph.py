@@ -48,6 +48,40 @@ def _extract_generation_usage(reply: Any) -> Dict[str, Any]:
     return {key: value for key, value in usage.items() if value is not None}
 
 
+def _flatten_reasoning(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_flatten_reasoning(item) for item in value]
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        for key in ("summary", "text", "content", "reasoning", "reasoning_text", "reasoning_content"):
+            if key in value:
+                return _flatten_reasoning(value.get(key))
+        parts = [_flatten_reasoning(item) for item in value.values()]
+        return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
+def _extract_generation_reasoning(reply: Any) -> str:
+    additional_kwargs = getattr(reply, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        for key in ("reasoning", "reasoning_content", "reasoning_text", "thinking"):
+            reasoning = _flatten_reasoning(additional_kwargs.get(key))
+            if reasoning:
+                return reasoning
+
+    response_metadata = getattr(reply, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        for key in ("reasoning", "reasoning_content", "reasoning_text"):
+            reasoning = _flatten_reasoning(response_metadata.get(key))
+            if reasoning:
+                return reasoning
+    return ""
+
+
 def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
     settings = get_settings()
     llm = ChatOpenAI(
@@ -154,15 +188,43 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
         reply = llm.invoke(messages)
         llm_content = reply.content if isinstance(reply.content, str) else str(reply.content or "")
         state["generation_usage"] = _extract_generation_usage(reply)
+        reasoning_text = _extract_generation_reasoning(reply)
         if llm_content.strip():
             if len(llm_content) > settings.max_response_chars:
                 llm_content = llm_content[: settings.max_response_chars].rstrip() + "..."
             state["final_response"] = llm_content
             state["generation_backend"] = f"llm:{settings.llm_model}"
+            if not reasoning_text:
+                reasoning_prompt = [
+                    SystemMessage(
+                        content=(
+                            "Write a concise reasoning summary for the user-visible answer.\n"
+                            "Rules:\n"
+                            "- Use 2-4 short bullet points.\n"
+                            "- Explain why the answer was selected.\n"
+                            "- Do not reveal hidden chain-of-thought.\n"
+                            "- Do not introduce facts outside the provided answer/citations."
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Question: {question}\n"
+                            f"Answer: {llm_content}\n"
+                            f"Citations:\n{citation_text}"
+                        )
+                    ),
+                ]
+                try:
+                    summary_reply = llm.invoke(reasoning_prompt)
+                    reasoning_text = summary_reply.content if isinstance(summary_reply.content, str) else str(summary_reply.content or "")
+                except Exception:  # noqa: BLE001 - reasoning summary is optional.
+                    reasoning_text = ""
         else:
             state["final_response"] = ""
             state["generation_backend"] = "none"
             state["generation_error"] = "LLM returned empty content"
+        if reasoning_text.strip():
+            state["generation_reasoning"] = reasoning_text.strip()
         return state
 
     def plan_edit(state: AgentState) -> AgentState:
