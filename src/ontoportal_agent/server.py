@@ -100,6 +100,13 @@ def chat_stream(
             if generation_error:
                 yield _sse({"type": "terminal_log", "content": f"generation_error={generation_error}"})
 
+            generation_usage = final_state.get("generation_usage")
+            if isinstance(generation_usage, dict):
+                for key in ("model", "prompt_tokens", "completion_tokens", "reasoning_tokens", "total_tokens"):
+                    value = generation_usage.get(key)
+                    if value is not None:
+                        yield _sse({"type": "terminal_log", "content": f"generation_{key}={value}"})
+
             sandbox_output = final_state.get("sandbox_output")
             if sandbox_output:
                 for line in str(sandbox_output).splitlines():

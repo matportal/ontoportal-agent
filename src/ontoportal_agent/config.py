@@ -31,6 +31,14 @@ class AgentSettings(BaseSettings):
         default="gpt-4o-mini",
         validation_alias=AliasChoices("ONTOAGENT_LLM_MODEL", "LLM_MODEL"),
     )
+    max_rag_context_chars: int = Field(
+        default=12000,
+        validation_alias=AliasChoices("ONTOAGENT_MAX_RAG_CONTEXT_CHARS", "MAX_RAG_CONTEXT_CHARS"),
+    )
+    max_response_chars: int = Field(
+        default=2400,
+        validation_alias=AliasChoices("ONTOAGENT_MAX_RESPONSE_CHARS", "MAX_RESPONSE_CHARS"),
+    )
 
     # RAG endpoint
     rag_base_url: str = Field(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 
 class AgentState(TypedDict, total=False):
@@ -20,3 +20,4 @@ class AgentState(TypedDict, total=False):
     retrieval_error: Optional[str]
     generation_backend: Optional[str]
     generation_error: Optional[str]
+    generation_usage: Optional[Dict[str, Any]]

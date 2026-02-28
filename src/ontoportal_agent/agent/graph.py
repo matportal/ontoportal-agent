@@ -19,6 +19,35 @@ from ..sandbox import PythonSandbox
 from .state import AgentState
 
 
+def _extract_generation_usage(reply: Any) -> Dict[str, Any]:
+    usage: Dict[str, Any] = {}
+
+    usage_metadata = getattr(reply, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        usage["prompt_tokens"] = usage_metadata.get("input_tokens")
+        usage["completion_tokens"] = usage_metadata.get("output_tokens")
+        usage["total_tokens"] = usage_metadata.get("total_tokens")
+        output_details = usage_metadata.get("output_token_details")
+        if isinstance(output_details, dict):
+            usage["reasoning_tokens"] = output_details.get("reasoning")
+
+    response_metadata = getattr(reply, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        token_usage = response_metadata.get("token_usage")
+        if isinstance(token_usage, dict):
+            usage["prompt_tokens"] = usage.get("prompt_tokens") or token_usage.get("prompt_tokens")
+            usage["completion_tokens"] = usage.get("completion_tokens") or token_usage.get("completion_tokens")
+            usage["total_tokens"] = usage.get("total_tokens") or token_usage.get("total_tokens")
+
+            completion_details = token_usage.get("completion_tokens_details")
+            if isinstance(completion_details, dict):
+                usage["reasoning_tokens"] = usage.get("reasoning_tokens") or completion_details.get("reasoning_tokens")
+            usage["reasoning_tokens"] = usage.get("reasoning_tokens") or token_usage.get("reasoning_tokens")
+        usage["model"] = response_metadata.get("model_name") or response_metadata.get("model")
+
+    return {key: value for key, value in usage.items() if value is not None}
+
+
 def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
     settings = get_settings()
     llm = ChatOpenAI(
@@ -88,26 +117,46 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
         return state
 
     def generate_response(state: AgentState) -> AgentState:
+        question = state["user_input"]
+        rag_result = state.get("rag_result", "") or ""
+        if len(rag_result) > settings.max_rag_context_chars:
+            rag_result = rag_result[: settings.max_rag_context_chars]
+
         citations = state.get("citations", [])
         citation_text = "\n".join(f"- {c}" for c in citations) if citations else "- none"
         retrieval_backend = state.get("retrieval_backend", "unknown")
         retrieval_error = state.get("retrieval_error", "")
         messages = [
-            SystemMessage(content="You are the OntoPortal assistant."),
+            SystemMessage(
+                content=(
+                    "You are the MatPortal ontology assistant.\n"
+                    "Rules:\n"
+                    "- Be concise and readable.\n"
+                    "- Use short paragraphs or bullets only.\n"
+                    "- Do not use markdown tables unless the user explicitly asks for a table.\n"
+                    "- Do not include code blocks unless the user asks for code.\n"
+                    "- Never invent ontology names, class URIs, or facts not present in the retrieved context.\n"
+                    "- If evidence is weak or missing, state uncertainty clearly.\n"
+                    "- For recommendation questions, return up to 3 options with a one-line reason each."
+                )
+            ),
             HumanMessage(
                 content=(
-                    f"Question: {state['user_input']}\n"
-                    f"RAG Answer: {state.get('rag_result', '')}\n"
+                    f"Question: {question}\n"
+                    f"Retrieved context: {rag_result}\n"
                     f"Retrieval backend: {retrieval_backend}\n"
                     f"Retrieval error: {retrieval_error}\n"
                     f"Citations:\n{citation_text}\n"
-                    "Respond directly to the user, referencing citations when relevant."
+                    "Write a direct answer for the user."
                 )
             ),
         ]
         reply = llm.invoke(messages)
         llm_content = reply.content if isinstance(reply.content, str) else str(reply.content or "")
+        state["generation_usage"] = _extract_generation_usage(reply)
         if llm_content.strip():
+            if len(llm_content) > settings.max_response_chars:
+                llm_content = llm_content[: settings.max_response_chars].rstrip() + "..."
             state["final_response"] = llm_content
             state["generation_backend"] = f"llm:{settings.llm_model}"
         else:

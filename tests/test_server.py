@@ -27,6 +27,13 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     dummy_state = {
         "retrieval_backend": "mcp",
         "generation_backend": "llm:test-model",
+        "generation_usage": {
+            "model": "test-model",
+            "prompt_tokens": 12,
+            "completion_tokens": 34,
+            "reasoning_tokens": 7,
+            "total_tokens": 46,
+        },
         "citations": ["TEST v1"],
         "final_response": "Aluminium is a metallic element.",
     }
@@ -51,6 +58,11 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     assert "Assistant request received" in response.text
     assert "retrieval_backend=mcp" in response.text
     assert "generation_backend=llm:test-model" in response.text
+    assert "generation_model=test-model" in response.text
+    assert "generation_prompt_tokens=12" in response.text
+    assert "generation_completion_tokens=34" in response.text
+    assert "generation_reasoning_tokens=7" in response.text
+    assert "generation_total_tokens=46" in response.text
     assert "Aluminium is a metallic element." in response.text
     assert "[DONE]" in response.text
     assert seen["payload"] == {"user_input": "What is aluminium?"}
