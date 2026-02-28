@@ -34,6 +34,7 @@ Create `.env` alongside `pyproject.toml` and set the variables you need. Prefixe
 | `ONTOAGENT_MCP_ENDPOINTS` | `MCP_ENDPOINTS` | `<RAG_BASE_URL>/mcp` | Comma-separated list of MCP base URLs. |
 | `ONTOAGENT_MCP_API_KEY` | `MCP_API_KEY` | _(unset)_ | Optional shared API key sent as `X-API-Key` for protected MCP endpoints. |
 | `ONTOAGENT_MCP_RAG_TOOL_NAME` | `MCP_RAG_TOOL_NAME` | `rag_query` | MCP tool name used for retrieval before HTTP fallback. |
+| `ONTOAGENT_INTERNAL_API_TOKEN` | `INTERNAL_API_TOKEN` | _(unset)_ | Optional shared secret expected as `X-Internal-Token` by the streaming API. |
 
 Example `.env`:
 
@@ -44,12 +45,21 @@ ONTOAGENT_RAG_BASE_URL=http://localhost:8000
 ONTOAGENT_REQUIRE_MANUAL_APPROVAL=true
 ONTOAGENT_MCP_ENDPOINTS=http://localhost:8000/mcp
 ONTOAGENT_MCP_API_KEY=change-me
+ONTOAGENT_INTERNAL_API_TOKEN=change-me
 ```
 
 ## Launch the Chat Interface
 ```bash
 python -m ontoportal_agent.cli chat
 ```
+
+## Launch the Streaming API
+```bash
+python -m ontoportal_agent.server
+```
+
+- Health check: `GET /healthz`
+- UI stream endpoint: `POST /api/v1/chat/stream`
 
 Sample session:
 

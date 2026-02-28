@@ -72,20 +72,34 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
             state["retrieval_backend"] = "rag-http-fallback"
             state["retrieval_error"] = str(err)
 
-        result = rag_client.query(question)
-        state["rag_result"] = result.answer
-        state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+        try:
+            result = rag_client.query(question)
+            state["rag_result"] = result.answer
+            state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+        except Exception as err:  # noqa: BLE001 - we intentionally degrade to non-RAG response.
+            state["retrieval_backend"] = "none"
+            existing_error = state.get("retrieval_error")
+            if existing_error:
+                state["retrieval_error"] = f"{existing_error}; fallback failed: {err}"
+            else:
+                state["retrieval_error"] = str(err)
+            state["rag_result"] = ""
+            state["citations"] = []
         return state
 
     def generate_response(state: AgentState) -> AgentState:
         citations = state.get("citations", [])
         citation_text = "\n".join(f"- {c}" for c in citations) if citations else "- none"
+        retrieval_backend = state.get("retrieval_backend", "unknown")
+        retrieval_error = state.get("retrieval_error", "")
         messages = [
             SystemMessage(content="You are the OntoPortal assistant."),
             HumanMessage(
                 content=(
                     f"Question: {state['user_input']}\n"
                     f"RAG Answer: {state.get('rag_result', '')}\n"
+                    f"Retrieval backend: {retrieval_backend}\n"
+                    f"Retrieval error: {retrieval_error}\n"
                     f"Citations:\n{citation_text}\n"
                     "Respond directly to the user, referencing citations when relevant."
                 )

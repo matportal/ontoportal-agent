@@ -102,6 +102,7 @@ ONTOAGENT_RAG_QUERY_PATH=/api/v1/query
 ONTOAGENT_ONTOLOGY_WORKDIR=/tmp/ontoportal-agent
 ONTOAGENT_MCP_API_KEY=change-me
 ONTOAGENT_MCP_RAG_TOOL_NAME=rag_query
+ONTOAGENT_INTERNAL_API_TOKEN=change-me
 # Optional overrides
 ONTOAGENT_OPENAI_API_BASE=https://api.openai.com/v1
 ONTOAGENT_LLM_MODEL=gpt-4o-mini
@@ -116,6 +117,16 @@ Environment keys are documented in `src/ontoportal_agent/config.py`. They accept
 ```bash
 python -m ontoportal_agent.cli chat
 ```
+
+### Launch the streaming API for the web UI
+```bash
+python -m ontoportal_agent.server
+```
+
+The endpoint used by the Rails assistant UI is:
+- `POST /api/v1/chat/stream` (Server-Sent Events response)
+
+When `ONTOAGENT_INTERNAL_API_TOKEN` is set, clients must send it as `X-Internal-Token`.
 
 Sample session:
 ```

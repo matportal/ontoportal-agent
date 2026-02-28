@@ -4,38 +4,85 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class AgentSettings(BaseSettings):
     """Runtime configuration for the OntoPortal agent."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="ONTOAGENT_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="ONTOAGENT_",
+        extra="ignore",
+        enable_decoding=False,
+    )
 
     # LLM settings
-    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
-    openai_api_base: Optional[str] = Field(default=None, alias="OPENAI_API_BASE")
-    llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    openai_api_key: str = Field(
+        ...,
+        validation_alias=AliasChoices("ONTOAGENT_OPENAI_API_KEY", "OPENAI_API_KEY"),
+    )
+    openai_api_base: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_OPENAI_API_BASE", "OPENAI_API_BASE"),
+    )
+    llm_model: str = Field(
+        default="gpt-4o-mini",
+        validation_alias=AliasChoices("ONTOAGENT_LLM_MODEL", "LLM_MODEL"),
+    )
 
     # RAG endpoint
-    rag_base_url: str = Field(default="http://localhost:8000", alias="RAG_BASE_URL")
-    rag_query_path: str = Field(default="/api/v1/query", alias="RAG_QUERY_PATH")
+    rag_base_url: str = Field(
+        default="http://localhost:8000",
+        validation_alias=AliasChoices("ONTOAGENT_RAG_BASE_URL", "RAG_BASE_URL"),
+    )
+    rag_query_path: str = Field(
+        default="/api/v1/query",
+        validation_alias=AliasChoices("ONTOAGENT_RAG_QUERY_PATH", "RAG_QUERY_PATH"),
+    )
 
     # OntoPortal REST API
-    ontoportal_api_base: str = Field(default="https://rest.matportal.org", alias="ONTOPORTAL_API_BASE")
-    ontoportal_api_key: str = Field(..., alias="ONTOPORTAL_API_KEY")
+    ontoportal_api_base: str = Field(
+        default="https://rest.matportal.org",
+        validation_alias=AliasChoices("ONTOAGENT_ONTOPORTAL_API_BASE", "ONTOPORTAL_API_BASE"),
+    )
+    ontoportal_api_key: str = Field(
+        ...,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOPORTAL_API_KEY", "ONTOPORTAL_API_KEY"),
+    )
 
     # Workspace
-    ontology_workdir: Path = Field(default=Path("/tmp/ontoportal-agent"), alias="ONTOLOGY_WORKDIR")
+    ontology_workdir: Path = Field(
+        default=Path("/tmp/ontoportal-agent"),
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_WORKDIR", "ONTOLOGY_WORKDIR"),
+    )
 
     # Approval gate
-    require_manual_approval: bool = Field(default=True, alias="REQUIRE_MANUAL_APPROVAL")
+    require_manual_approval: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("ONTOAGENT_REQUIRE_MANUAL_APPROVAL", "REQUIRE_MANUAL_APPROVAL"),
+    )
 
     # Model Context Protocol endpoints (comma-separated)
-    mcp_endpoints: List[str] = Field(default_factory=list, alias="MCP_ENDPOINTS")
-    mcp_api_key: Optional[str] = Field(default=None, alias="MCP_API_KEY")
-    mcp_rag_tool_name: str = Field(default="rag_query", alias="MCP_RAG_TOOL_NAME")
+    mcp_endpoints: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("ONTOAGENT_MCP_ENDPOINTS", "MCP_ENDPOINTS"),
+    )
+    mcp_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_MCP_API_KEY", "MCP_API_KEY"),
+    )
+    mcp_rag_tool_name: str = Field(
+        default="rag_query",
+        validation_alias=AliasChoices("ONTOAGENT_MCP_RAG_TOOL_NAME", "MCP_RAG_TOOL_NAME"),
+    )
+
+    # Optional shared secret between UI backend and agent API.
+    internal_api_token: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_INTERNAL_API_TOKEN", "INTERNAL_API_TOKEN"),
+    )
 
     @field_validator("mcp_endpoints", mode="before")
     @classmethod
