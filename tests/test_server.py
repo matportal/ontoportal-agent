@@ -39,12 +39,15 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     }
     seen = {}
 
-    def invoke(payload, config=None):
+    def stream(payload, config=None, stream_mode=None):
         seen["payload"] = payload
         seen["config"] = config
-        return dummy_state
+        seen["stream_mode"] = stream_mode
+        yield {"classify": {"intent": "RETRIEVE"}}
+        yield {"retrieve": {"retrieval_backend": "mcp"}}
+        yield {"respond": dummy_state}
 
-    dummy_agent = SimpleNamespace(graph=SimpleNamespace(invoke=invoke))
+    dummy_agent = SimpleNamespace(graph=SimpleNamespace(stream=stream))
     monkeypatch.setattr(server, "_get_agent", lambda: dummy_agent)
 
     client = TestClient(server.app)
@@ -67,3 +70,4 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     assert "[DONE]" in response.text
     assert seen["payload"] == {"user_input": "What is aluminium?"}
     assert seen["config"] == {"configurable": {"thread_id": "thread-2"}}
+    assert seen["stream_mode"] == "updates"

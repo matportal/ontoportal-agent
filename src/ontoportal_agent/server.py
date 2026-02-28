@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from threading import Lock
 from typing import Iterator, Optional
 
@@ -36,6 +37,30 @@ def _sse(payload: dict) -> str:
 
 def _sse_done() -> str:
     return "data: [DONE]\n\n"
+
+
+def _iter_text_chunks(text: str, max_chars: int = 220) -> Iterator[str]:
+    clean = text.strip()
+    if not clean:
+        return
+
+    # Prefer sentence-sized chunks; fall back to hard splits for long lines.
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        start = 0
+        while start < len(sentence):
+            end = min(len(sentence), start + max_chars)
+            if end < len(sentence):
+                split = sentence.rfind(" ", start, end)
+                if split > start:
+                    end = split
+            chunk = sentence[start:end].strip()
+            if chunk:
+                yield chunk + (" " if end < len(sentence) else "")
+            start = end
 
 
 def _get_agent() -> OntoPortalAgent:
@@ -78,11 +103,35 @@ def chat_stream(
         yield _sse({"type": "status", "message": "Assistant request received."})
         yield _sse({"type": "status", "message": "Executing ontology assistant pipeline..."})
         try:
+            final_state = {}
             with _agent_lock:
                 if graph_config:
-                    final_state = _get_agent().graph.invoke({"user_input": prompt}, config=graph_config)
+                    updates = _get_agent().graph.stream(
+                        {"user_input": prompt},
+                        config=graph_config,
+                        stream_mode="updates",
+                    )
                 else:
-                    final_state = _get_agent().graph.invoke({"user_input": prompt})
+                    updates = _get_agent().graph.stream(
+                        {"user_input": prompt},
+                        stream_mode="updates",
+                    )
+                for update in updates:
+                    if not isinstance(update, dict):
+                        continue
+                    for node_name, node_state in update.items():
+                        yield _sse({"type": "terminal_log", "content": f"reasoning_step={node_name}"})
+                        if isinstance(node_state, dict):
+                            final_state.update(node_state)
+                            if node_name == "classify" and node_state.get("intent"):
+                                yield _sse({"type": "terminal_log", "content": f"intent={node_state['intent']}"})
+                            if node_name == "retrieve" and node_state.get("retrieval_backend"):
+                                yield _sse(
+                                    {
+                                        "type": "terminal_log",
+                                        "content": f"retrieval_backend={node_state['retrieval_backend']}",
+                                    }
+                                )
 
             retrieval_backend = final_state.get("retrieval_backend")
             if retrieval_backend:
@@ -119,7 +168,8 @@ def chat_stream(
                 or final_state.get("rag_result")
                 or "No response generated."
             )
-            yield _sse({"content": final_response})
+            for chunk in _iter_text_chunks(str(final_response)):
+                yield _sse({"type": "delta", "content": chunk})
         except Exception as exc:  # pragma: no cover - smoke tests cover happy path.
             logger.exception("Assistant stream failed: %s", exc)
             yield _sse(
