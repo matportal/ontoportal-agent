@@ -87,3 +87,25 @@ def test_list_tools_wraps_transport_errors(monkeypatch):
 
     with pytest.raises(McpInvocationError):
         client.list_tools()
+
+
+def test_mcp_client_uses_endpoint_specific_key_and_timeout(monkeypatch):
+    captured = {}
+
+    def _fake_get(url, headers, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Response({"tools": []})
+
+    monkeypatch.setattr("ontoportal_agent.mcp_client.requests.get", _fake_get)
+
+    client = McpClient(
+        [{"url": "http://rag.internal/mcp", "api_key": "endpoint-key", "timeout_ms": 45000}],
+        api_key="shared-secret",
+    )
+    client.list_tools()
+
+    assert captured["url"] == "http://rag.internal/mcp/tools"
+    assert captured["headers"] == {"X-API-Key": "endpoint-key"}
+    assert captured["timeout"] == 45

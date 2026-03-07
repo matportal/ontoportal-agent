@@ -7,14 +7,21 @@ from langchain_core.messages import HumanMessage
 from ..config import get_settings
 from ..ontology_repository import OntologyRepository
 from .graph import build_agent_graph
+from .options import AgentRuntimeOptions
 from .state import AgentState
 
 
 class OntoPortalAgent:
-    def __init__(self, *, repository: Optional[OntologyRepository] = None):
+    def __init__(
+        self,
+        *,
+        repository: Optional[OntologyRepository] = None,
+        runtime_options: AgentRuntimeOptions | None = None,
+    ):
         self.settings = get_settings()
         self.repository = repository or OntologyRepository()
-        self.graph = build_agent_graph(self.repository).compile()
+        self.runtime_options = runtime_options
+        self.graph = build_agent_graph(self.repository, runtime_options=runtime_options).compile()
 
     def invoke(self, question: str) -> str:
         state: AgentState = {"user_input": question}

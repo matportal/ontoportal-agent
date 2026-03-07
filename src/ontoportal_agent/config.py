@@ -92,9 +92,90 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_INTERNAL_API_TOKEN", "INTERNAL_API_TOKEN"),
     )
 
+    # Assistant persistence + user-context security
+    database_url: str = Field(
+        default="sqlite:///./ontoportal-agent.db",
+        validation_alias=AliasChoices("ONTOAGENT_DATABASE_URL", "DATABASE_URL"),
+    )
+    encryption_key_current: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_ENCRYPTION_KEY_CURRENT", "ENCRYPTION_KEY_CURRENT"),
+    )
+    encryption_key_previous: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_ENCRYPTION_KEY_PREVIOUS", "ENCRYPTION_KEY_PREVIOUS"),
+    )
+    user_context_secret: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_USER_CONTEXT_SECRET", "USER_CONTEXT_SECRET"),
+    )
+    user_context_ttl_seconds: int = Field(
+        default=300,
+        validation_alias=AliasChoices("ONTOAGENT_USER_CONTEXT_TTL_SECONDS", "USER_CONTEXT_TTL_SECONDS"),
+    )
+    history_retention_days: int = Field(
+        default=90,
+        validation_alias=AliasChoices("ONTOAGENT_HISTORY_RETENTION_DAYS", "HISTORY_RETENTION_DAYS"),
+    )
+
+    # Deployment-level defaults for provider settings.
+    default_generation_provider: str = Field(
+        default="openai_compatible",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_PROVIDER", "DEFAULT_GENERATION_PROVIDER"),
+    )
+    default_generation_model: str = Field(
+        default="gemini-2.5-flash-lite",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_MODEL", "DEFAULT_GENERATION_MODEL"),
+    )
+    default_generation_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_BASE_URL", "DEFAULT_GENERATION_BASE_URL"),
+    )
+    default_embeddings_provider: str = Field(
+        default="openai_compatible",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_EMBEDDINGS_PROVIDER", "DEFAULT_EMBEDDINGS_PROVIDER"),
+    )
+    default_embeddings_model: str = Field(
+        default="text-embedding-005",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_EMBEDDINGS_MODEL", "DEFAULT_EMBEDDINGS_MODEL"),
+    )
+    default_embeddings_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_EMBEDDINGS_BASE_URL", "DEFAULT_EMBEDDINGS_BASE_URL"),
+    )
+    default_reranker_provider: str = Field(
+        default="cohere",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_RERANKER_PROVIDER", "DEFAULT_RERANKER_PROVIDER"),
+    )
+    default_reranker_model: str = Field(
+        default="rerank-v3.5",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_RERANKER_MODEL", "DEFAULT_RERANKER_MODEL"),
+    )
+    default_reranker_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_RERANKER_BASE_URL", "DEFAULT_RERANKER_BASE_URL"),
+    )
+    default_mcp_endpoints: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_MCP_ENDPOINTS", "DEFAULT_MCP_ENDPOINTS"),
+    )
+    default_mcp_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_MCP_API_KEY", "DEFAULT_MCP_API_KEY"),
+    )
+
     @field_validator("mcp_endpoints", mode="before")
     @classmethod
     def _split_endpoints(cls, value: Optional[str] | List[str]):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("default_mcp_endpoints", mode="before")
+    @classmethod
+    def _split_default_mcp_endpoints(cls, value: Optional[str] | List[str]):
         if value is None:
             return []
         if isinstance(value, str):

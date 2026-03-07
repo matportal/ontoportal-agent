@@ -16,6 +16,7 @@ from ..ontology_repository import OntologyRepository, OntologyArtifact
 from ..publishing import OntoPortalPublisher
 from ..rag_client import RagClient
 from ..sandbox import PythonSandbox
+from .options import AgentRuntimeOptions
 from .state import AgentState
 
 
@@ -82,19 +83,39 @@ def _extract_generation_reasoning(reply: Any) -> str:
     return ""
 
 
-def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
+def build_agent_graph(
+    repository: OntologyRepository,
+    runtime_options: AgentRuntimeOptions | None = None,
+) -> StateGraph[AgentState]:
     settings = get_settings()
+    llm_api_key = runtime_options.openai_api_key if runtime_options else settings.openai_api_key
+    llm_base_url = runtime_options.openai_api_base if runtime_options else settings.openai_api_base
+    llm_model = runtime_options.llm_model if runtime_options and runtime_options.llm_model else settings.llm_model
+    mcp_endpoints = runtime_options.mcp_endpoints if runtime_options and runtime_options.mcp_endpoints else settings.resolved_mcp_endpoints()
+    mcp_api_key = runtime_options.mcp_api_key if runtime_options else settings.mcp_api_key
+    mcp_rag_tool_name = (
+        runtime_options.mcp_rag_tool_name
+        if runtime_options and runtime_options.mcp_rag_tool_name
+        else settings.mcp_rag_tool_name
+    )
+    rag_base_url = runtime_options.rag_base_url if runtime_options and runtime_options.rag_base_url else settings.rag_base_url
+    rag_query_path = runtime_options.rag_query_path if runtime_options and runtime_options.rag_query_path else settings.rag_query_path
+    rag_top_k = runtime_options.rag_top_k if runtime_options and runtime_options.rag_top_k else None
+
     llm = ChatOpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_api_base,
-        model=settings.llm_model,
+        api_key=llm_api_key,
+        base_url=llm_base_url,
+        model=llm_model,
         temperature=0.0,
     )
     mcp_client = McpClient(
-        settings.resolved_mcp_endpoints(),
-        api_key=settings.mcp_api_key,
+        mcp_endpoints,
+        api_key=mcp_api_key,
     )
-    rag_client = RagClient()
+    if runtime_options and (runtime_options.rag_base_url or runtime_options.rag_query_path):
+        rag_client = RagClient(base_url=rag_base_url, query_path=rag_query_path)
+    else:
+        rag_client = RagClient()
     publisher = OntoPortalPublisher()
     sandbox = PythonSandbox(repository)
 
@@ -118,10 +139,22 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
     def retrieve_answer(state: AgentState) -> AgentState:
         question = state["user_input"]
 
+        if rag_base_url and rag_query_path:
+            try:
+                result = rag_client.query(question, top_k=rag_top_k)
+                state["rag_result"] = result.answer
+                state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+                state["retrieval_backend"] = "rag-http"
+                return state
+            except Exception as err:  # noqa: BLE001 - we intentionally degrade to MCP or non-RAG response.
+                state["retrieval_backend"] = "mcp-fallback"
+                state["retrieval_error"] = str(err)
+
         try:
             mcp_payload = mcp_client.invoke_rag_query(
                 question,
-                tool_name=settings.mcp_rag_tool_name,
+                tool_name=mcp_rag_tool_name,
+                top_k=rag_top_k,
             )
             sources = mcp_payload.get("sources", [])
             state["rag_result"] = mcp_payload.get("answer", "")
@@ -132,16 +165,8 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
             state["retrieval_backend"] = "mcp"
             return state
         except (McpInvocationError, KeyError, TypeError, ValueError) as err:
-            state["retrieval_backend"] = "rag-http-fallback"
-            state["retrieval_error"] = str(err)
-
-        try:
-            result = rag_client.query(question)
-            state["rag_result"] = result.answer
-            state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
-        except Exception as err:  # noqa: BLE001 - we intentionally degrade to non-RAG response.
-            state["retrieval_backend"] = "none"
             existing_error = state.get("retrieval_error")
+            state["retrieval_backend"] = "none"
             if existing_error:
                 state["retrieval_error"] = f"{existing_error}; fallback failed: {err}"
             else:
@@ -193,7 +218,7 @@ def build_agent_graph(repository: OntologyRepository) -> StateGraph[AgentState]:
             if len(llm_content) > settings.max_response_chars:
                 llm_content = llm_content[: settings.max_response_chars].rstrip() + "..."
             state["final_response"] = llm_content
-            state["generation_backend"] = f"llm:{settings.llm_model}"
+            state["generation_backend"] = f"llm:{llm_model}"
             if not reasoning_text:
                 reasoning_prompt = [
                     SystemMessage(
