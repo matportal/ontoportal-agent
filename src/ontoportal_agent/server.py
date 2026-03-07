@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -42,7 +44,7 @@ from .intent import classify_user_intent
 from .mcp_client import McpClient, McpInvocationError
 from .rag_client import RagClient
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error").getChild("ontoportal_agent")
 
 app = FastAPI(
     title="OntoPortal Agent API",
@@ -150,6 +152,118 @@ def _normalized_chunk_count(value: Any, *, default: int = 20) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(1, min(40, parsed))
+
+
+def _compact_user_id(user_id: str | None) -> str:
+    text = str(user_id or "").strip()
+    if not text:
+        return ""
+    return text.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _trim_log_value(value: Any, *, limit: int = 160) -> str:
+    text = str(value).replace("\n", "\\n").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
+
+
+def _log_event(event: str, **fields: Any) -> str:
+    parts = [event]
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            rendered = str(value)
+        else:
+            rendered = json.dumps(_trim_log_value(value), ensure_ascii=False)
+        parts.append(f"{key}={rendered}")
+    return " ".join(parts)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
+def _error_status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    match = re.search(r"Error code:\s*(\d+)", str(exc), re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _error_retry_after_seconds(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0, math.ceil(float(retry_after)))
+            except ValueError:
+                pass
+
+    match = re.search(r"retry in ([0-9.]+)s", str(exc), re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return max(0, math.ceil(float(match.group(1))))
+    except ValueError:
+        return None
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status_code = _error_status_code(exc)
+    if status_code == 429:
+        return True
+    text = str(exc).lower()
+    return "resource_exhausted" in text or "quota exceeded" in text or "rate limit" in text
+
+
+def _stream_failure_payload(exc: Exception) -> tuple[str, str]:
+    if _is_rate_limit_error(exc):
+        retry_after = _error_retry_after_seconds(exc)
+        if retry_after is not None:
+            wait_text = f" Retry in about {retry_after} seconds."
+        else:
+            wait_text = ""
+        return (
+            "Provider quota exceeded.",
+            "The configured AI provider quota is exhausted."
+            f"{wait_text} Add your own API key in AI Settings or try again later.",
+        )
+
+    text = str(exc).lower()
+    if "timed out" in text or "timeout" in text:
+        return (
+            "Provider timeout.",
+            "The assistant provider timed out while handling the request. Try again or switch the model in AI Settings.",
+        )
+    if "connection" in text or "temporarily unavailable" in text:
+        return (
+            "Provider connection failed.",
+            "The assistant could not reach the configured provider. Check the provider settings in AI Settings and retry.",
+        )
+    return ("Assistant request failed.", "Assistant backend failed while handling the request.")
+
+
+def _failure_log_fields(exc: Exception) -> dict[str, Any]:
+    return {
+        "error_class": exc.__class__.__name__,
+        "status_code": _error_status_code(exc),
+        "retry_after_seconds": _error_retry_after_seconds(exc),
+        "rate_limited": _is_rate_limit_error(exc),
+    }
 
 
 def _resolved_default_mcp_urls(settings: Any | None = None) -> set[str]:
@@ -643,15 +757,25 @@ def _stream_agent_response(
     thread_id: str | None,
     agent_builder: Callable[[], OntoPortalAgent],
     on_completed: Callable[[dict[str, Any], str], None] | None = None,
+    log_context: dict[str, Any] | None = None,
 ) -> Iterator[str]:
+    stream_context = dict(log_context or {})
+    stream_context.setdefault("thread_id", thread_id)
+    stream_context.setdefault("prompt_chars", len(prompt))
+    stream_context.setdefault("trace_id", uuid.uuid4().hex[:12])
+    started_at = time.monotonic()
+    logger.info(_log_event("assistant_stream_started", **stream_context))
     yield _sse({"type": "status", "message": "Assistant request received.", "thread_id": thread_id})
+    final_state: dict[str, Any] = {}
+    final_response_text = ""
+    resolved_model = ""
+    intent = "LEGACY"
     try:
         agent = agent_builder()
         runtime_options = getattr(agent, "runtime_options", None)
-        final_state: dict[str, Any]
-        final_response_text = ""
 
         if runtime_options is None:
+            logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="legacy_graph"))
             yield _sse({"type": "status", "message": "Executing ontology assistant pipeline..."})
             final_state = _collect_graph_final_state(agent=agent, prompt=prompt, thread_id=thread_id)
             for event in _emit_final_state(final_state):
@@ -659,9 +783,11 @@ def _stream_agent_response(
             final_response_text = str(final_state.get("final_response") or final_state.get("rag_result") or "").strip()
         else:
             llm = _build_chat_model(runtime_options)
-            resolved_model = runtime_options.llm_model or get_settings().llm_model
+            resolved_model = str(runtime_options.llm_model or get_settings().llm_model or "")
+            logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="runtime", model=resolved_model))
             yield _sse({"type": "status", "message": "Classifying request..."})
             intent = _classify_intent(llm, prompt)
+            logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
             if intent == "EDIT":
                 yield _sse({"type": "status", "message": "Edit workflow uses buffered execution."})
                 final_state = _collect_graph_final_state(agent=agent, prompt=prompt, thread_id=thread_id)
@@ -671,6 +797,18 @@ def _stream_agent_response(
             else:
                 yield _sse({"type": "status", "message": "Retrieving ontology context..."})
                 final_state = _retrieve_runtime_state(prompt, runtime_options)
+                logger.info(
+                    _log_event(
+                        "assistant_retrieval_complete",
+                        **stream_context,
+                        intent=intent,
+                        model=resolved_model,
+                        retrieval_backend=final_state.get("retrieval_backend"),
+                        retrieval_chunk_count=final_state.get("retrieval_chunk_count"),
+                        citations=len(final_state.get("citations") or []),
+                        retrieval_error=bool(final_state.get("retrieval_error")),
+                    )
+                )
                 if final_state.get("retrieval_error"):
                     yield _sse({"type": "status", "message": str(final_state["retrieval_error"])})
 
@@ -693,7 +831,15 @@ def _stream_agent_response(
                         streamed_chunks.append(text)
                         yield _sse({"type": "delta", "content": text})
                 except Exception as exc:  # pragma: no cover - fallback path
-                    logger.warning("Falling back to buffered LLM response after stream failure: %s", exc)
+                    logger.warning(
+                        _log_event(
+                            "assistant_stream_chunk_fallback",
+                            **stream_context,
+                            intent=intent,
+                            model=resolved_model,
+                            **_failure_log_fields(exc),
+                        )
+                    )
                     reply = llm.invoke(messages)
                     stream_usage.update(_extract_generation_usage(reply))
                     text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
@@ -731,18 +877,96 @@ def _stream_agent_response(
                     if model_reasoning and not reasoning_text:
                         reasoning_text = model_reasoning
                 except Exception as exc:  # pragma: no cover - summary is optional
-                    logger.warning("Reasoning summary generation failed: %s", exc)
+                    logger.warning(
+                        _log_event(
+                            "assistant_reasoning_summary_failed",
+                            **stream_context,
+                            intent=intent,
+                            model=resolved_model,
+                            **_failure_log_fields(exc),
+                        )
+                    )
 
                 if reasoning_text:
                     final_state["generation_reasoning"] = reasoning_text
                     yield _sse({"type": "model_reasoning", "content": reasoning_text})
                 yield _sse({"type": "usage", "content": stream_usage})
+        logger.info(
+            _log_event(
+                "assistant_stream_completed",
+                **stream_context,
+                intent=intent,
+                model=resolved_model or final_state.get("generation_backend"),
+                duration_ms=_elapsed_ms(started_at),
+                response_chars=len(final_response_text),
+                citations=len(final_state.get("citations") or []),
+                retrieval_backend=final_state.get("retrieval_backend"),
+                retrieval_error=bool(final_state.get("retrieval_error")),
+            )
+        )
+    except Exception as exc:  # pragma: no cover - smoke tests cover happy path.
+        status_message, client_message = _stream_failure_payload(exc)
+        error_details = {
+            "trace_id": stream_context["trace_id"],
+            "status": status_message,
+            "message": client_message,
+            **_failure_log_fields(exc),
+        }
+        failure_context = {
+            **stream_context,
+            "intent": intent,
+            "model": resolved_model or get_settings().llm_model,
+            "duration_ms": _elapsed_ms(started_at),
+            **_failure_log_fields(exc),
+        }
+        if error_details["rate_limited"]:
+            logger.warning(_log_event("assistant_stream_failed", **failure_context))
+        else:
+            logger.exception(_log_event("assistant_stream_failed", **failure_context))
 
         if on_completed is not None:
+            try:
+                on_completed(
+                    {
+                        "generation_usage": {
+                            "model": resolved_model or get_settings().llm_model,
+                            "error": error_details,
+                        },
+                        "generation_reasoning": "",
+                        "citations": [],
+                        "retrieval_backend": final_state.get("retrieval_backend") if final_state else "",
+                        "retrieval_error": final_state.get("retrieval_error") if final_state else "",
+                    },
+                    client_message,
+                )
+            except Exception as persist_exc:  # pragma: no cover - persistence failure is secondary.
+                logger.exception(
+                    _log_event(
+                        "assistant_stream_failure_persist_failed",
+                        **stream_context,
+                        duration_ms=_elapsed_ms(started_at),
+                        error_class=persist_exc.__class__.__name__,
+                    )
+                )
+
+        yield _sse({"type": "status", "message": status_message})
+        yield _sse({"type": "error", "content": error_details})
+        yield _sse({"type": "delta", "content": client_message})
+        yield _sse_done()
+        return
+
+    if on_completed is not None:
+        try:
             on_completed(final_state, final_response_text or "No response generated.")
-    except Exception as exc:  # pragma: no cover - smoke tests cover happy path.
-        logger.exception("Assistant stream failed: %s", exc)
-        yield _sse({"type": "delta", "content": "Assistant backend failed while handling the request."})
+        except Exception as exc:  # pragma: no cover - persistence failure should not poison the response.
+            logger.exception(
+                _log_event(
+                    "assistant_stream_persist_failed",
+                    **stream_context,
+                    duration_ms=_elapsed_ms(started_at),
+                    error_class=exc.__class__.__name__,
+                )
+            )
     yield _sse_done()
 
 
@@ -994,6 +1218,14 @@ def me_chat_stream(
             thread_id=thread.thread_id,
             title=requested_title,
         )
+    log_context = {
+        "trace_id": uuid.uuid4().hex[:12],
+        "user_id": _compact_user_id(user_context.user_id),
+        "username": user_context.username,
+        "thread_id": thread.thread_id,
+        "follow_up": bool(payload.thread_id),
+        "request_id": request.headers.get("x-request-id") or request.headers.get("X-Request-Id"),
+    }
 
     def on_completed(final_state: dict[str, Any], final_response_text: str) -> None:
         create_message(
@@ -1013,6 +1245,7 @@ def me_chat_stream(
             thread_id=thread.thread_id,
             agent_builder=lambda: OntoPortalAgent(runtime_options=runtime_options),
             on_completed=on_completed,
+            log_context=log_context,
         ),
         media_type="text/event-stream",
         headers={
@@ -1047,6 +1280,12 @@ def chat_stream(
             prompt=prompt,
             thread_id=request.thread_id,
             agent_builder=lambda: _get_agent(),
+            log_context={
+                "trace_id": uuid.uuid4().hex[:12],
+                "thread_id": request.thread_id,
+                "follow_up": bool(request.thread_id),
+                "legacy": True,
+            },
         ),
         media_type="text/event-stream",
         headers={

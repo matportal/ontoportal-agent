@@ -1,3 +1,5 @@
+import json
+import logging
 import importlib
 import time
 from pathlib import Path
@@ -162,6 +164,85 @@ def test_me_chat_stream_persists_messages(monkeypatch, tmp_path):
     assert [msg["role"] for msg in messages] == ["user", "assistant"]
     assert messages[0]["content"] == "What is MDS?"
     assert "Synthetic assistant answer." in messages[1]["content"]
+
+
+def test_me_chat_stream_exposes_and_persists_quota_errors(monkeypatch, tmp_path, caplog):
+    _configure_env(monkeypatch, tmp_path)
+
+    class _QuotaError(Exception):
+        status_code = 429
+
+    class _DummyLlm:
+        def stream(self, _messages):
+            raise _QuotaError("Error code: 429 - quota exceeded. Please retry in 9.1s.")
+
+        def invoke(self, _messages):
+            raise _QuotaError("Error code: 429 - quota exceeded. Please retry in 9.1s.")
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = SimpleNamespace(
+                openai_api_key="test-openai-key",
+                openai_api_base="https://example.test/openai",
+                llm_model="gemini-2.5-flash-lite",
+                rag_top_k=12,
+                rag_base_url="http://rag.internal",
+                rag_query_path="/api/v1/query",
+                mcp_endpoints=[],
+                mcp_api_key=None,
+                mcp_rag_tool_name="rag_query",
+            )
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _DummyAgent)
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options: _DummyLlm())
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda _prompt, _runtime_options: {
+            "citations": [],
+            "rag_result": "",
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+            "retrieval_chunk_count": 12,
+        },
+    )
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+
+    thread_resp = client.post("/api/v1/me/threads", json={"title": "Quota thread"}, headers=headers)
+    assert thread_resp.status_code == 200
+    thread_id = thread_resp.json()["thread_id"]
+
+    with caplog.at_level(logging.INFO):
+        response = client.post(
+            "/api/v1/me/chat/stream",
+            json={"prompt": "Follow up question", "thread_id": thread_id},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line.replace("data:", "", 1).strip())
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    error_event = next(event for event in events if event.get("type") == "error")
+    assert error_event["content"]["status"] == "Provider quota exceeded."
+    assert error_event["content"]["status_code"] == 429
+    assert error_event["content"]["retry_after_seconds"] == 10
+    assert "Add your own API key in AI Settings" in response.text
+
+    messages_resp = client.get(f"/api/v1/me/threads/{thread_id}/messages", headers=headers)
+    assert messages_resp.status_code == 200
+    messages = messages_resp.json()["messages"]
+    assert [msg["role"] for msg in messages] == ["user", "assistant"]
+    assert "configured AI provider quota is exhausted" in messages[1]["content"]
+    assert messages[1]["usage"]["error"]["status_code"] == 429
+    assert messages[1]["usage"]["error"]["trace_id"]
+
+    assert any("assistant_stream_failed" in record.message and "trace_id=" in record.message for record in caplog.records)
 
 
 def test_retrieve_runtime_state_prefers_direct_rag(monkeypatch):
