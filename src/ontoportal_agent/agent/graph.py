@@ -11,6 +11,7 @@ from langgraph.graph import END, StateGraph
 from rdflib import Graph
 
 from ..config import get_settings
+from ..intent import classify_user_intent
 from ..mcp_client import McpClient, McpInvocationError
 from ..ontology_repository import OntologyRepository, OntologyArtifact
 from ..publishing import OntoPortalPublisher
@@ -122,18 +123,7 @@ def build_agent_graph(
     graph = StateGraph(AgentState)
 
     def classify_intent(state: AgentState) -> AgentState:
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "Classify the user's intent as either RETRIEVE or EDIT. Respond with a single word.",
-                ),
-                ("human", "{question}"),
-            ]
-        )
-        chain = prompt | llm
-        intent = chain.invoke({"question": state["user_input"]}).content.strip().upper()
-        state["intent"] = "EDIT" if "EDIT" in intent else "RETRIEVE"
+        state["intent"] = classify_user_intent(state["user_input"], llm=llm)
         return state
 
     def retrieve_answer(state: AgentState) -> AgentState:

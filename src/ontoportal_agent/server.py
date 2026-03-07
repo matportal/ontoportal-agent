@@ -38,6 +38,7 @@ from .db.repositories import (
     upsert_user_settings,
 )
 from .db.user_context import AssistantUserContext, verify_user_context_headers
+from .intent import classify_user_intent
 from .mcp_client import McpClient, McpInvocationError
 from .rag_client import RagClient
 
@@ -200,14 +201,7 @@ def _build_chat_model(runtime_options: AgentRuntimeOptions | None) -> ChatOpenAI
 
 
 def _classify_intent(llm: ChatOpenAI, prompt: str) -> str:
-    reply = llm.invoke(
-        [
-            SystemMessage(content="Classify the user's intent as either RETRIEVE or EDIT. Respond with a single word."),
-            HumanMessage(content=prompt),
-        ]
-    )
-    content = _flatten_chunk_text(getattr(reply, "content", reply)).strip().upper()
-    return "EDIT" if "EDIT" in content else "RETRIEVE"
+    return classify_user_intent(prompt, llm=llm)
 
 
 def _build_response_messages(

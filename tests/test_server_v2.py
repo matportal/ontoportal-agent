@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage
 
 if importlib.util.find_spec("ontoportal_agent") is None:
     pytest.skip("ontoportal_agent package not available", allow_module_level=True)
@@ -278,3 +279,58 @@ def test_me_routes_reject_bad_signature(monkeypatch, tmp_path):
 
     response = client.get("/api/v1/me/bootstrap", headers=headers)
     assert response.status_code == 401
+
+
+def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypatch):
+    observed = {"graph_called": False}
+
+    class _DummyLlm:
+        def stream(self, _messages):
+            yield AIMessage(content="# Summary\n")
+            yield AIMessage(content="- MatPortal helps organize ontology knowledge.\n")
+
+        def invoke(self, messages):
+            system_text = str(getattr(messages[0], "content", ""))
+            if "Route the user request" in system_text:
+                return AIMessage(content="EDIT")
+            if "Write a concise reasoning summary" in system_text:
+                return AIMessage(content="- Used the retrieved context.\n- Kept the answer concise.")
+            return AIMessage(content="Fallback answer")
+
+    def _unexpected_edit_graph(*args, **kwargs):
+        observed["graph_called"] = True
+        raise AssertionError("retrieve-style prompts must not enter the edit graph")
+
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options: _DummyLlm())
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda prompt, runtime_options: {
+            "rag_result": "MatPortal is an ontology portal for materials science.",
+            "citations": ["MATONTO v2.0"],
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+        },
+    )
+    monkeypatch.setattr(server, "_collect_graph_final_state", _unexpected_edit_graph)
+
+    runtime_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            llm_model="gemini-2.5-flash-lite",
+            openai_api_key="test-key",
+            openai_api_base="https://example.test/openai",
+        )
+    )
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="What is MatPortal? Answer in markdown with a heading, twelve bullet points, and a short json code block.",
+            thread_id="thread-123",
+            agent_builder=lambda: runtime_agent,
+        )
+    )
+
+    assert observed["graph_called"] is False
+    assert "Streaming answer..." in events
+    assert "No action generated; placeholder plan." not in events
+    assert "# Summary" in events
