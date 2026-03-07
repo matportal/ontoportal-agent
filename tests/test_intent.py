@@ -34,6 +34,10 @@ class _AlwaysEditLlm:
             INTENT_RETRIEVE,
         ),
         (
+            "Write a short follow-up answer about tensile test ontologies.",
+            INTENT_RETRIEVE,
+        ),
+        (
             "Generate a tensile test ontology for polymers, validate it, and submit privately to MatPortal.",
             INTENT_EDIT,
         ),

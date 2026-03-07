@@ -8,6 +8,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 INTENT_RETRIEVE = "RETRIEVE"
 INTENT_EDIT = "EDIT"
 
+_RETRIEVE_OVERRIDE_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(write|draft|generate|give)\b.{0,40}\b(answer|summary|comparison|explanation|response|overview|paragraph|bullet(?:\s+list)?|markdown|table|json)\b",
+    )
+]
+
 _RETRIEVE_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -24,6 +31,8 @@ _RETRIEVE_PATTERNS = [
         r"\bfind\b",
         r"\bsearch\b",
         r"\banaly[sz]e\b",
+        r"\banswer\b",
+        r"\bfollow[\s-]?up\b",
         r"\bdescribe\b",
         r"\bmarkdown\b",
         r"\btable\b",
@@ -98,6 +107,9 @@ def _llm_classify_intent(llm: Any, prompt: str) -> str:
 def classify_user_intent(prompt: str, *, llm: Any | None = None) -> str:
     clean = " ".join(str(prompt or "").split())
     if not clean:
+        return INTENT_RETRIEVE
+
+    if _matches_any(_RETRIEVE_OVERRIDE_PATTERNS, clean):
         return INTENT_RETRIEVE
 
     if _matches_any(_EDIT_PATTERNS, clean):
