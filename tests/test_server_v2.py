@@ -774,6 +774,63 @@ def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypat
     assert "# Summary" in events
 
 
+def test_stream_agent_response_runs_edit_flow_on_vertex_via_openai_bridge(monkeypatch):
+    captured = {"graph_calls": [], "agent_runtime_options": []}
+
+    initial_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="vertex_gemini",
+            llm_model="gemini-2.5-pro",
+            openai_api_key="",
+            openai_api_base="",
+            vertex_project="ontoportal-llm-finetune",
+            vertex_location="us-central1",
+            vertex_service_account_json='{"client_email":"svc@example.org"}',
+        )
+    )
+
+    def _collect_graph(agent, prompt, thread_id):
+        captured["graph_calls"].append(
+            {
+                "agent": agent,
+                "prompt": prompt,
+                "thread_id": thread_id,
+            }
+        )
+        return {
+            "final_response": "Proposed ontology edits (pending approval):\n- Add a class",
+            "generation_usage": {"model": "google/gemini-2.5-pro"},
+        }
+
+    class _BufferedEditAgent:
+        def __init__(self, *args, runtime_options=None, **kwargs):
+            captured["agent_runtime_options"].append(runtime_options)
+            self.runtime_options = runtime_options
+
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "EDIT")
+    monkeypatch.setattr(server, "_vertex_access_token", lambda _runtime_options: "vertex-token-123")
+    monkeypatch.setattr(server, "_collect_graph_final_state", _collect_graph)
+    monkeypatch.setattr(server, "OntoPortalAgent", _BufferedEditAgent)
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Create a new ontology class for tensile strength.",
+            thread_id="thread-edit-1",
+            agent_builder=lambda: initial_agent,
+        )
+    )
+
+    assert "Edit workflow uses buffered execution." in events
+    assert "Proposed ontology edits (pending approval)" in events
+    assert len(captured["graph_calls"]) == 1
+    assert len(captured["agent_runtime_options"]) == 1
+    bridged = captured["agent_runtime_options"][0]
+    assert bridged.generation_provider == "openai_compatible"
+    assert bridged.openai_api_key == "vertex-token-123"
+    assert bridged.openai_api_base == "https://aiplatform.googleapis.com/v1/projects/ontoportal-llm-finetune/locations/global/endpoints/openapi"
+    assert bridged.llm_model == "google/gemini-2.5-pro"
+
+
 def test_stream_agent_response_falls_back_to_latest_google_model(monkeypatch):
     class _BusyError(Exception):
         status_code = 503

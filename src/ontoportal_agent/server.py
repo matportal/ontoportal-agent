@@ -408,6 +408,47 @@ def _vertex_endpoint_url(runtime_options: AgentRuntimeOptions | None, model: str
     )
 
 
+def _vertex_openai_base_url(runtime_options: AgentRuntimeOptions | None) -> str:
+    settings = get_settings()
+    project = str(
+        (getattr(runtime_options, "vertex_project", None) if runtime_options else None)
+        or settings.vertex_project
+        or ""
+    ).strip()
+    if not project:
+        raise RuntimeError("Vertex Gemini provider requires ONTOAGENT_VERTEX_PROJECT.")
+    return f"https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi"
+
+
+def _vertex_openai_model_name(model: str | None) -> str:
+    clean_model = str(model or "").strip()
+    if clean_model.startswith("publishers/google/models/"):
+        clean_model = clean_model.split("publishers/google/models/", 1)[1]
+    if clean_model.startswith("google/"):
+        return clean_model
+    return f"google/{clean_model}" if clean_model else "google/gemini-2.5-pro"
+
+
+def _vertex_buffered_edit_runtime_options(runtime_options: AgentRuntimeOptions) -> AgentRuntimeOptions:
+    settings = get_settings()
+    selected_model = str(runtime_options.llm_model or settings.llm_model or "").strip() or "gemini-2.5-pro"
+    return AgentRuntimeOptions(
+        openai_api_key=_vertex_access_token(runtime_options),
+        generation_provider="openai_compatible",
+        openai_api_base=_vertex_openai_base_url(runtime_options),
+        llm_model=_vertex_openai_model_name(selected_model),
+        vertex_project=getattr(runtime_options, "vertex_project", None),
+        vertex_location=getattr(runtime_options, "vertex_location", None),
+        vertex_service_account_json=getattr(runtime_options, "vertex_service_account_json", None),
+        rag_top_k=getattr(runtime_options, "rag_top_k", None),
+        rag_base_url=getattr(runtime_options, "rag_base_url", None),
+        rag_query_path=getattr(runtime_options, "rag_query_path", None),
+        mcp_endpoints=getattr(runtime_options, "mcp_endpoints", None),
+        mcp_api_key=getattr(runtime_options, "mcp_api_key", None),
+        mcp_rag_tool_name=getattr(runtime_options, "mcp_rag_tool_name", None),
+    )
+
+
 def _failure_log_fields(exc: Exception) -> dict[str, Any]:
     return {
         "error_class": exc.__class__.__name__,
@@ -1180,12 +1221,22 @@ def _stream_agent_response(
             intent = _classify_intent(llm, prompt)
             logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
             if intent == "EDIT":
-                if _uses_vertex_gemini_provider(runtime_options):
-                    raise RuntimeError(
-                        "Edit workflow is not enabled for the Vertex Gemini runtime yet. Use a retrieve/explain request or switch the provider in AI Settings."
-                    )
                 yield _sse({"type": "status", "message": "Edit workflow uses buffered execution."})
-                final_state = _collect_graph_final_state(agent=agent, prompt=prompt, thread_id=thread_id)
+                edit_agent = agent
+                if _uses_vertex_gemini_provider(runtime_options):
+                    edit_runtime_options = _vertex_buffered_edit_runtime_options(runtime_options)
+                    resolved_model = str(edit_runtime_options.llm_model or resolved_model or "")
+                    logger.info(
+                        _log_event(
+                            "assistant_stream_edit_vertex_bridge",
+                            **stream_context,
+                            intent=intent,
+                            model=resolved_model,
+                            base_url=_vertex_openai_base_url(runtime_options),
+                        )
+                    )
+                    edit_agent = OntoPortalAgent(runtime_options=edit_runtime_options)
+                final_state = _collect_graph_final_state(agent=edit_agent, prompt=prompt, thread_id=thread_id)
                 for event in _emit_final_state(final_state):
                     yield event
                 final_response_text = str(final_state.get("final_response") or final_state.get("rag_result") or "").strip()
