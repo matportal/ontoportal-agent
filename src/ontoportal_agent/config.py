@@ -28,8 +28,20 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_OPENAI_API_BASE", "OPENAI_API_BASE"),
     )
     llm_model: str = Field(
-        default="gemini-3-flash-preview",
+        default="gemini-3.1-pro-preview",
         validation_alias=AliasChoices("ONTOAGENT_LLM_MODEL", "LLM_MODEL"),
+    )
+    vertex_project: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_VERTEX_PROJECT", "VERTEX_PROJECT"),
+    )
+    vertex_location: str = Field(
+        default="us-central1",
+        validation_alias=AliasChoices("ONTOAGENT_VERTEX_LOCATION", "VERTEX_LOCATION"),
+    )
+    vertex_service_account_json: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_VERTEX_SERVICE_ACCOUNT_JSON", "VERTEX_SERVICE_ACCOUNT_JSON"),
     )
     max_rag_context_chars: int = Field(
         default=12000,
@@ -124,7 +136,7 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_PROVIDER", "DEFAULT_GENERATION_PROVIDER"),
     )
     default_generation_model: str = Field(
-        default="gemini-3-flash-preview",
+        default="gemini-3.1-pro-preview",
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_MODEL", "DEFAULT_GENERATION_MODEL"),
     )
     default_generation_base_url: Optional[str] = Field(

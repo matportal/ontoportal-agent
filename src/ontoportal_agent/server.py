@@ -7,19 +7,24 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from threading import Lock
 from typing import Any, Callable, Iterator, Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from pydantic import BaseModel, Field
+import requests
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
-from .agent.graph import _extract_generation_reasoning, _extract_generation_usage
+from .agent.graph import _extract_generation_usage
 from .agent.options import AgentRuntimeOptions
 from .agent.runtime import OntoPortalAgent
 from .config import get_settings
@@ -59,11 +64,29 @@ _LEGACY_DEFAULT_MCP_TIMEOUT_MS = 10_000
 _BUILTIN_DEFAULT_MCP_TIMEOUT_MS = 30_000
 _GOOGLE_OPENAI_BASE_MARKER = "generativelanguage.googleapis.com"
 _GOOGLE_GEMINI_FALLBACK_MODELS = (
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite-preview",
     "gemini-3.1-pro-preview",
+    "gemini-3.1-pro-preview-customtools",
     "gemini-3-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
 )
+_VERTEX_GEMINI_FALLBACK_MODELS = (
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+)
+_GOOGLE_THOUGHT_REQUEST_MODEL_PREFIXES = (
+    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+)
+_GOOGLE_THOUGHT_STREAM_MODEL_PREFIXES = (
+    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
+)
+_MAX_STREAM_ATTEMPTS_PER_MODEL = 2
+_STREAM_RETRY_BACKOFF_SECONDS = 1.25
+_GOOGLE_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 class ChatStreamRequest(BaseModel):
@@ -268,13 +291,28 @@ def _uses_google_openai_base(base_url: str | None) -> bool:
     return _GOOGLE_OPENAI_BASE_MARKER in str(base_url or "").strip().lower()
 
 
-def _generation_model_candidates(selected_model: str | None, *, base_url: str | None) -> list[str]:
+def _uses_vertex_gemini_provider(runtime_options: AgentRuntimeOptions | None) -> bool:
+    provider = str(getattr(runtime_options, "generation_provider", "") or "").strip().lower()
+    return provider == "vertex_gemini"
+
+
+def _generation_model_candidates(
+    selected_model: str | None,
+    *,
+    base_url: str | None,
+    generation_provider: str | None = None,
+) -> list[str]:
     clean_selected = str(selected_model or "").strip()
     candidates: list[str] = []
     if clean_selected:
         candidates.append(clean_selected)
 
-    if _uses_google_openai_base(base_url):
+    clean_provider = str(generation_provider or "").strip().lower()
+    if clean_provider == "vertex_gemini":
+        for candidate in _VERTEX_GEMINI_FALLBACK_MODELS:
+            if candidate not in candidates:
+                candidates.append(candidate)
+    elif _uses_google_openai_base(base_url):
         for candidate in _GOOGLE_GEMINI_FALLBACK_MODELS:
             if candidate not in candidates:
                 candidates.append(candidate)
@@ -303,6 +341,73 @@ def _can_retry_with_fallback_model(exc: Exception) -> bool:
     return any(marker in text for marker in retry_markers)
 
 
+def _stream_attempts_for_model(model: str | None, *, base_url: str | None) -> int:
+    clean_model = str(model or "").strip()
+    if not clean_model:
+        return 1
+    if _uses_google_openai_base(base_url) and any(
+        clean_model.startswith(prefix) for prefix in _GOOGLE_THOUGHT_STREAM_MODEL_PREFIXES
+    ):
+        return _MAX_STREAM_ATTEMPTS_PER_MODEL
+    return 1
+
+
+def _stream_retry_delay_seconds(attempt_number: int) -> float:
+    if attempt_number <= 0:
+        return 0.0
+    return min(3.0, _STREAM_RETRY_BACKOFF_SECONDS * attempt_number)
+
+
+@lru_cache(maxsize=4)
+def _vertex_service_account_credentials(service_account_json: str):
+    payload = json.loads(service_account_json)
+    return service_account.Credentials.from_service_account_info(
+        payload,
+        scopes=[_GOOGLE_CLOUD_PLATFORM_SCOPE],
+    )
+
+
+def _vertex_access_token(runtime_options: AgentRuntimeOptions | None) -> str:
+    settings = get_settings()
+    service_account_json = str(
+        (getattr(runtime_options, "vertex_service_account_json", None) if runtime_options else None)
+        or settings.vertex_service_account_json
+        or ""
+    ).strip()
+    if not service_account_json:
+        raise RuntimeError("Vertex Gemini provider requires ONTOAGENT_VERTEX_SERVICE_ACCOUNT_JSON.")
+
+    credentials = _vertex_service_account_credentials(service_account_json)
+    credentials.refresh(GoogleAuthRequest())
+    return str(credentials.token or "")
+
+
+def _vertex_endpoint_url(runtime_options: AgentRuntimeOptions | None, model: str) -> str:
+    settings = get_settings()
+    project = str(
+        (getattr(runtime_options, "vertex_project", None) if runtime_options else None)
+        or settings.vertex_project
+        or ""
+    ).strip()
+    location = str(
+        (getattr(runtime_options, "vertex_location", None) if runtime_options else None)
+        or settings.vertex_location
+        or "us-central1"
+    ).strip()
+    if not project:
+        raise RuntimeError("Vertex Gemini provider requires ONTOAGENT_VERTEX_PROJECT.")
+    clean_model = str(model or "").strip()
+    if clean_model.startswith("publishers/google/models/"):
+        clean_model = clean_model.split("publishers/google/models/", 1)[1]
+    if clean_model.startswith("google/"):
+        clean_model = clean_model.split("google/", 1)[1]
+
+    return (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}"
+        f"/publishers/google/models/{clean_model}:streamGenerateContent?alt=sse"
+    )
+
+
 def _failure_log_fields(exc: Exception) -> dict[str, Any]:
     return {
         "error_class": exc.__class__.__name__,
@@ -310,6 +415,230 @@ def _failure_log_fields(exc: Exception) -> dict[str, Any]:
         "retry_after_seconds": _error_retry_after_seconds(exc),
         "rate_limited": _is_rate_limit_error(exc),
     }
+
+
+def _google_stream_extra_body(*, base_url: str | None, model: str | None) -> dict[str, Any] | None:
+    if not _uses_google_openai_base(base_url):
+        return None
+    clean_model = str(model or "").strip()
+    if not any(clean_model.startswith(prefix) for prefix in _GOOGLE_THOUGHT_REQUEST_MODEL_PREFIXES):
+        return None
+    return {
+        "extra_body": {
+            "google": {
+                "thinking_config": {
+                    "thinking_level": "low",
+                    "include_thoughts": True,
+                }
+            }
+        }
+    }
+
+
+def _strip_google_thought_tags(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = cleaned.replace("<thought>", "")
+    cleaned = cleaned.replace("</thought>", "")
+    return cleaned
+
+
+def _update_usage_from_openai_chunk(usage: dict[str, Any], chunk_payload: dict[str, Any]) -> None:
+    usage_payload = chunk_payload.get("usage")
+    if isinstance(usage_payload, dict):
+        if usage_payload.get("prompt_tokens") is not None:
+            usage["prompt_tokens"] = usage_payload.get("prompt_tokens")
+        if usage_payload.get("completion_tokens") is not None:
+            usage["completion_tokens"] = usage_payload.get("completion_tokens")
+        if usage_payload.get("total_tokens") is not None:
+            usage["total_tokens"] = usage_payload.get("total_tokens")
+    model_name = chunk_payload.get("model")
+    if model_name:
+        usage["model"] = model_name
+
+
+def _stream_openai_compatible_events(
+    *,
+    runtime_options: AgentRuntimeOptions,
+    model: str,
+    messages: list[Any],
+    usage_state: dict[str, Any],
+    answer_chunks: list[str],
+    reasoning_chunks: list[str],
+) -> Iterator[dict[str, Any]]:
+    base_url = (runtime_options.openai_api_base if runtime_options else None) or get_settings().openai_api_base
+    client = OpenAI(
+        api_key=(runtime_options.openai_api_key if runtime_options else "") or get_settings().openai_api_key,
+        base_url=base_url,
+    )
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system" if isinstance(message, SystemMessage) else "user",
+                "content": str(message.content),
+            }
+            for message in messages
+        ],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    extra_body = _google_stream_extra_body(base_url=base_url, model=model)
+    if extra_body:
+        request_kwargs["extra_body"] = extra_body
+
+    saw_reasoning_text = False
+    saw_reasoning_signature = False
+
+    for chunk in client.chat.completions.create(**request_kwargs):
+        chunk_payload = chunk.model_dump(mode="json") if hasattr(chunk, "model_dump") else {}
+        _update_usage_from_openai_chunk(usage_state, chunk_payload)
+
+        choices = chunk_payload.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        raw_text = _flatten_chunk_text(delta.get("content"))
+        if not raw_text:
+            google_extra = ((delta.get("extra_content") or {}).get("google") or {})
+            if google_extra.get("thought_signature"):
+                saw_reasoning_signature = True
+            continue
+
+        google_extra = ((delta.get("extra_content") or {}).get("google") or {})
+        if google_extra.get("thought_signature"):
+            saw_reasoning_signature = True
+
+        if google_extra.get("thought") is True:
+            cleaned_thought = _strip_google_thought_tags(raw_text)
+            if cleaned_thought:
+                saw_reasoning_text = True
+                reasoning_chunks.append(cleaned_thought)
+                yield {"type": "reasoning_delta", "content": cleaned_thought}
+            continue
+
+        cleaned_answer = _strip_google_thought_tags(raw_text)
+        if cleaned_answer:
+            answer_chunks.append(cleaned_answer)
+            yield {"type": "delta", "content": cleaned_answer}
+
+    if saw_reasoning_text:
+        usage_state["reasoning_kind"] = "provider_thought_stream"
+        usage_state["reasoning_displayable"] = True
+    elif saw_reasoning_signature:
+        usage_state["reasoning_kind"] = "provider_thought_signature"
+
+
+def _stream_vertex_gemini_events(
+    *,
+    runtime_options: AgentRuntimeOptions,
+    model: str,
+    messages: list[Any],
+    usage_state: dict[str, Any],
+    answer_chunks: list[str],
+    reasoning_chunks: list[str],
+) -> Iterator[dict[str, Any]]:
+    system_parts: list[dict[str, str]] = []
+    user_parts: list[dict[str, str]] = []
+
+    for message in messages:
+        text = str(getattr(message, "content", "") or "").strip()
+        if not text:
+            continue
+        if isinstance(message, SystemMessage):
+            system_parts.append({"text": text})
+        else:
+            user_parts.append({"text": text})
+
+    if not user_parts:
+        raise RuntimeError("Vertex Gemini request is missing user content.")
+
+    request_body: dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": user_parts,
+            }
+        ],
+        "generationConfig": {
+            "thinkingConfig": {
+                "includeThoughts": True,
+            }
+        },
+    }
+    if system_parts:
+        request_body["systemInstruction"] = {"parts": system_parts}
+
+    response = requests.post(
+        _vertex_endpoint_url(runtime_options, model),
+        headers={
+            "Authorization": f"Bearer {_vertex_access_token(runtime_options)}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=request_body,
+        stream=True,
+        timeout=(15, 300),
+    )
+    response.raise_for_status()
+
+    saw_reasoning_text = False
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+        line = str(raw_line).strip()
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line.replace("data:", "", 1).strip()
+        if not payload:
+            continue
+        event = json.loads(payload)
+        usage_metadata = event.get("usageMetadata") or {}
+        if usage_metadata.get("promptTokenCount") is not None:
+            usage_state["prompt_tokens"] = usage_metadata.get("promptTokenCount")
+        if usage_metadata.get("candidatesTokenCount") is not None:
+            usage_state["completion_tokens"] = usage_metadata.get("candidatesTokenCount")
+        if usage_metadata.get("totalTokenCount") is not None:
+            usage_state["total_tokens"] = usage_metadata.get("totalTokenCount")
+        if usage_metadata.get("thoughtsTokenCount") is not None:
+            usage_state["reasoning_tokens"] = usage_metadata.get("thoughtsTokenCount")
+        if event.get("modelVersion"):
+            usage_state["model"] = event.get("modelVersion")
+
+        candidates = event.get("candidates") or []
+        if not candidates:
+            continue
+        parts = ((candidates[0].get("content") or {}).get("parts")) or []
+        for part in parts:
+            text = _flatten_chunk_text(part.get("text"))
+            if not text:
+                continue
+            if part.get("thought") is True:
+                saw_reasoning_text = True
+                reasoning_chunks.append(text)
+                yield {"type": "reasoning_delta", "content": text}
+            else:
+                answer_chunks.append(text)
+                yield {"type": "delta", "content": text}
+
+    if saw_reasoning_text:
+        usage_state["reasoning_kind"] = "provider_thought_stream"
+        usage_state["reasoning_displayable"] = True
+
+
+def _usage_allows_reasoning_display(usage: Any) -> bool:
+    if not isinstance(usage, dict):
+        return False
+    if usage.get("reasoning_displayable") is not True:
+        return False
+    if usage.get("reasoning_kind") != "provider_thought_stream":
+        return False
+    return True
+
+
+def _reasoning_is_user_visible(final_state: dict[str, Any]) -> bool:
+    usage = final_state.get("generation_usage")
+    if not _usage_allows_reasoning_display(usage):
+        return False
+    return bool(str(final_state.get("generation_reasoning") or "").strip())
 
 
 def _resolved_default_mcp_urls(settings: Any | None = None) -> set[str]:
@@ -404,28 +733,6 @@ def _build_response_messages(
     ]
 
 
-def _build_reasoning_messages(*, question: str, answer: str, citations: list[str]) -> list[Any]:
-    citation_text = "\n".join(f"- {item}" for item in citations) if citations else "- none"
-    return [
-        SystemMessage(
-            content=(
-                "Write a concise reasoning summary for the user-visible answer.\n"
-                "Rules:\n"
-                "- Use 2-4 short bullet points.\n"
-                "- Explain why the answer was selected.\n"
-                "- Do not reveal hidden chain-of-thought.\n"
-                "- Do not introduce facts outside the provided answer/citations."
-            )
-        ),
-        HumanMessage(
-            content=(
-                f"Question: {question}\n"
-                f"Answer: {answer}\n"
-                f"Citations:\n{citation_text}"
-            )
-        ),
-    ]
-
 def _retrieve_runtime_state(prompt: str, runtime_options: AgentRuntimeOptions | None) -> dict[str, Any]:
     settings = get_settings()
     mcp_endpoints = runtime_options.mcp_endpoints if runtime_options and runtime_options.mcp_endpoints else settings.resolved_mcp_endpoints()
@@ -512,10 +819,6 @@ def _collect_graph_final_state(
 
 
 def _emit_final_state(final_state: dict[str, Any]) -> Iterator[str]:
-    model_reasoning = final_state.get("generation_reasoning")
-    if model_reasoning:
-        yield _sse({"type": "model_reasoning", "content": str(model_reasoning)})
-
     generation_usage = final_state.get("generation_usage")
     if isinstance(generation_usage, dict):
         yield _sse({"type": "usage", "content": generation_usage})
@@ -564,12 +867,18 @@ def _encryption_required() -> EncryptionService:
 def _default_settings_payload() -> dict[str, Any]:
     settings = get_settings()
     mcp_endpoints = settings.default_mcp_endpoints or settings.resolved_mcp_endpoints()
+    default_generation_provider = settings.default_generation_provider
+    default_generation_base = (
+        settings.default_generation_base_url
+        if settings.default_generation_base_url is not None
+        else ("" if default_generation_provider == "vertex_gemini" else settings.openai_api_base or "")
+    )
     return {
         "generation": {
-            "provider": settings.default_generation_provider,
+            "provider": default_generation_provider,
             "model": settings.default_generation_model or settings.llm_model,
             "api_key": "",
-            "base_url": settings.default_generation_base_url or settings.openai_api_base or "",
+            "base_url": default_generation_base,
         },
         "embeddings": {
             "provider": settings.default_embeddings_provider,
@@ -600,16 +909,24 @@ def _default_settings_payload() -> dict[str, Any]:
 
 
 def _normalize_provider(provider_payload: dict[str, Any], default_payload: dict[str, Any]) -> dict[str, Any]:
+    api_key = str(provider_payload.get("api_key", "") or "")
+    if api_key == "__configured__":
+        api_key = ""
     normalized = dict(default_payload)
     normalized.update(
         {
             "provider": str(provider_payload.get("provider", default_payload.get("provider", "openai_compatible"))),
             "model": str(provider_payload.get("model", default_payload.get("model", "")) or ""),
-            "api_key": str(provider_payload.get("api_key", "") or ""),
+            "api_key": api_key,
             "base_url": str(provider_payload.get("base_url", default_payload.get("base_url", "")) or ""),
         }
     )
     return normalized
+
+
+def _has_persisted_secret(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text != "__configured__"
 
 
 def _normalize_settings_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
@@ -629,11 +946,14 @@ def _normalize_settings_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
         url = str(item.get("url", "")).strip()
         if not url:
             continue
+        api_key = str(item.get("api_key", "") or "")
+        if api_key == "__configured__":
+            api_key = ""
         mcp_servers.append(
             {
                 "name": str(item.get("name", "MCP")).strip() or "MCP",
                 "url": url,
-                "api_key": str(item.get("api_key", "") or ""),
+                "api_key": api_key,
                 "enabled": bool(item.get("enabled", True)),
                 "timeout_ms": _normalized_mcp_timeout_ms(item.get("timeout_ms"), url=url),
             }
@@ -739,12 +1059,19 @@ def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRun
     resolved_openai_key = str(generation.get("api_key") or "").strip() or settings.openai_api_key
     resolved_openai_base = str(generation.get("base_url") or "").strip() or settings.openai_api_base
     resolved_llm_model = str(generation.get("model") or "").strip() or settings.llm_model
+    resolved_generation_provider = (
+        str(generation.get("provider") or "").strip() or settings.default_generation_provider
+    )
     resolved_mcp_endpoints = mcp_endpoint_configs or settings.default_mcp_endpoints or settings.resolved_mcp_endpoints()
 
     return AgentRuntimeOptions(
         openai_api_key=resolved_openai_key,
+        generation_provider=resolved_generation_provider,
         openai_api_base=resolved_openai_base,
         llm_model=resolved_llm_model,
+        vertex_project=getattr(settings, "vertex_project", None),
+        vertex_location=getattr(settings, "vertex_location", "us-central1"),
+        vertex_service_account_json=getattr(settings, "vertex_service_account_json", None),
         rag_top_k=_normalized_chunk_count(retrieval.get("chunk_count"), default=20),
         rag_base_url=settings.rag_base_url,
         rag_query_path=settings.rag_query_path,
@@ -788,16 +1115,26 @@ def _serialize_thread(thread) -> dict[str, Any]:
 
 
 def _serialize_message(message) -> dict[str, Any]:
+    usage = message.usage_json or {}
+    reasoning_summary = message.reasoning_summary or ""
+    if not _usage_allows_reasoning_display(usage):
+        reasoning_summary = ""
     return {
         "id": message.id,
         "thread_id": message.thread_id,
         "role": message.role,
         "content": message.content,
-        "reasoning_summary": message.reasoning_summary or "",
-        "usage": message.usage_json or {},
+        "reasoning_summary": reasoning_summary,
+        "usage": usage,
         "citations": message.citations_json or [],
         "created_at": message.created_at.isoformat() if message.created_at else None,
     }
+
+
+def _persistable_reasoning_summary(final_state: dict[str, Any]) -> str:
+    if not _reasoning_is_user_visible(final_state):
+        return ""
+    return str(final_state.get("generation_reasoning") or "").strip()
 
 
 def _stream_agent_response(
@@ -831,10 +1168,11 @@ def _stream_agent_response(
                 yield event
             final_response_text = str(final_state.get("final_response") or final_state.get("rag_result") or "").strip()
         else:
-            llm = _build_chat_model(runtime_options)
+            llm = None if _uses_vertex_gemini_provider(runtime_options) else _build_chat_model(runtime_options)
             resolved_model = str(runtime_options.llm_model or get_settings().llm_model or "")
             model_candidates = _generation_model_candidates(
                 resolved_model,
+                generation_provider=getattr(runtime_options, "generation_provider", None),
                 base_url=(runtime_options.openai_api_base if runtime_options else None) or get_settings().openai_api_base,
             )
             logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="runtime", model=resolved_model))
@@ -842,6 +1180,10 @@ def _stream_agent_response(
             intent = _classify_intent(llm, prompt)
             logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
             if intent == "EDIT":
+                if _uses_vertex_gemini_provider(runtime_options):
+                    raise RuntimeError(
+                        "Edit workflow is not enabled for the Vertex Gemini runtime yet. Use a retrieve/explain request or switch the provider in AI Settings."
+                    )
                 yield _sse({"type": "status", "message": "Edit workflow uses buffered execution."})
                 final_state = _collect_graph_final_state(agent=agent, prompt=prompt, thread_id=thread_id)
                 for event in _emit_final_state(final_state):
@@ -876,20 +1218,18 @@ def _stream_agent_response(
 
                 streamed_chunks: list[str] = []
                 stream_usage: dict[str, Any] = {"model": resolved_model}
-                active_llm: ChatOpenAI | None = None
+                streamed_reasoning: list[str] = []
                 last_stream_error: Exception | None = None
+                last_attempted_model = resolved_model
 
                 for index, candidate_model in enumerate(model_candidates):
-                    candidate_llm = _build_chat_model(runtime_options, model_override=candidate_model)
-                    candidate_usage: dict[str, Any] = {"model": candidate_model}
-                    candidate_chunks: list[str] = []
                     if index > 0:
                         logger.warning(
                             _log_event(
                                 "assistant_stream_model_fallback",
                                 **stream_context,
                                 intent=intent,
-                                previous_model=resolved_model,
+                                previous_model=last_attempted_model,
                                 fallback_model=candidate_model,
                             )
                         )
@@ -900,52 +1240,129 @@ def _stream_agent_response(
                             }
                         )
 
-                    try:
-                        try:
-                            for chunk in candidate_llm.stream(messages):
-                                text = _flatten_chunk_text(getattr(chunk, "content", chunk))
-                                if not text:
-                                    continue
-                                candidate_chunks.append(text)
-                                yield _sse({"type": "delta", "content": text})
-                        except Exception as exc:  # pragma: no cover - fallback path
+                    candidate_attempts = _stream_attempts_for_model(
+                        candidate_model,
+                        base_url=runtime_options.openai_api_base,
+                    )
+                    candidate_succeeded = False
+
+                    for attempt_index in range(candidate_attempts):
+                        candidate_llm = _build_chat_model(runtime_options, model_override=candidate_model)
+                        candidate_usage: dict[str, Any] = {"model": candidate_model}
+                        candidate_chunks: list[str] = []
+                        candidate_reasoning: list[str] = []
+
+                        if attempt_index > 0:
                             logger.warning(
                                 _log_event(
-                                    "assistant_stream_chunk_fallback",
+                                    "assistant_stream_model_retry",
                                     **stream_context,
                                     intent=intent,
                                     model=candidate_model,
+                                    attempt=attempt_index + 1,
+                                    attempts_total=candidate_attempts,
+                                )
+                            )
+                            yield _sse(
+                                {
+                                    "type": "status",
+                                    "message": f"Retrying {candidate_model} after a transient provider failure.",
+                                }
+                            )
+                            time.sleep(_stream_retry_delay_seconds(attempt_index))
+
+                        try:
+                            if _uses_vertex_gemini_provider(runtime_options):
+                                for event in _stream_vertex_gemini_events(
+                                    runtime_options=runtime_options,
+                                    model=candidate_model,
+                                    messages=messages,
+                                    usage_state=candidate_usage,
+                                    answer_chunks=candidate_chunks,
+                                    reasoning_chunks=candidate_reasoning,
+                                ):
+                                    yield _sse(event)
+                            elif _uses_google_openai_base(runtime_options.openai_api_base):
+                                for event in _stream_openai_compatible_events(
+                                    runtime_options=runtime_options,
+                                    model=candidate_model,
+                                    messages=messages,
+                                    usage_state=candidate_usage,
+                                    answer_chunks=candidate_chunks,
+                                    reasoning_chunks=candidate_reasoning,
+                                ):
+                                    yield _sse(event)
+                            else:
+                                try:
+                                    for chunk in candidate_llm.stream(messages):
+                                        text = _flatten_chunk_text(getattr(chunk, "content", chunk))
+                                        if not text:
+                                            continue
+                                        candidate_chunks.append(text)
+                                        yield _sse({"type": "delta", "content": text})
+                                except Exception as exc:  # pragma: no cover - fallback path
+                                    logger.warning(
+                                        _log_event(
+                                            "assistant_stream_chunk_fallback",
+                                            **stream_context,
+                                            intent=intent,
+                                            model=candidate_model,
+                                            **_failure_log_fields(exc),
+                                        )
+                                    )
+                                    reply = candidate_llm.invoke(messages)
+                                    candidate_usage.update(_extract_generation_usage(reply))
+                                    text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
+                                    candidate_chunks = []
+                                    for chunk in _iter_text_chunks(text):
+                                        candidate_chunks.append(chunk)
+                                        yield _sse({"type": "delta", "content": chunk})
+
+                            if not candidate_chunks:
+                                reply = candidate_llm.invoke(messages)
+                                candidate_usage.update(_extract_generation_usage(reply))
+                                text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
+                                candidate_chunks = []
+                                for chunk in _iter_text_chunks(text):
+                                    candidate_chunks.append(chunk)
+                                    yield _sse({"type": "delta", "content": chunk})
+
+                            streamed_chunks = candidate_chunks
+                            streamed_reasoning = candidate_reasoning
+                            stream_usage = candidate_usage
+                            resolved_model = candidate_model
+                            last_attempted_model = candidate_model
+                            candidate_succeeded = True
+                            break
+                        except Exception as exc:
+                            last_stream_error = exc
+                            last_attempted_model = candidate_model
+                            logger.warning(
+                                _log_event(
+                                    "assistant_stream_model_attempt_failed",
+                                    **stream_context,
+                                    intent=intent,
+                                    model=candidate_model,
+                                    attempt=attempt_index + 1,
+                                    attempts_total=candidate_attempts,
+                                    response_started=bool(candidate_chunks),
+                                    reasoning_started=bool(candidate_reasoning),
+                                    error=str(exc),
                                     **_failure_log_fields(exc),
                                 )
                             )
-                            reply = candidate_llm.invoke(messages)
-                            candidate_usage.update(_extract_generation_usage(reply))
-                            text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
-                            candidate_chunks = []
-                            for chunk in _iter_text_chunks(text):
-                                candidate_chunks.append(chunk)
-                                yield _sse({"type": "delta", "content": chunk})
+                            if candidate_reasoning and not candidate_chunks:
+                                yield _sse({"type": "reasoning_reset"})
+                            if candidate_chunks:
+                                raise
+                            if attempt_index < candidate_attempts - 1 and _can_retry_with_fallback_model(exc):
+                                continue
+                            if index == len(model_candidates) - 1 or not _can_retry_with_fallback_model(exc):
+                                raise
+                            break
 
-                        if not candidate_chunks:
-                            reply = candidate_llm.invoke(messages)
-                            candidate_usage.update(_extract_generation_usage(reply))
-                            text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
-                            candidate_chunks = []
-                            for chunk in _iter_text_chunks(text):
-                                candidate_chunks.append(chunk)
-                                yield _sse({"type": "delta", "content": chunk})
-
-                        streamed_chunks = candidate_chunks
-                        stream_usage = candidate_usage
-                        active_llm = candidate_llm
-                        resolved_model = candidate_model
+                    if candidate_succeeded:
                         break
-                    except Exception as exc:
-                        last_stream_error = exc
-                        if candidate_chunks:
-                            raise
-                        if index == len(model_candidates) - 1 or not _can_retry_with_fallback_model(exc):
-                            raise
 
                 if not streamed_chunks and last_stream_error is not None:
                     raise last_stream_error
@@ -954,11 +1371,8 @@ def _stream_agent_response(
                 final_state["final_response"] = final_response_text
                 final_state["generation_backend"] = f"llm:{resolved_model}"
                 final_state["generation_usage"] = stream_usage
-
-                reasoning_text = str(final_state.get("generation_reasoning") or "").strip()
-                if reasoning_text:
-                    final_state["generation_reasoning"] = reasoning_text
-                    yield _sse({"type": "model_reasoning", "content": reasoning_text})
+                if streamed_reasoning:
+                    final_state["generation_reasoning"] = "".join(streamed_reasoning).strip()
                 yield _sse({"type": "usage", "content": stream_usage})
         logger.info(
             _log_event(
@@ -1098,7 +1512,15 @@ def me_put_settings(
     for provider_key in ("generation", "embeddings", "reranker"):
         incoming_provider = normalized_payload.get(provider_key, {})
         existing_provider = existing_payload.get(provider_key, {})
-        if not str(incoming_provider.get("api_key", "")).strip() and str(existing_provider.get("api_key", "")).strip():
+        incoming_provider_name = str(incoming_provider.get("provider", "")).strip().lower()
+        existing_provider_name = str(existing_provider.get("provider", "")).strip().lower()
+        if (
+            incoming_provider_name != "vertex_gemini"
+            and
+            incoming_provider_name == existing_provider_name
+            and not str(incoming_provider.get("api_key", "")).strip()
+            and _has_persisted_secret(existing_provider.get("api_key", ""))
+        ):
             incoming_provider["api_key"] = str(existing_provider.get("api_key", "")).strip()
 
     existing_mcp_by_identity = {
@@ -1108,7 +1530,7 @@ def me_put_settings(
     for server in normalized_payload.get("mcp_servers", []):
         identity = (server.get("name", "").strip(), server.get("url", "").strip())
         existing_server = existing_mcp_by_identity.get(identity)
-        if existing_server and not str(server.get("api_key", "")).strip() and str(existing_server.get("api_key", "")).strip():
+        if existing_server and not str(server.get("api_key", "")).strip() and _has_persisted_secret(existing_server.get("api_key", "")):
             server["api_key"] = str(existing_server.get("api_key", "")).strip()
 
     settings_blob = {
@@ -1303,7 +1725,7 @@ def me_chat_stream(
             thread_id=thread.thread_id,
             role="assistant",
             content=final_response_text or "No response generated.",
-            reasoning_summary=str(final_state.get("generation_reasoning") or ""),
+            reasoning_summary=_persistable_reasoning_summary(final_state),
             usage_json=final_state.get("generation_usage") if isinstance(final_state.get("generation_usage"), dict) else {},
             citations_json=final_state.get("citations") if isinstance(final_state.get("citations"), list) else [],
         )

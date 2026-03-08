@@ -28,6 +28,7 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
         "generation_reasoning": "- Picked BWMD because it has explicit Aluminium classes.",
         "generation_usage": {
             "model": "test-model",
+            "reasoning_kind": "provider_thought_stream",
             "prompt_tokens": 12,
             "completion_tokens": 34,
             "reasoning_tokens": 7,
@@ -58,8 +59,8 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
     assert "Assistant request received" in response.text
-    assert "\"type\": \"model_reasoning\"" in response.text
-    assert "Picked BWMD because it has explicit Aluminium classes." in response.text
+    assert "\"type\": \"reasoning_delta\"" not in response.text
+    assert "Picked BWMD because it has explicit Aluminium classes." not in response.text
     assert "\"type\": \"usage\"" in response.text
     assert "\"model\": \"test-model\"" in response.text
     assert "\"reasoning_tokens\": 7" in response.text

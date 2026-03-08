@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 if importlib.util.find_spec("ontoportal_agent") is None:
     pytest.skip("ontoportal_agent package not available", allow_module_level=True)
@@ -119,6 +120,154 @@ def test_settings_crud_redacts_secrets(monkeypatch, tmp_path):
     assert get_body["generation"]["api_key"] == "__configured__"
     assert get_body["retrieval"]["chunk_count"] == 12
     assert get_body["mcp_servers"][0]["api_key"] == "__configured__"
+
+    masked_save = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gemini-2.5-pro",
+                "api_key": "__configured__",
+                "base_url": "https://example.test/openai",
+            },
+            "embeddings": get_body["embeddings"],
+            "reranker": get_body["reranker"],
+            "retrieval": {"chunk_count": 8},
+            "mcp_servers": get_body["mcp_servers"],
+        },
+        headers=headers,
+    )
+    assert masked_save.status_code == 200
+    masked_body = masked_save.json()
+    assert masked_body["generation"]["api_key"] == "__configured__"
+    assert masked_body["generation"]["model"] == "gemini-2.5-pro"
+    assert masked_body["mcp_servers"][0]["api_key"] == "__configured__"
+
+
+def test_switching_provider_does_not_preserve_previous_secret(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    initial = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gemini-3.1-pro-preview",
+                "api_key": "old-openai-key",
+                "base_url": "https://example.test/openai",
+            },
+            "embeddings": {
+                "provider": "openai_compatible",
+                "model": "text-embedding-005",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "reranker": {
+                "provider": "none",
+                "model": "",
+                "api_key": "",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert initial.status_code == 200
+    assert initial.json()["generation"]["api_key"] == "__configured__"
+
+    switched = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "vertex_gemini",
+                "model": "gemini-2.5-pro",
+                "api_key": "",
+                "base_url": "",
+            },
+            "embeddings": {
+                "provider": "openai_compatible",
+                "model": "text-embedding-005",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "reranker": {
+                "provider": "none",
+                "model": "",
+                "api_key": "",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert switched.status_code == 200
+    assert switched.json()["generation"]["api_key"] == ""
+
+    repeated = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "vertex_gemini",
+                "model": "gemini-2.5-pro",
+                "api_key": "",
+                "base_url": "",
+            },
+            "embeddings": {
+                "provider": "openai_compatible",
+                "model": "text-embedding-005",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "reranker": {
+                "provider": "none",
+                "model": "",
+                "api_key": "",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["generation"]["api_key"] == ""
+
+
+def test_serialize_message_hides_non_displayable_reasoning():
+    hidden = server._serialize_message(
+        SimpleNamespace(
+            id=1,
+            thread_id="thread-1",
+            role="assistant",
+            content="Answer.",
+            reasoning_summary="Synthetic explanation.",
+            usage_json={"reasoning_kind": "provider_thought_stream"},
+            citations_json=[],
+            created_at=None,
+        )
+    )
+    shown = server._serialize_message(
+        SimpleNamespace(
+            id=2,
+            thread_id="thread-1",
+            role="assistant",
+            content="Answer.",
+            reasoning_summary="Native provider thought stream.",
+            usage_json={
+                "reasoning_kind": "provider_thought_stream",
+                "reasoning_displayable": True,
+            },
+            citations_json=[],
+            created_at=None,
+        )
+    )
+
+    assert hidden["reasoning_summary"] == ""
+    assert shown["reasoning_summary"] == "Native provider thought stream."
 
 
 def test_me_chat_stream_persists_messages(monkeypatch, tmp_path):
@@ -243,6 +392,214 @@ def test_me_chat_stream_exposes_and_persists_quota_errors(monkeypatch, tmp_path,
     assert messages[1]["usage"]["error"]["trace_id"]
 
     assert any("assistant_stream_failed" in record.message and "trace_id=" in record.message for record in caplog.records)
+
+
+def test_me_chat_stream_retries_same_reasoning_model_before_fallback(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+
+    class _TransientError(Exception):
+        status_code = 503
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = SimpleNamespace(
+                openai_api_key="test-openai-key",
+                openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+                llm_model="gemini-3.1-pro-preview-customtools",
+                rag_top_k=12,
+                rag_base_url="http://rag.internal",
+                rag_query_path="/api/v1/query",
+                mcp_endpoints=[],
+                mcp_api_key=None,
+                mcp_rag_tool_name="rag_query",
+            )
+
+    attempts: list[str] = []
+
+    def _stream_events(*, model, usage_state, answer_chunks, reasoning_chunks, **_kwargs):
+        attempts.append(model)
+        if len(attempts) == 1:
+            raise _TransientError("Error code: 503 - temporarily unavailable")
+        reasoning_chunks.append("Provider reasoning.")
+        usage_state["reasoning_kind"] = "provider_thought_stream"
+        yield {"type": "reasoning_delta", "content": "Provider reasoning."}
+        answer_chunks.append("Recovered answer.")
+        yield {"type": "delta", "content": "Recovered answer."}
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _DummyAgent)
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: SimpleNamespace())
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda _prompt, _runtime_options: {
+            "citations": [],
+            "rag_result": "",
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+            "retrieval_chunk_count": 12,
+        },
+    )
+    monkeypatch.setattr(server, "_stream_openai_compatible_events", _stream_events)
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+
+    thread_resp = client.post("/api/v1/me/threads", json={"title": "Retry thread"}, headers=headers)
+    assert thread_resp.status_code == 200
+    thread_id = thread_resp.json()["thread_id"]
+
+    response = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "Explain interoperability", "thread_id": thread_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert attempts == [
+        "gemini-3.1-pro-preview-customtools",
+        "gemini-3.1-pro-preview-customtools",
+    ]
+    assert "Retrying gemini-3.1-pro-preview-customtools after a transient provider failure." in response.text
+    assert "\"type\": \"reasoning_delta\"" in response.text
+    assert "Recovered answer." in response.text
+    assert "Switching to gemini-3.1-pro-preview" not in response.text
+
+
+def test_me_chat_stream_resets_stale_reasoning_before_fallback(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+
+    class _TransientError(Exception):
+        status_code = 503
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = SimpleNamespace(
+                openai_api_key="test-openai-key",
+                openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+                llm_model="gemini-3.1-pro-preview-customtools",
+                rag_top_k=12,
+                rag_base_url="http://rag.internal",
+                rag_query_path="/api/v1/query",
+                mcp_endpoints=[],
+                mcp_api_key=None,
+                mcp_rag_tool_name="rag_query",
+            )
+
+    attempts: list[str] = []
+
+    def _stream_events(*, model, usage_state, answer_chunks, reasoning_chunks, **_kwargs):
+        attempts.append(model)
+        if model == "gemini-3.1-pro-preview-customtools":
+            reasoning_chunks.append("Stale reasoning.")
+            yield {"type": "reasoning_delta", "content": "Stale reasoning."}
+            raise _TransientError("Error code: 503 - temporarily unavailable")
+        reasoning_chunks.append("Fresh reasoning.")
+        usage_state["reasoning_kind"] = "provider_thought_stream"
+        yield {"type": "reasoning_delta", "content": "Fresh reasoning."}
+        answer_chunks.append("Fallback answer.")
+        yield {"type": "delta", "content": "Fallback answer."}
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _DummyAgent)
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: SimpleNamespace())
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda _prompt, _runtime_options: {
+            "citations": [],
+            "rag_result": "",
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+            "retrieval_chunk_count": 12,
+        },
+    )
+    monkeypatch.setattr(server, "_stream_openai_compatible_events", _stream_events)
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+
+    thread_resp = client.post("/api/v1/me/threads", json={"title": "Fallback thread"}, headers=headers)
+    assert thread_resp.status_code == 200
+    thread_id = thread_resp.json()["thread_id"]
+
+    response = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "Explain interoperability", "thread_id": thread_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert attempts == [
+        "gemini-3.1-pro-preview-customtools",
+        "gemini-3.1-pro-preview-customtools",
+        "gemini-3.1-pro-preview",
+    ]
+    assert "\"type\": \"reasoning_reset\"" in response.text
+    assert "Switching to gemini-3.1-pro-preview." in response.text
+    assert "Fallback answer." in response.text
+
+
+def test_stream_vertex_gemini_events_emits_reasoning_and_usage(monkeypatch):
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, decode_unicode=True):
+            yield 'data: {"candidates":[{"content":{"parts":[{"text":"Thinking step.","thought":true}]}}],"usageMetadata":{"trafficType":"ON_DEMAND"},"modelVersion":"gemini-2.5-pro"}'
+            yield 'data: {"candidates":[{"content":{"parts":[{"text":"Final answer."}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4,"totalTokenCount":30,"thoughtsTokenCount":16},"modelVersion":"gemini-2.5-pro"}'
+
+    captured = {}
+
+    def _fake_post(url, headers, json, stream, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["stream"] = stream
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(server, "_vertex_access_token", lambda _runtime_options: "token-123")
+    monkeypatch.setattr(server, "_vertex_endpoint_url", lambda _runtime_options, model: f"https://vertex.test/{model}")
+    monkeypatch.setattr(server.requests, "post", _fake_post)
+
+    usage = {"model": "gemini-2.5-pro"}
+    answer_chunks = []
+    reasoning_chunks = []
+    runtime_options = SimpleNamespace(generation_provider="vertex_gemini")
+
+    events = list(
+        server._stream_vertex_gemini_events(
+            runtime_options=runtime_options,
+            model="gemini-2.5-pro",
+            messages=[
+                SystemMessage(content="System guidance."),
+                HumanMessage(content="Explain ontology interoperability."),
+            ],
+            usage_state=usage,
+            answer_chunks=answer_chunks,
+            reasoning_chunks=reasoning_chunks,
+        )
+    )
+
+    assert events == [
+        {"type": "reasoning_delta", "content": "Thinking step."},
+        {"type": "delta", "content": "Final answer."},
+    ]
+    assert usage["model"] == "gemini-2.5-pro"
+    assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 4
+    assert usage["total_tokens"] == 30
+    assert usage["reasoning_tokens"] == 16
+    assert usage["reasoning_kind"] == "provider_thought_stream"
+    assert usage["reasoning_displayable"] is True
+    assert answer_chunks == ["Final answer."]
+    assert reasoning_chunks == ["Thinking step."]
+    assert captured["url"] == "https://vertex.test/gemini-2.5-pro"
+    assert captured["headers"]["Authorization"] == "Bearer token-123"
+    assert captured["json"]["systemInstruction"]["parts"][0]["text"] == "System guidance."
+    assert captured["json"]["contents"][0]["parts"][0]["text"] == "Explain ontology interoperability."
+    assert captured["stream"] is True
 
 
 def test_retrieve_runtime_state_prefers_direct_rag(monkeypatch):
@@ -428,22 +785,27 @@ def test_stream_agent_response_falls_back_to_latest_google_model(monkeypatch):
         def invoke(self, _messages):
             raise _BusyError("Error code: 503 - This model is currently experiencing high demand.")
 
-    class _WorkingLlm:
-        def stream(self, _messages):
-            yield AIMessage(content="Fallback answer from flash.")
-
-        def invoke(self, _messages):
-            return AIMessage(content="")
-
     def _build_llm(runtime_options, *, model_override=None):
         model = model_override or runtime_options.llm_model
+        return SimpleNamespace(model=model)
+
+    def _stream_openai_events(*, runtime_options, model, messages, usage_state, answer_chunks, reasoning_chunks):
         if model == "gemini-3.1-pro-preview":
-            return _BusyLlm()
-        if model == "gemini-3-flash-preview":
-            return _WorkingLlm()
+            raise _BusyError("Error code: 503 - This model is currently experiencing high demand.")
+        if model == "gemini-3.1-pro-preview-customtools":
+            raise _BusyError("Error code: 503 - This model is currently experiencing high demand.")
+        if model == "gemini-3-pro-preview":
+            usage_state["model"] = model
+            reasoning_chunks.append("Fallback reasoning from Gemini 3 Pro.")
+            usage_state["reasoning_kind"] = "provider_thought_stream"
+            yield {"type": "reasoning_delta", "content": "Fallback reasoning from Gemini 3 Pro."}
+            answer_chunks.append("Fallback answer from Gemini 3 Pro.")
+            yield {"type": "delta", "content": "Fallback answer from Gemini 3 Pro."}
+            return
         raise AssertionError(f"unexpected model {model}")
 
     monkeypatch.setattr(server, "_build_chat_model", _build_llm)
+    monkeypatch.setattr(server, "_stream_openai_compatible_events", _stream_openai_events)
     monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
     monkeypatch.setattr(
         server,
@@ -472,5 +834,6 @@ def test_stream_agent_response_falls_back_to_latest_google_model(monkeypatch):
         )
     )
 
-    assert "Primary model unavailable. Switching to gemini-3-flash-preview." in events
-    assert "Fallback answer from flash." in events
+    assert "Primary model unavailable. Switching to gemini-3-pro-preview." in events
+    assert "Fallback reasoning from Gemini 3 Pro." in events
+    assert "Fallback answer from Gemini 3 Pro." in events
