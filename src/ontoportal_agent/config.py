@@ -28,7 +28,7 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_OPENAI_API_BASE", "OPENAI_API_BASE"),
     )
     llm_model: str = Field(
-        default="gpt-4o-mini",
+        default="gemini-3-flash-preview",
         validation_alias=AliasChoices("ONTOAGENT_LLM_MODEL", "LLM_MODEL"),
     )
     max_rag_context_chars: int = Field(
@@ -124,7 +124,7 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_PROVIDER", "DEFAULT_GENERATION_PROVIDER"),
     )
     default_generation_model: str = Field(
-        default="gemini-2.5-flash-lite",
+        default="gemini-3-flash-preview",
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_GENERATION_MODEL", "DEFAULT_GENERATION_MODEL"),
     )
     default_generation_base_url: Optional[str] = Field(

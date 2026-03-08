@@ -209,31 +209,6 @@ def build_agent_graph(
                 llm_content = llm_content[: settings.max_response_chars].rstrip() + "..."
             state["final_response"] = llm_content
             state["generation_backend"] = f"llm:{llm_model}"
-            if not reasoning_text:
-                reasoning_prompt = [
-                    SystemMessage(
-                        content=(
-                            "Write a concise reasoning summary for the user-visible answer.\n"
-                            "Rules:\n"
-                            "- Use 2-4 short bullet points.\n"
-                            "- Explain why the answer was selected.\n"
-                            "- Do not reveal hidden chain-of-thought.\n"
-                            "- Do not introduce facts outside the provided answer/citations."
-                        )
-                    ),
-                    HumanMessage(
-                        content=(
-                            f"Question: {question}\n"
-                            f"Answer: {llm_content}\n"
-                            f"Citations:\n{citation_text}"
-                        )
-                    ),
-                ]
-                try:
-                    summary_reply = llm.invoke(reasoning_prompt)
-                    reasoning_text = summary_reply.content if isinstance(summary_reply.content, str) else str(summary_reply.content or "")
-                except Exception:  # noqa: BLE001 - reasoning summary is optional.
-                    reasoning_text = ""
         else:
             state["final_response"] = ""
             state["generation_backend"] = "none"

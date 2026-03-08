@@ -57,6 +57,13 @@ _agent_instance: Optional[OntoPortalAgent] = None
 
 _LEGACY_DEFAULT_MCP_TIMEOUT_MS = 10_000
 _BUILTIN_DEFAULT_MCP_TIMEOUT_MS = 30_000
+_GOOGLE_OPENAI_BASE_MARKER = "generativelanguage.googleapis.com"
+_GOOGLE_GEMINI_FALLBACK_MODELS = (
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
+)
 
 
 class ChatStreamRequest(BaseModel):
@@ -257,6 +264,45 @@ def _stream_failure_payload(exc: Exception) -> tuple[str, str]:
     return ("Assistant request failed.", "Assistant backend failed while handling the request.")
 
 
+def _uses_google_openai_base(base_url: str | None) -> bool:
+    return _GOOGLE_OPENAI_BASE_MARKER in str(base_url or "").strip().lower()
+
+
+def _generation_model_candidates(selected_model: str | None, *, base_url: str | None) -> list[str]:
+    clean_selected = str(selected_model or "").strip()
+    candidates: list[str] = []
+    if clean_selected:
+        candidates.append(clean_selected)
+
+    if _uses_google_openai_base(base_url):
+        for candidate in _GOOGLE_GEMINI_FALLBACK_MODELS:
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates or ([clean_selected] if clean_selected else [])
+
+
+def _can_retry_with_fallback_model(exc: Exception) -> bool:
+    status_code = _error_status_code(exc)
+    if status_code in {400, 404, 408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+
+    text = str(exc).lower()
+    retry_markers = (
+        "resource_exhausted",
+        "high demand",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "connection error",
+        "unsupported",
+        "not found",
+        "cannot find field",
+        "unknown name",
+    )
+    return any(marker in text for marker in retry_markers)
+
+
 def _failure_log_fields(exc: Exception) -> dict[str, Any]:
     return {
         "error_class": exc.__class__.__name__,
@@ -304,12 +350,16 @@ def _derive_thread_title(prompt: str, *, max_chars: int = 72) -> str:
     return trimmed.rstrip(" .,:;!-") + "..."
 
 
-def _build_chat_model(runtime_options: AgentRuntimeOptions | None) -> ChatOpenAI:
+def _build_chat_model(
+    runtime_options: AgentRuntimeOptions | None,
+    *,
+    model_override: str | None = None,
+) -> ChatOpenAI:
     settings = get_settings()
     return ChatOpenAI(
         api_key=(runtime_options.openai_api_key if runtime_options else "") or settings.openai_api_key,
         base_url=(runtime_options.openai_api_base if runtime_options else None) or settings.openai_api_base,
-        model=(runtime_options.llm_model if runtime_options else None) or settings.llm_model,
+        model=model_override or (runtime_options.llm_model if runtime_options else None) or settings.llm_model,
         temperature=0.0,
     )
 
@@ -375,7 +425,6 @@ def _build_reasoning_messages(*, question: str, answer: str, citations: list[str
             )
         ),
     ]
-
 
 def _retrieve_runtime_state(prompt: str, runtime_options: AgentRuntimeOptions | None) -> dict[str, Any]:
     settings = get_settings()
@@ -784,6 +833,10 @@ def _stream_agent_response(
         else:
             llm = _build_chat_model(runtime_options)
             resolved_model = str(runtime_options.llm_model or get_settings().llm_model or "")
+            model_candidates = _generation_model_candidates(
+                resolved_model,
+                base_url=(runtime_options.openai_api_base if runtime_options else None) or get_settings().openai_api_base,
+            )
             logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="runtime", model=resolved_model))
             yield _sse({"type": "status", "message": "Classifying request..."})
             intent = _classify_intent(llm, prompt)
@@ -823,70 +876,86 @@ def _stream_agent_response(
 
                 streamed_chunks: list[str] = []
                 stream_usage: dict[str, Any] = {"model": resolved_model}
-                try:
-                    for chunk in llm.stream(messages):
-                        text = _flatten_chunk_text(getattr(chunk, "content", chunk))
-                        if not text:
-                            continue
-                        streamed_chunks.append(text)
-                        yield _sse({"type": "delta", "content": text})
-                except Exception as exc:  # pragma: no cover - fallback path
-                    logger.warning(
-                        _log_event(
-                            "assistant_stream_chunk_fallback",
-                            **stream_context,
-                            intent=intent,
-                            model=resolved_model,
-                            **_failure_log_fields(exc),
-                        )
-                    )
-                    reply = llm.invoke(messages)
-                    stream_usage.update(_extract_generation_usage(reply))
-                    text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
-                    streamed_chunks = []
-                    for chunk in _iter_text_chunks(text):
-                        streamed_chunks.append(chunk)
-                        yield _sse({"type": "delta", "content": chunk})
+                active_llm: ChatOpenAI | None = None
+                last_stream_error: Exception | None = None
 
-                if not streamed_chunks:
-                    reply = llm.invoke(messages)
-                    stream_usage.update(_extract_generation_usage(reply))
-                    text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
-                    streamed_chunks = []
-                    for chunk in _iter_text_chunks(text):
-                        streamed_chunks.append(chunk)
-                        yield _sse({"type": "delta", "content": chunk})
+                for index, candidate_model in enumerate(model_candidates):
+                    candidate_llm = _build_chat_model(runtime_options, model_override=candidate_model)
+                    candidate_usage: dict[str, Any] = {"model": candidate_model}
+                    candidate_chunks: list[str] = []
+                    if index > 0:
+                        logger.warning(
+                            _log_event(
+                                "assistant_stream_model_fallback",
+                                **stream_context,
+                                intent=intent,
+                                previous_model=resolved_model,
+                                fallback_model=candidate_model,
+                            )
+                        )
+                        yield _sse(
+                            {
+                                "type": "status",
+                                "message": f"Primary model unavailable. Switching to {candidate_model}.",
+                            }
+                        )
+
+                    try:
+                        try:
+                            for chunk in candidate_llm.stream(messages):
+                                text = _flatten_chunk_text(getattr(chunk, "content", chunk))
+                                if not text:
+                                    continue
+                                candidate_chunks.append(text)
+                                yield _sse({"type": "delta", "content": text})
+                        except Exception as exc:  # pragma: no cover - fallback path
+                            logger.warning(
+                                _log_event(
+                                    "assistant_stream_chunk_fallback",
+                                    **stream_context,
+                                    intent=intent,
+                                    model=candidate_model,
+                                    **_failure_log_fields(exc),
+                                )
+                            )
+                            reply = candidate_llm.invoke(messages)
+                            candidate_usage.update(_extract_generation_usage(reply))
+                            text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
+                            candidate_chunks = []
+                            for chunk in _iter_text_chunks(text):
+                                candidate_chunks.append(chunk)
+                                yield _sse({"type": "delta", "content": chunk})
+
+                        if not candidate_chunks:
+                            reply = candidate_llm.invoke(messages)
+                            candidate_usage.update(_extract_generation_usage(reply))
+                            text = _flatten_chunk_text(getattr(reply, "content", reply)).strip()
+                            candidate_chunks = []
+                            for chunk in _iter_text_chunks(text):
+                                candidate_chunks.append(chunk)
+                                yield _sse({"type": "delta", "content": chunk})
+
+                        streamed_chunks = candidate_chunks
+                        stream_usage = candidate_usage
+                        active_llm = candidate_llm
+                        resolved_model = candidate_model
+                        break
+                    except Exception as exc:
+                        last_stream_error = exc
+                        if candidate_chunks:
+                            raise
+                        if index == len(model_candidates) - 1 or not _can_retry_with_fallback_model(exc):
+                            raise
+
+                if not streamed_chunks and last_stream_error is not None:
+                    raise last_stream_error
 
                 final_response_text = "".join(streamed_chunks).strip() or "No response generated."
                 final_state["final_response"] = final_response_text
                 final_state["generation_backend"] = f"llm:{resolved_model}"
                 final_state["generation_usage"] = stream_usage
 
-                reasoning_text = ""
-                try:
-                    summary_reply = llm.invoke(
-                        _build_reasoning_messages(
-                            question=prompt,
-                            answer=final_response_text,
-                            citations=list(final_state.get("citations") or []),
-                        )
-                    )
-                    reasoning_text = _flatten_chunk_text(getattr(summary_reply, "content", summary_reply)).strip()
-                    stream_usage.update(_extract_generation_usage(summary_reply))
-                    model_reasoning = _extract_generation_reasoning(summary_reply)
-                    if model_reasoning and not reasoning_text:
-                        reasoning_text = model_reasoning
-                except Exception as exc:  # pragma: no cover - summary is optional
-                    logger.warning(
-                        _log_event(
-                            "assistant_reasoning_summary_failed",
-                            **stream_context,
-                            intent=intent,
-                            model=resolved_model,
-                            **_failure_log_fields(exc),
-                        )
-                    )
-
+                reasoning_text = str(final_state.get("generation_reasoning") or "").strip()
                 if reasoning_text:
                     final_state["generation_reasoning"] = reasoning_text
                     yield _sse({"type": "model_reasoning", "content": reasoning_text})

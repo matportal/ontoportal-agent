@@ -73,7 +73,7 @@ def test_settings_crud_redacts_secrets(monkeypatch, tmp_path):
         json={
             "generation": {
                 "provider": "openai_compatible",
-                "model": "gemini-2.5-flash-lite",
+                "model": "gemini-3-flash-preview",
                 "api_key": "user-gen-key",
                 "base_url": "https://example.test/openai",
             },
@@ -115,7 +115,7 @@ def test_settings_crud_redacts_secrets(monkeypatch, tmp_path):
     get_response = client.get("/api/v1/me/settings", headers=headers)
     assert get_response.status_code == 200
     get_body = get_response.json()
-    assert get_body["generation"]["model"] == "gemini-2.5-flash-lite"
+    assert get_body["generation"]["model"] == "gemini-3-flash-preview"
     assert get_body["generation"]["api_key"] == "__configured__"
     assert get_body["retrieval"]["chunk_count"] == 12
     assert get_body["mcp_servers"][0]["api_key"] == "__configured__"
@@ -184,7 +184,7 @@ def test_me_chat_stream_exposes_and_persists_quota_errors(monkeypatch, tmp_path,
             self.runtime_options = SimpleNamespace(
                 openai_api_key="test-openai-key",
                 openai_api_base="https://example.test/openai",
-                llm_model="gemini-2.5-flash-lite",
+                llm_model="gemini-3-flash-preview",
                 rag_top_k=12,
                 rag_base_url="http://rag.internal",
                 rag_query_path="/api/v1/query",
@@ -194,7 +194,7 @@ def test_me_chat_stream_exposes_and_persists_quota_errors(monkeypatch, tmp_path,
             )
 
     monkeypatch.setattr(server, "OntoPortalAgent", _DummyAgent)
-    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options: _DummyLlm())
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: _DummyLlm())
     monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
     monkeypatch.setattr(
         server,
@@ -311,7 +311,7 @@ def test_builtin_mcp_timeout_is_upgraded_for_runtime(monkeypatch):
         lambda: SimpleNamespace(
             openai_api_key="test-openai-key",
             openai_api_base="https://example.test/openai",
-            llm_model="gemini-2.5-flash-lite",
+            llm_model="gemini-3-flash-preview",
             rag_base_url="http://rag.internal",
             rag_query_path="/api/v1/query",
             default_mcp_endpoints=[],
@@ -326,7 +326,7 @@ def test_builtin_mcp_timeout_is_upgraded_for_runtime(monkeypatch):
         {
             "generation": {
                 "provider": "openai_compatible",
-                "model": "gemini-2.5-flash-lite",
+                "model": "gemini-3-flash-preview",
                 "api_key": "",
                 "base_url": "https://example.test/openai",
             },
@@ -382,7 +382,7 @@ def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypat
         observed["graph_called"] = True
         raise AssertionError("retrieve-style prompts must not enter the edit graph")
 
-    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options: _DummyLlm())
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: _DummyLlm())
     monkeypatch.setattr(
         server,
         "_retrieve_runtime_state",
@@ -397,7 +397,7 @@ def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypat
 
     runtime_agent = SimpleNamespace(
         runtime_options=SimpleNamespace(
-            llm_model="gemini-2.5-flash-lite",
+            llm_model="gemini-3-flash-preview",
             openai_api_key="test-key",
             openai_api_base="https://example.test/openai",
         )
@@ -415,3 +415,62 @@ def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypat
     assert "Streaming answer..." in events
     assert "No action generated; placeholder plan." not in events
     assert "# Summary" in events
+
+
+def test_stream_agent_response_falls_back_to_latest_google_model(monkeypatch):
+    class _BusyError(Exception):
+        status_code = 503
+
+    class _BusyLlm:
+        def stream(self, _messages):
+            raise _BusyError("Error code: 503 - This model is currently experiencing high demand.")
+
+        def invoke(self, _messages):
+            raise _BusyError("Error code: 503 - This model is currently experiencing high demand.")
+
+    class _WorkingLlm:
+        def stream(self, _messages):
+            yield AIMessage(content="Fallback answer from flash.")
+
+        def invoke(self, _messages):
+            return AIMessage(content="")
+
+    def _build_llm(runtime_options, *, model_override=None):
+        model = model_override or runtime_options.llm_model
+        if model == "gemini-3.1-pro-preview":
+            return _BusyLlm()
+        if model == "gemini-3-flash-preview":
+            return _WorkingLlm()
+        raise AssertionError(f"unexpected model {model}")
+
+    monkeypatch.setattr(server, "_build_chat_model", _build_llm)
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda prompt, runtime_options: {
+            "rag_result": "MatPortal context",
+            "citations": ["MATONTO v2.0"],
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+        },
+    )
+
+    runtime_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            llm_model="gemini-3.1-pro-preview",
+            openai_api_key="test-key",
+            openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+    )
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Explain MatPortal.",
+            thread_id="thread-456",
+            agent_builder=lambda: runtime_agent,
+        )
+    )
+
+    assert "Primary model unavailable. Switching to gemini-3-flash-preview." in events
+    assert "Fallback answer from flash." in events
