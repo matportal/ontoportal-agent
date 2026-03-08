@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -82,6 +83,95 @@ def _extract_generation_reasoning(reply: Any) -> str:
             if reasoning:
                 return reasoning
     return ""
+
+
+def _extract_json_object(text: str) -> str:
+    fence_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1].strip()
+
+    raise json.JSONDecodeError("Incomplete JSON object", text, start)
+
+
+def _parse_edit_plan(response: Any) -> dict[str, Any]:
+    if isinstance(response, str):
+        response_text = response
+    else:
+        response_text = str(response or "")
+
+    response_text = response_text.strip()
+    if not response_text:
+        raise json.JSONDecodeError("Empty edit plan", response_text, 0)
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        return json.loads(_extract_json_object(response_text))
+
+
+def _format_pending_approval_response(
+    *,
+    summary_lines: list[str],
+    workspace: str,
+    sandbox_output: str,
+    artifact_path: Path | None,
+) -> str:
+    cleaned_summary = [line.strip() for line in summary_lines if line and line.strip()]
+    if cleaned_summary:
+        summary_block = "\n".join(f"- {line}" for line in cleaned_summary)
+    else:
+        summary_block = "- No change notes generated."
+
+    response_parts = [
+        "## Proposed ontology edits (pending approval)",
+        "",
+        summary_block,
+        "",
+        f"- Workspace: `{workspace}`",
+        "- Review and publish with:",
+        "  `ontoportal-agent publish --acronym <ACRONYM> --artifact <PATH> --contact-email <EMAIL>`",
+    ]
+    if artifact_path:
+        response_parts.append(f"- Suggested artifact: `{artifact_path}`")
+    response_parts.extend(
+        [
+            "",
+            "### Sandbox output",
+            "```text",
+            sandbox_output or "Sandbox executed without output.",
+            "```",
+        ]
+    )
+    return "\n".join(response_parts)
 
 
 def build_agent_graph(
@@ -237,7 +327,7 @@ def build_agent_graph(
         )
         response = (prompt | llm).invoke({"question": state["user_input"]}).content
         try:
-            plan = json.loads(response)
+            plan = _parse_edit_plan(response)
         except json.JSONDecodeError:
             plan = {
                 "workspace": "session",
@@ -305,16 +395,10 @@ def build_agent_graph(
 
         summary_lines = state.get("change_notes", [])
         sandbox_output = state.get("sandbox_output", "")
-        summary = "\n".join(summary_lines) if summary_lines else "- No change notes generated."
-        instructions = (
-            f"Workspace: {workspace}.\n"
-            f"Sandbox output:\n{sandbox_output}\n"
-            "Review the changes. When satisfied, publish with: \n"
-            "`ontoportal-agent publish --acronym <ACRONYM> --artifact <PATH> --contact-email <EMAIL>`"
-        )
         if artifact_hint:
             artifact_path = Path(repository.workdir / workspace / artifact_hint)
-            instructions += f"\nSuggested artifact: {artifact_path}"
+        else:
+            artifact_path = None
 
         auto_publish = bool(not settings.require_manual_approval and publish_payload)
         state["auto_publish"] = auto_publish
@@ -322,9 +406,11 @@ def build_agent_graph(
         if auto_publish:
             state["final_response"] = "Publishing prepared ontology automatically."
         else:
-            state["final_response"] = (
-                "Proposed ontology edits (pending approval):\n"
-                f"{summary}\n\n{instructions}"
+            state["final_response"] = _format_pending_approval_response(
+                summary_lines=summary_lines,
+                workspace=workspace,
+                sandbox_output=sandbox_output,
+                artifact_path=artifact_path,
             )
         return state
 
