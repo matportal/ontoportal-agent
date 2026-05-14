@@ -61,7 +61,7 @@ from .db.repositories import (
 from .db.user_context import AssistantUserContext, verify_user_context_headers
 from .intent import classify_user_intent
 from .mcp_client import McpClient, McpInvocationError
-from .opencode_executor import OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
+from .opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
 from .rag_client import RagClient
 
 logger = logging.getLogger("uvicorn.error").getChild("ontoportal_agent")
@@ -139,6 +139,10 @@ class RetrievalSettingsIn(BaseModel):
 
 class OpenCodeSettingsIn(BaseModel):
     auth_source: str = "auto"
+    auth_kind: Optional[str] = None
+    auth_json: Optional[str] = None
+    codex_auth_json: Optional[str] = None
+    clear_account_auth: bool = False
 
 
 class AssistantSettingsIn(BaseModel):
@@ -1063,6 +1067,9 @@ def _default_settings_payload() -> dict[str, Any]:
         },
         "opencode": {
             "auth_source": "auto",
+            "auth_kind": "",
+            "auth_json": "",
+            "codex_auth_json": "",
         },
         "mcp_servers": [
             {
@@ -1146,9 +1153,36 @@ def _has_persisted_secret(value: Any) -> bool:
 def _normalize_opencode_settings(raw_payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = raw_payload or {}
     auth_source = str(raw.get("auth_source", "auto") or "auto").strip().lower()
-    if auth_source not in {"auto", "generation_key", "opencode_builtin"}:
+    if auth_source not in {"auto", "generation_key", "opencode_builtin", "account_auth"}:
         auth_source = "auto"
-    return {"auth_source": auth_source}
+    auth_kind = str(raw.get("auth_kind", "") or "").strip().lower()
+    if auth_kind not in {"", "gemini_antigravity", "codex"}:
+        auth_kind = ""
+    return {
+        "auth_source": auth_source,
+        "auth_kind": auth_kind,
+        "auth_json": str(raw.get("auth_json", "") or ""),
+        "codex_auth_json": str(raw.get("codex_auth_json", "") or ""),
+    }
+
+
+def _validate_auth_json(value: str, *, label: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{label} must be valid JSON.",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{label} must be a JSON object.",
+        )
+    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
 
 
 def _normalize_settings_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
@@ -1208,12 +1242,15 @@ def _redact_mcp_server(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _serialize_settings_for_output(payload: dict[str, Any]) -> dict[str, Any]:
+    opencode = _normalize_opencode_settings(payload.get("opencode", {}))
+    opencode["auth_json"] = "__configured__" if opencode.get("auth_json") else ""
+    opencode["codex_auth_json"] = "__configured__" if opencode.get("codex_auth_json") else ""
     return {
         "generation": _redact_provider(payload["generation"]),
         "embeddings": _redact_provider(payload["embeddings"]),
         "reranker": _redact_provider(payload["reranker"]),
         "retrieval": payload.get("retrieval", {"chunk_count": 20}),
-        "opencode": _normalize_opencode_settings(payload.get("opencode", {})),
+        "opencode": opencode,
         "mcp_servers": [_redact_mcp_server(item) for item in payload.get("mcp_servers", [])],
     }
 
@@ -1334,6 +1371,9 @@ def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRun
         mcp_api_key=settings.default_mcp_api_key or settings.mcp_api_key,
         mcp_rag_tool_name=settings.mcp_rag_tool_name,
         opencode_auth_source=opencode["auth_source"],
+        opencode_auth_kind=opencode["auth_kind"],
+        opencode_auth_json=opencode["auth_json"],
+        codex_auth_json=opencode["codex_auth_json"],
     )
 
 
@@ -1399,7 +1439,7 @@ def _opencode_provider_auth_from_runtime_options(
     if runtime_options is None:
         return None
     auth_source = str(getattr(runtime_options, "opencode_auth_source", "auto") or "auto").strip().lower()
-    if auth_source == "opencode_builtin":
+    if auth_source in {"opencode_builtin", "account_auth"}:
         return None
     if not bool(getattr(runtime_options, "generation_api_key_configured", False)):
         return None
@@ -1446,9 +1486,28 @@ def _opencode_provider_auth_from_runtime_options(
 
 def _opencode_auth_source_from_runtime_options(runtime_options: AgentRuntimeOptions | None) -> str:
     auth_source = str(getattr(runtime_options, "opencode_auth_source", "auto") or "auto").strip().lower()
-    if auth_source not in {"auto", "generation_key", "opencode_builtin"}:
+    if auth_source not in {"auto", "generation_key", "opencode_builtin", "account_auth"}:
         return "auto"
     return auth_source
+
+
+def _opencode_account_auth_from_runtime_options(
+    runtime_options: AgentRuntimeOptions | None,
+) -> OpenCodeAccountAuth | None:
+    if runtime_options is None:
+        return None
+    auth_source = _opencode_auth_source_from_runtime_options(runtime_options)
+    if auth_source != "account_auth":
+        return None
+    opencode_auth_json = str(getattr(runtime_options, "opencode_auth_json", "") or "").strip()
+    codex_auth_json = str(getattr(runtime_options, "codex_auth_json", "") or "").strip()
+    if not opencode_auth_json and not codex_auth_json:
+        return None
+    return OpenCodeAccountAuth(
+        kind=str(getattr(runtime_options, "opencode_auth_kind", "") or "").strip() or "account_auth",
+        opencode_auth_json=opencode_auth_json or None,
+        codex_auth_json=codex_auth_json or None,
+    )
 
 
 def _stream_opencode_execution(
@@ -1458,7 +1517,10 @@ def _stream_opencode_execution(
     trace_id: str,
     runtime_options: AgentRuntimeOptions | None = None,
 ) -> Iterator[str]:
-    executor = OpenCodeExecutor(provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options))
+    executor = OpenCodeExecutor(
+        provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
+        account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
+    )
     stream = executor.stream(prompt=prompt, thread_id=thread_id, trace_id=trace_id)
     while True:
         try:
@@ -1500,8 +1562,10 @@ def _opencode_usage_payload(
     if runtime_options is not None:
         source = _opencode_auth_source_from_runtime_options(runtime_options)
         execution["auth_source"] = source
+        execution["auth_kind"] = str(getattr(runtime_options, "opencode_auth_kind", "") or "")
         execution["using_user_generation_key"] = bool(
             source != "opencode_builtin"
+            and source != "account_auth"
             and getattr(runtime_options, "generation_api_key_configured", False)
         )
     return {
@@ -1530,6 +1594,7 @@ def _opencode_hybrid_ask_usage_payload(
             "exit_code": result.exit_code,
             "log_lines": len(result.console_lines),
             "auth_source": _opencode_auth_source_from_runtime_options(runtime_options),
+            "auth_kind": str(getattr(runtime_options, "opencode_auth_kind", "") or ""),
         },
     }
 
@@ -1542,7 +1607,10 @@ def _stream_opencode_ask_generation(
     runtime_options: AgentRuntimeOptions | None,
     retrieval_state: dict[str, Any],
 ) -> Iterator[str]:
-    executor = OpenCodeExecutor(provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options))
+    executor = OpenCodeExecutor(
+        provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
+        account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
+    )
     stream = executor.stream(
         prompt=prompt,
         thread_id=thread_id,
@@ -2220,6 +2288,24 @@ def me_put_settings(
     existing_payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
     raw_payload = payload.model_dump()
     normalized_payload = _normalize_settings_payload(raw_payload)
+    raw_opencode = raw_payload.get("opencode", {})
+    incoming_opencode = normalized_payload.get("opencode", {})
+    existing_opencode = existing_payload.get("opencode", {})
+    if bool(raw_opencode.get("clear_account_auth", False)):
+        incoming_opencode["auth_json"] = ""
+        incoming_opencode["codex_auth_json"] = ""
+    else:
+        if str(incoming_opencode.get("auth_json", "")).strip() == "__configured__":
+            incoming_opencode["auth_json"] = ""
+        if str(incoming_opencode.get("codex_auth_json", "")).strip() == "__configured__":
+            incoming_opencode["codex_auth_json"] = ""
+        if not str(incoming_opencode.get("auth_json", "")).strip() and _has_persisted_secret(existing_opencode.get("auth_json", "")):
+            incoming_opencode["auth_json"] = str(existing_opencode.get("auth_json", "")).strip()
+        if not str(incoming_opencode.get("codex_auth_json", "")).strip() and _has_persisted_secret(existing_opencode.get("codex_auth_json", "")):
+            incoming_opencode["codex_auth_json"] = str(existing_opencode.get("codex_auth_json", "")).strip()
+    incoming_opencode["auth_json"] = _validate_auth_json(incoming_opencode.get("auth_json", ""), label="OpenCode auth JSON")
+    incoming_opencode["codex_auth_json"] = _validate_auth_json(incoming_opencode.get("codex_auth_json", ""), label="Codex auth JSON")
+    normalized_payload["opencode"] = incoming_opencode
     for provider_key in ("generation", "embeddings", "reranker"):
         incoming_provider = normalized_payload.get(provider_key, {})
         existing_provider = existing_payload.get(provider_key, {})

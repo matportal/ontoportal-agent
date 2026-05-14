@@ -376,11 +376,69 @@ def test_settings_persist_opencode_auth_source(monkeypatch, tmp_path):
         headers=headers,
     )
     assert saved.status_code == 200
-    assert saved.json()["opencode"] == {"auth_source": "opencode_builtin"}
+    assert saved.json()["opencode"]["auth_source"] == "opencode_builtin"
+    assert saved.json()["opencode"]["auth_json"] == ""
+    assert saved.json()["opencode"]["codex_auth_json"] == ""
 
     loaded = client.get("/api/v1/me/settings", headers=headers)
     assert loaded.status_code == 200
-    assert loaded.json()["opencode"] == {"auth_source": "opencode_builtin"}
+    assert loaded.json()["opencode"]["auth_source"] == "opencode_builtin"
+
+
+def test_settings_persist_account_auth_json_redacted(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {"provider": "gemini_api", "model": "gemini-2.5-pro", "api_key": "", "base_url": ""},
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "opencode": {
+                "auth_source": "account_auth",
+                "auth_kind": "gemini_antigravity",
+                "auth_json": "{not-json",
+                "codex_auth_json": '{"tokens":{"access_token":"codex-token"}}',
+            },
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 422
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {"provider": "gemini_api", "model": "gemini-2.5-pro", "api_key": "", "base_url": ""},
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "opencode": {
+                "auth_source": "account_auth",
+                "auth_kind": "gemini_antigravity",
+                "auth_json": '{"provider":"antigravity","token":"antigravity-token"}',
+                "codex_auth_json": '{"tokens":{"access_token":"codex-token"}}',
+            },
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    body = saved.json()["opencode"]
+    assert body["auth_source"] == "account_auth"
+    assert body["auth_kind"] == "gemini_antigravity"
+    assert body["auth_json"] == "__configured__"
+    assert body["codex_auth_json"] == "__configured__"
+    assert "antigravity-token" not in json.dumps(saved.json())
+    assert "codex-token" not in json.dumps(saved.json())
+
+    loaded = client.get("/api/v1/me/settings", headers=headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["opencode"]["auth_json"] == "__configured__"
+    assert loaded.json()["opencode"]["codex_auth_json"] == "__configured__"
 
 
 def test_provider_check_uses_saved_gemini_api_key_without_returning_secret(monkeypatch, tmp_path):
@@ -1290,6 +1348,56 @@ def test_opencode_builtin_auth_source_skips_user_generation_key(monkeypatch):
     assert runtime_options.opencode_auth_source == "opencode_builtin"
     assert runtime_options.generation_api_key_configured is True
     assert server._opencode_provider_auth_from_runtime_options(runtime_options) is None
+
+
+def test_account_auth_source_builds_account_auth(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            vertex_project=None,
+            vertex_location="us-central1",
+            vertex_service_account_json=None,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "opencode": {
+                "auth_source": "account_auth",
+                "auth_kind": "codex",
+                "auth_json": '{"provider":"openai"}',
+                "codex_auth_json": '{"tokens":{"access_token":"codex-token"}}',
+            },
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.opencode_auth_source == "account_auth"
+    assert server._opencode_provider_auth_from_runtime_options(runtime_options) is None
+    account_auth = server._opencode_account_auth_from_runtime_options(runtime_options)
+    assert account_auth is not None
+    assert account_auth.kind == "codex"
+    assert account_auth.opencode_auth_json == '{"provider":"openai"}'
+    assert "codex-token" in (account_auth.codex_auth_json or "")
 
 
 def test_opencode_usage_reports_auth_source():

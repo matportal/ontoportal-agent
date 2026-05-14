@@ -10,7 +10,7 @@ if importlib.util.find_spec("ontoportal_agent") is None:
     pytest.skip("ontoportal_agent package not available", allow_module_level=True)
 
 from ontoportal_agent.config import get_settings
-from ontoportal_agent.opencode_executor import OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
+from ontoportal_agent.opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
 
 
 def test_prepare_workspace_writes_opencode_mcp_config(monkeypatch, tmp_path):
@@ -272,6 +272,31 @@ def test_execution_payload_does_not_include_provider_secret(monkeypatch, tmp_pat
     assert "user-gemini-secret" not in raw_config
     assert "{env:MATPORTAL_OPENCODE_API_KEY}" in raw_config
     assert "user-gemini-secret" not in payload_text
+
+
+def test_opencode_account_auth_writes_isolated_auth_files(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "deployment-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "ontoportal-secret")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor(
+        account_auth=OpenCodeAccountAuth(
+            kind="gemini_antigravity",
+            opencode_auth_json='{"provider":"antigravity","token":"antigravity-token"}',
+            codex_auth_json='{"tokens":{"access_token":"codex-token"}}',
+        )
+    )
+    workspace = executor._prepare_workspace(thread_id="account-auth")
+    env = executor._opencode_environment(workspace)
+
+    opencode_auth = workspace / ".opencode-home" / ".local" / "share" / "opencode" / "auth.json"
+    codex_auth = workspace / ".codex-home" / "auth.json"
+    assert json.loads(opencode_auth.read_text(encoding="utf-8"))["token"] == "antigravity-token"
+    assert json.loads(codex_auth.read_text(encoding="utf-8"))["tokens"]["access_token"] == "codex-token"
+    assert env["CODEX_HOME"] == str(workspace / ".codex-home")
+    assert stat.S_IMODE(opencode_auth.stat().st_mode) == 0o600
+    assert stat.S_IMODE(codex_auth.stat().st_mode) == 0o600
 
 
 def test_opencode_environment_is_scoped_to_workspace(monkeypatch, tmp_path):

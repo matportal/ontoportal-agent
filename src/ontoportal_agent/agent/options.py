@@ -21,3 +21,6 @@ class AgentRuntimeOptions:
     mcp_api_key: str | None = None
     mcp_rag_tool_name: str | None = None
     opencode_auth_source: str = "auto"
+    opencode_auth_kind: str | None = None
+    opencode_auth_json: str | None = None
+    codex_auth_json: str | None = None

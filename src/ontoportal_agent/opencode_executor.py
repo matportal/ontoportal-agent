@@ -72,6 +72,13 @@ class OpenCodeProviderAuth:
         return f"{self.provider_id}/{self.model}"
 
 
+@dataclass(frozen=True)
+class OpenCodeAccountAuth:
+    kind: str
+    opencode_auth_json: str | None = field(default=None, repr=False)
+    codex_auth_json: str | None = field(default=None, repr=False)
+
+
 @dataclass
 class OpenCodeExecutionResult:
     ok: bool
@@ -109,9 +116,15 @@ class OpenCodeExecutionResult:
 
 
 class OpenCodeExecutor:
-    def __init__(self, settings: AgentSettings | None = None, provider_auth: OpenCodeProviderAuth | None = None):
+    def __init__(
+        self,
+        settings: AgentSettings | None = None,
+        provider_auth: OpenCodeProviderAuth | None = None,
+        account_auth: OpenCodeAccountAuth | None = None,
+    ):
         self.settings = settings or get_settings()
         self.provider_auth = provider_auth
+        self.account_auth = account_auth
 
     def stream(
         self,
@@ -418,9 +431,31 @@ class OpenCodeExecutor:
         env["XDG_CONFIG_HOME"] = str(config_home)
         env["XDG_DATA_HOME"] = str(data_home)
         env["XDG_CACHE_HOME"] = str(cache_home)
+        if self.account_auth:
+            self._write_account_auth(workspace, home, data_home)
+            codex_home = workspace / ".codex-home"
+            codex_home.mkdir(parents=True, exist_ok=True)
+            self._chmod_private(codex_home, 0o700)
+            env["CODEX_HOME"] = str(codex_home)
         if self.provider_auth:
             env[self.provider_auth.env_api_key_name] = self.provider_auth.api_key
         return env
+
+    def _write_private_json_file(self, path: Path, raw_json: str) -> None:
+        parsed = json.loads(raw_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._chmod_private(path.parent, 0o700)
+        path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+        self._chmod_private(path, 0o600)
+
+    def _write_account_auth(self, workspace: Path, home: Path, data_home: Path) -> None:
+        if not self.account_auth:
+            return
+        if self.account_auth.opencode_auth_json:
+            self._write_private_json_file(data_home / "opencode" / "auth.json", self.account_auth.opencode_auth_json)
+        if self.account_auth.codex_auth_json:
+            codex_home = workspace / ".codex-home"
+            self._write_private_json_file(codex_home / "auth.json", self.account_auth.codex_auth_json)
 
     def _stream_process_output(
         self,
@@ -815,6 +850,8 @@ class OpenCodeExecutor:
         secrets = [self.settings.ontoportal_api_key, self.settings.openai_api_key]
         if self.provider_auth:
             secrets.append(self.provider_auth.api_key)
+        if self.account_auth:
+            secrets.extend([self.account_auth.opencode_auth_json or "", self.account_auth.codex_auth_json or ""])
         for secret in secrets:
             secret_text = str(secret or "").strip()
             if secret_text:
