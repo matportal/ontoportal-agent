@@ -77,6 +77,73 @@ class AgentSettings(BaseSettings):
         default=Path("/tmp/ontoportal-agent"),
         validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_WORKDIR", "ONTOLOGY_WORKDIR"),
     )
+    opencode_path: str = Field(
+        default="opencode",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_PATH", "OPENCODE_PATH"),
+    )
+    opencode_model: str = Field(
+        default="opencode/big-pickle",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MODEL", "OPENCODE_MODEL"),
+    )
+    opencode_workspace_subdir: str = Field(
+        default="opencode-runs",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_WORKSPACE_SUBDIR", "OPENCODE_WORKSPACE_SUBDIR"),
+    )
+    opencode_mcp_mode: str = Field(
+        default="remote",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_MODE", "OPENCODE_MCP_MODE"),
+    )
+    opencode_mcp_url: str = Field(
+        default="https://mcp.matportal.org/mcp",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_URL", "OPENCODE_MCP_URL"),
+    )
+    opencode_mcp_name: str = Field(
+        default="ontoportal_api",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_NAME", "OPENCODE_MCP_NAME"),
+    )
+    opencode_mcp_python: str = Field(
+        default="python",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_PYTHON", "OPENCODE_MCP_PYTHON"),
+    )
+    opencode_mcp_server_root: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_SERVER_ROOT", "OPENCODE_MCP_SERVER_ROOT"),
+    )
+    opencode_mcp_transport: str = Field(
+        default="stdio",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_TRANSPORT", "OPENCODE_MCP_TRANSPORT"),
+    )
+    opencode_mcp_timeout_ms: int = Field(
+        default=20000,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_TIMEOUT_MS", "OPENCODE_MCP_TIMEOUT_MS"),
+    )
+    opencode_keep_workspace: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_KEEP_WORKSPACE", "OPENCODE_KEEP_WORKSPACE"),
+    )
+    opencode_max_log_lines: int = Field(
+        default=400,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MAX_LOG_LINES", "OPENCODE_MAX_LOG_LINES"),
+    )
+    opencode_max_diff_chars: int = Field(
+        default=24000,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MAX_DIFF_CHARS", "OPENCODE_MAX_DIFF_CHARS"),
+    )
+    opencode_run_timeout_seconds: int = Field(
+        default=900,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_RUN_TIMEOUT_SECONDS", "OPENCODE_RUN_TIMEOUT_SECONDS"),
+    )
+    opencode_artifact_retention_days: int = Field(
+        default=7,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_ARTIFACT_RETENTION_DAYS",
+            "OPENCODE_ARTIFACT_RETENTION_DAYS",
+        ),
+    )
+    opencode_hybrid_ask_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_HYBRID_ASK_ENABLED", "OPENCODE_HYBRID_ASK_ENABLED"),
+    )
 
     # Approval gate
     require_manual_approval: bool = Field(
@@ -193,6 +260,14 @@ class AgentSettings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("opencode_mcp_mode")
+    @classmethod
+    def _normalize_opencode_mcp_mode(cls, value: str):
+        normalized = str(value or "remote").strip().lower()
+        if normalized not in {"remote", "local"}:
+            raise ValueError("opencode_mcp_mode must be 'remote' or 'local'")
+        return normalized
 
     def resolved_mcp_endpoints(self) -> List[str]:
         if self.mcp_endpoints:

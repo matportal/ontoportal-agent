@@ -12,8 +12,8 @@ from threading import Lock
 from typing import Any, Callable, Iterator, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -27,6 +27,19 @@ from sqlalchemy.orm import Session
 from .agent.graph import _extract_generation_usage
 from .agent.options import AgentRuntimeOptions
 from .agent.runtime import OntoPortalAgent
+from .artifact_store import (
+    ArtifactAccessError,
+    artifact_expired,
+    build_artifact_bundle,
+    cleanup_expired_workspaces,
+    execution_allows_path,
+    file_metadata,
+    list_artifact_files,
+    read_artifact_diff,
+    read_artifact_text,
+    resolve_artifact_file,
+    sanitize_artifact_path,
+)
 from .config import get_settings
 from .db import EncryptionService, init_db
 from .db.base import get_db_session
@@ -36,6 +49,7 @@ from .db.repositories import (
     create_thread,
     delete_thread,
     ensure_thread,
+    get_thread_execution,
     get_user_settings,
     list_mcp_servers,
     list_thread_messages,
@@ -47,6 +61,7 @@ from .db.repositories import (
 from .db.user_context import AssistantUserContext, verify_user_context_headers
 from .intent import classify_user_intent
 from .mcp_client import McpClient, McpInvocationError
+from .opencode_executor import OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
 from .rag_client import RagClient
 
 logger = logging.getLogger("uvicorn.error").getChild("ontoportal_agent")
@@ -63,6 +78,8 @@ _agent_instance: Optional[OntoPortalAgent] = None
 _LEGACY_DEFAULT_MCP_TIMEOUT_MS = 10_000
 _BUILTIN_DEFAULT_MCP_TIMEOUT_MS = 30_000
 _GOOGLE_OPENAI_BASE_MARKER = "generativelanguage.googleapis.com"
+_GOOGLE_GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+_GOOGLE_GEMINI_API_PROVIDER_ALIASES = {"google_gemini", "gemini", "gemini_api", "google_ai_studio"}
 _GOOGLE_GEMINI_FALLBACK_MODELS = (
     "gemini-3.1-pro-preview",
     "gemini-3.1-pro-preview-customtools",
@@ -93,6 +110,7 @@ class ChatStreamRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     thread_id: Optional[str] = None
     thread_title: Optional[str] = None
+    mode: Optional[str] = None
 
 
 class ProviderConfigIn(BaseModel):
@@ -100,6 +118,11 @@ class ProviderConfigIn(BaseModel):
     model: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    clear_api_key: bool = False
+
+
+class ProviderCheckIn(ProviderConfigIn):
+    scope: str = "generation"
 
 
 class McpServerIn(BaseModel):
@@ -114,11 +137,16 @@ class RetrievalSettingsIn(BaseModel):
     chunk_count: int = Field(default=20, ge=1, le=40)
 
 
+class OpenCodeSettingsIn(BaseModel):
+    auth_source: str = "auto"
+
+
 class AssistantSettingsIn(BaseModel):
     generation: ProviderConfigIn = Field(default_factory=ProviderConfigIn)
     embeddings: ProviderConfigIn = Field(default_factory=ProviderConfigIn)
     reranker: ProviderConfigIn = Field(default_factory=lambda: ProviderConfigIn(provider="none"))
     retrieval: RetrievalSettingsIn = Field(default_factory=RetrievalSettingsIn)
+    opencode: OpenCodeSettingsIn = Field(default_factory=OpenCodeSettingsIn)
     mcp_servers: list[McpServerIn] = Field(default_factory=list)
 
 
@@ -182,6 +210,72 @@ def _normalized_chunk_count(value: Any, *, default: int = 20) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(1, min(40, parsed))
+
+
+def _source_document_label(ontology_id: str, version: str) -> str:
+    parts = [str(ontology_id or "").strip()]
+    if str(version or "").strip():
+        parts.append(f"v{str(version).strip()}")
+    return " ".join(part for part in parts if part).strip() or "Unknown source"
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isfinite(parsed):
+        return parsed
+    return None
+
+
+def _source_payload_from_rag_chunk(source: Any, index: int) -> dict[str, Any]:
+    metadata = dict(getattr(source, "metadata", {}) or {})
+    ontology_id = str(getattr(source, "ontology_id", "") or metadata.get("ontology_id") or "").strip()
+    version = str(getattr(source, "version", "") or metadata.get("version") or "").strip()
+    header = str(metadata.get("header") or metadata.get("section") or "").strip()
+    content = str(getattr(source, "content", "") or "").strip()
+    rank = metadata.get("rank") or index + 1
+    retrieval_score = _safe_float(metadata.get("retrieval_score") or metadata.get("score"))
+    rerank_score = _safe_float(metadata.get("rerank_score"))
+    return {
+        "ontology_id": ontology_id,
+        "version": version,
+        "document_label": _source_document_label(ontology_id, version),
+        "content": content,
+        "metadata": {
+            "header": header,
+            "rank": rank,
+            "retrieval_score": retrieval_score,
+            "rerank_score": rerank_score,
+            "chunk_id": metadata.get("chunk_id") or metadata.get("id") or f"{ontology_id}:{version}:{index + 1}",
+        },
+    }
+
+
+def _source_payload_from_mapping(source: Any, index: int) -> dict[str, Any]:
+    item = dict(source or {})
+    metadata = dict(item.get("metadata") or {})
+    ontology_id = str(item.get("ontology_id") or metadata.get("ontology_id") or "unknown").strip()
+    version = str(item.get("version") or metadata.get("version") or "unknown").strip()
+    header = str(item.get("header") or metadata.get("header") or metadata.get("section") or "").strip()
+    content = str(item.get("content") or metadata.get("content") or "").strip()
+    rank = metadata.get("rank") or item.get("rank") or index + 1
+    retrieval_score = _safe_float(metadata.get("retrieval_score") or metadata.get("score") or item.get("score"))
+    rerank_score = _safe_float(metadata.get("rerank_score") or item.get("rerank_score"))
+    return {
+        "ontology_id": ontology_id,
+        "version": version,
+        "document_label": str(item.get("document_label") or _source_document_label(ontology_id, version)),
+        "content": content,
+        "metadata": {
+            "header": header,
+            "rank": rank,
+            "retrieval_score": retrieval_score,
+            "rerank_score": rerank_score,
+            "chunk_id": metadata.get("chunk_id") or item.get("chunk_id") or f"{ontology_id}:{version}:{index + 1}",
+        },
+    }
 
 
 def _compact_user_id(user_id: str | None) -> str:
@@ -291,6 +385,10 @@ def _uses_google_openai_base(base_url: str | None) -> bool:
     return _GOOGLE_OPENAI_BASE_MARKER in str(base_url or "").strip().lower()
 
 
+def _uses_gemini_api_provider(provider: str | None) -> bool:
+    return str(provider or "").strip().lower() in _GOOGLE_GEMINI_API_PROVIDER_ALIASES
+
+
 def _uses_vertex_gemini_provider(runtime_options: AgentRuntimeOptions | None) -> bool:
     provider = str(getattr(runtime_options, "generation_provider", "") or "").strip().lower()
     return provider == "vertex_gemini"
@@ -367,6 +465,16 @@ def _vertex_service_account_credentials(service_account_json: str):
     )
 
 
+def _vertex_service_account_project_id(service_account_json: str | None) -> str:
+    try:
+        payload = json.loads(str(service_account_json or ""))
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("project_id") or "").strip()
+
+
 def _vertex_access_token(runtime_options: AgentRuntimeOptions | None) -> str:
     settings = get_settings()
     service_account_json = str(
@@ -435,6 +543,7 @@ def _vertex_buffered_edit_runtime_options(runtime_options: AgentRuntimeOptions) 
     return AgentRuntimeOptions(
         openai_api_key=_vertex_access_token(runtime_options),
         generation_provider="openai_compatible",
+        generation_api_key_configured=True,
         openai_api_base=_vertex_openai_base_url(runtime_options),
         llm_model=_vertex_openai_model_name(selected_model),
         vertex_project=getattr(runtime_options, "vertex_project", None),
@@ -738,6 +847,13 @@ def _classify_intent(llm: ChatOpenAI, prompt: str) -> str:
     return classify_user_intent(prompt, llm=llm)
 
 
+def _normalize_chat_mode(mode: str | None) -> str:
+    clean = str(mode or "").strip().lower().replace("_", "-")
+    if clean in {"edit", "opencode", "open-code", "workspace"}:
+        return "edit"
+    return "ask"
+
+
 def _build_response_messages(
     *,
     question: str,
@@ -792,6 +908,7 @@ def _retrieve_runtime_state(prompt: str, runtime_options: AgentRuntimeOptions | 
 
     state: dict[str, Any] = {
         "citations": [],
+        "citation_labels": [],
         "rag_result": "",
         "retrieval_backend": "none",
         "retrieval_error": "",
@@ -802,7 +919,8 @@ def _retrieve_runtime_state(prompt: str, runtime_options: AgentRuntimeOptions | 
         try:
             result = RagClient(base_url=rag_base_url, query_path=rag_query_path).query(prompt, top_k=rag_top_k)
             state["rag_result"] = result.answer
-            state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+            state["citations"] = [_source_payload_from_rag_chunk(src, index) for index, src in enumerate(result.sources)]
+            state["citation_labels"] = list(dict.fromkeys(item["document_label"] for item in state["citations"]))
             state["retrieval_backend"] = "rag-http"
             return state
         except Exception as err:  # noqa: BLE001 - we intentionally degrade to MCP or non-RAG response.
@@ -819,10 +937,8 @@ def _retrieve_runtime_state(prompt: str, runtime_options: AgentRuntimeOptions | 
             )
             sources = mcp_payload.get("sources", [])
             state["rag_result"] = str(mcp_payload.get("answer", "") or "")
-            state["citations"] = [
-                f"{src.get('ontology_id', 'unknown')} v{src.get('version', 'unknown')}"
-                for src in sources
-            ]
+            state["citations"] = [_source_payload_from_mapping(src, index) for index, src in enumerate(sources)]
+            state["citation_labels"] = list(dict.fromkeys(item["document_label"] for item in state["citations"]))
             state["retrieval_backend"] = "mcp"
             return state
         except (McpInvocationError, KeyError, TypeError, ValueError) as err:
@@ -833,6 +949,7 @@ def _retrieve_runtime_state(prompt: str, runtime_options: AgentRuntimeOptions | 
     state["retrieval_backend"] = "none"
     state["rag_result"] = ""
     state["citations"] = []
+    state["citation_labels"] = []
 
     return state
 
@@ -863,6 +980,10 @@ def _emit_final_state(final_state: dict[str, Any]) -> Iterator[str]:
     generation_usage = final_state.get("generation_usage")
     if isinstance(generation_usage, dict):
         yield _sse({"type": "usage", "content": generation_usage})
+
+    citations = final_state.get("citations")
+    if isinstance(citations, list) and citations:
+        yield _sse({"type": "citations", "content": citations})
 
     sandbox_output = final_state.get("sandbox_output")
     if sandbox_output:
@@ -912,7 +1033,11 @@ def _default_settings_payload() -> dict[str, Any]:
     default_generation_base = (
         settings.default_generation_base_url
         if settings.default_generation_base_url is not None
-        else ("" if default_generation_provider == "vertex_gemini" else settings.openai_api_base or "")
+        else (
+            ""
+            if default_generation_provider == "vertex_gemini"
+            else (_GOOGLE_GEMINI_OPENAI_BASE_URL if _uses_gemini_api_provider(default_generation_provider) else settings.openai_api_base or "")
+        )
     )
     return {
         "generation": {
@@ -935,6 +1060,9 @@ def _default_settings_payload() -> dict[str, Any]:
         },
         "retrieval": {
             "chunk_count": 20,
+        },
+        "opencode": {
+            "auth_source": "auto",
         },
         "mcp_servers": [
             {
@@ -965,14 +1093,69 @@ def _normalize_provider(provider_payload: dict[str, Any], default_payload: dict[
     return normalized
 
 
+def _sanitize_provider_error(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Provider check failed."
+    text = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[redacted]", text)
+    text = re.sub(r"sk-[0-9A-Za-z_-]{12,}", "[redacted]", text)
+    text = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s\"']+", r"\1[redacted]", text)
+    return text[:240]
+
+
+def _provider_check_url(base_url: str) -> str:
+    clean = str(base_url or "").strip().rstrip("/")
+    if not clean:
+        clean = "https://api.openai.com/v1"
+    return f"{clean}/models"
+
+
+def _check_openai_compatible_provider(*, api_key: str, base_url: str, model: str | None) -> dict[str, Any]:
+    if not api_key.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="API key is required.")
+    response = requests.get(
+        _provider_check_url(base_url),
+        headers={"Authorization": f"Bearer {api_key.strip()}"},
+        timeout=20,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_sanitize_provider_error(response.text or f"Provider returned HTTP {response.status_code}."),
+        )
+    body = response.json() if response.content else {}
+    model_ids = {
+        str(item.get("id") or item.get("name") or "")
+        for item in body.get("data", [])
+        if isinstance(item, dict)
+    }
+    requested_model = str(model or "").strip()
+    return {
+        "ok": True,
+        "model_available": bool(requested_model and requested_model in model_ids) if model_ids else None,
+        "models_seen": len(model_ids),
+    }
+
+
 def _has_persisted_secret(value: Any) -> bool:
     text = str(value or "").strip()
     return bool(text) and text != "__configured__"
 
 
+def _normalize_opencode_settings(raw_payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = raw_payload or {}
+    auth_source = str(raw.get("auth_source", "auto") or "auto").strip().lower()
+    if auth_source not in {"auto", "generation_key", "opencode_builtin"}:
+        auth_source = "auto"
+    return {"auth_source": auth_source}
+
+
 def _normalize_settings_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
     defaults = _default_settings_payload()
     generation = _normalize_provider(raw_payload.get("generation", {}), defaults["generation"])
+    if _uses_gemini_api_provider(generation.get("provider")) and not str(generation.get("base_url") or "").strip():
+        generation["base_url"] = _GOOGLE_GEMINI_OPENAI_BASE_URL
     embeddings = _normalize_provider(raw_payload.get("embeddings", {}), defaults["embeddings"])
     reranker = _normalize_provider(raw_payload.get("reranker", {}), defaults["reranker"])
     retrieval = {
@@ -1005,6 +1188,7 @@ def _normalize_settings_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "embeddings": embeddings,
         "reranker": reranker,
         "retrieval": retrieval,
+        "opencode": _normalize_opencode_settings(raw_payload.get("opencode", defaults.get("opencode", {}))),
         "mcp_servers": mcp_servers,
     }
 
@@ -1029,6 +1213,7 @@ def _serialize_settings_for_output(payload: dict[str, Any]) -> dict[str, Any]:
         "embeddings": _redact_provider(payload["embeddings"]),
         "reranker": _redact_provider(payload["reranker"]),
         "retrieval": payload.get("retrieval", {"chunk_count": 20}),
+        "opencode": _normalize_opencode_settings(payload.get("opencode", {})),
         "mcp_servers": [_redact_mcp_server(item) for item in payload.get("mcp_servers", [])],
     }
 
@@ -1082,6 +1267,7 @@ def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRun
     settings = get_settings()
     generation = settings_payload.get("generation", {})
     retrieval = settings_payload.get("retrieval", {})
+    opencode = _normalize_opencode_settings(settings_payload.get("opencode", {}))
     mcp_servers = settings_payload.get("mcp_servers", [])
     enabled_mcp = [item for item in mcp_servers if bool(item.get("enabled", True))]
     mcp_endpoint_configs: list[dict[str, Any]] = []
@@ -1097,28 +1283,57 @@ def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRun
             }
         )
 
-    resolved_openai_key = str(generation.get("api_key") or "").strip() or settings.openai_api_key
-    resolved_openai_base = str(generation.get("base_url") or "").strip() or settings.openai_api_base
+    generation_api_key = str(generation.get("api_key") or "").strip()
     resolved_llm_model = str(generation.get("model") or "").strip() or settings.llm_model
     resolved_generation_provider = (
         str(generation.get("provider") or "").strip() or settings.default_generation_provider
     )
+    clean_generation_provider = resolved_generation_provider.strip().lower()
+    if clean_generation_provider == "vertex_gemini":
+        resolved_vertex_service_account_json = generation_api_key or getattr(settings, "vertex_service_account_json", None)
+        resolved_vertex_project = (
+            str(generation.get("project") or "").strip()
+            or _vertex_service_account_project_id(generation_api_key)
+            or str(getattr(settings, "vertex_project", "") or "").strip()
+        )
+        resolved_vertex_location = (
+            str(generation.get("location") or "").strip()
+            or str(getattr(settings, "vertex_location", "") or "").strip()
+            or "us-central1"
+        )
+        resolved_openai_key = settings.openai_api_key
+        resolved_openai_base = str(generation.get("base_url") or "").strip() or settings.openai_api_base
+    elif _uses_gemini_api_provider(clean_generation_provider):
+        resolved_vertex_service_account_json = getattr(settings, "vertex_service_account_json", None)
+        resolved_vertex_project = getattr(settings, "vertex_project", None)
+        resolved_vertex_location = getattr(settings, "vertex_location", "us-central1")
+        resolved_generation_provider = "openai_compatible"
+        resolved_openai_key = generation_api_key or settings.openai_api_key
+        resolved_openai_base = str(generation.get("base_url") or "").strip() or _GOOGLE_GEMINI_OPENAI_BASE_URL
+    else:
+        resolved_vertex_service_account_json = getattr(settings, "vertex_service_account_json", None)
+        resolved_vertex_project = getattr(settings, "vertex_project", None)
+        resolved_vertex_location = getattr(settings, "vertex_location", "us-central1")
+        resolved_openai_key = generation_api_key or settings.openai_api_key
+        resolved_openai_base = str(generation.get("base_url") or "").strip() or settings.openai_api_base
     resolved_mcp_endpoints = mcp_endpoint_configs or settings.default_mcp_endpoints or settings.resolved_mcp_endpoints()
 
     return AgentRuntimeOptions(
         openai_api_key=resolved_openai_key,
         generation_provider=resolved_generation_provider,
+        generation_api_key_configured=bool(generation_api_key),
         openai_api_base=resolved_openai_base,
         llm_model=resolved_llm_model,
-        vertex_project=getattr(settings, "vertex_project", None),
-        vertex_location=getattr(settings, "vertex_location", "us-central1"),
-        vertex_service_account_json=getattr(settings, "vertex_service_account_json", None),
+        vertex_project=resolved_vertex_project,
+        vertex_location=resolved_vertex_location,
+        vertex_service_account_json=resolved_vertex_service_account_json,
         rag_top_k=_normalized_chunk_count(retrieval.get("chunk_count"), default=20),
         rag_base_url=settings.rag_base_url,
         rag_query_path=settings.rag_query_path,
         mcp_endpoints=resolved_mcp_endpoints,
         mcp_api_key=settings.default_mcp_api_key or settings.mcp_api_key,
         mcp_rag_tool_name=settings.mcp_rag_tool_name,
+        opencode_auth_source=opencode["auth_source"],
     )
 
 
@@ -1178,11 +1393,246 @@ def _persistable_reasoning_summary(final_state: dict[str, Any]) -> str:
     return str(final_state.get("generation_reasoning") or "").strip()
 
 
+def _opencode_provider_auth_from_runtime_options(
+    runtime_options: AgentRuntimeOptions | None,
+) -> OpenCodeProviderAuth | None:
+    if runtime_options is None:
+        return None
+    auth_source = str(getattr(runtime_options, "opencode_auth_source", "auto") or "auto").strip().lower()
+    if auth_source == "opencode_builtin":
+        return None
+    if not bool(getattr(runtime_options, "generation_api_key_configured", False)):
+        return None
+
+    model = str(getattr(runtime_options, "llm_model", "") or "").strip()
+    if not model:
+        return None
+
+    provider = str(getattr(runtime_options, "generation_provider", "") or "").strip().lower()
+    if provider == "vertex_gemini":
+        if not str(getattr(runtime_options, "vertex_service_account_json", "") or "").strip():
+            return None
+        buffered_runtime_options = _vertex_buffered_edit_runtime_options(runtime_options)
+        api_key = str(getattr(buffered_runtime_options, "openai_api_key", "") or "").strip()
+        base_url = str(getattr(buffered_runtime_options, "openai_api_base", "") or "").strip()
+        vertex_model = str(getattr(buffered_runtime_options, "llm_model", "") or "").strip()
+        if not api_key or not base_url or not vertex_model:
+            return None
+        return OpenCodeProviderAuth(
+            provider_id="matportal-user",
+            model=vertex_model,
+            api_key=api_key,
+            base_url=base_url,
+            name="MatPortal user Vertex AI account",
+        )
+
+    api_key = str(getattr(runtime_options, "openai_api_key", "") or "").strip()
+    if not api_key:
+        return None
+
+    settings = get_settings()
+    base_url = (
+        str(getattr(runtime_options, "openai_api_base", "") or "").strip()
+        or str(settings.openai_api_base or "").strip()
+        or "https://api.openai.com/v1"
+    )
+    return OpenCodeProviderAuth(
+        provider_id="matportal-user",
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+
+def _opencode_auth_source_from_runtime_options(runtime_options: AgentRuntimeOptions | None) -> str:
+    auth_source = str(getattr(runtime_options, "opencode_auth_source", "auto") or "auto").strip().lower()
+    if auth_source not in {"auto", "generation_key", "opencode_builtin"}:
+        return "auto"
+    return auth_source
+
+
+def _stream_opencode_execution(
+    *,
+    prompt: str,
+    thread_id: str | None,
+    trace_id: str,
+    runtime_options: AgentRuntimeOptions | None = None,
+) -> Iterator[str]:
+    executor = OpenCodeExecutor(provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options))
+    stream = executor.stream(prompt=prompt, thread_id=thread_id, trace_id=trace_id)
+    while True:
+        try:
+            event = next(stream)
+        except StopIteration as stop:
+            return stop.value
+        yield _sse(event)
+
+
+def _opencode_success_response(result: OpenCodeExecutionResult) -> str:
+    summary = str(result.final_text or "").strip()
+    if summary:
+        return summary
+
+    if result.changed_files:
+        return (
+            f"OpenCode prepared an ontology edit proposal in `{result.workspace}` "
+            f"touching {len(result.changed_files)} file(s)."
+        )
+
+    return f"OpenCode finished in `{result.workspace}` without writing any files."
+
+
+def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
+    if result.changed_files:
+        return (
+            f"OpenCode did not finish cleanly, but it still changed {len(result.changed_files)} file(s) "
+            f"in `{result.workspace}` for review."
+        )
+    return "OpenCode could not finish the ontology edit proposal."
+
+
+def _opencode_usage_payload(
+    result: OpenCodeExecutionResult,
+    runtime_options: AgentRuntimeOptions | None = None,
+) -> dict[str, Any]:
+    model = str(result.model or get_settings().opencode_model or "opencode")
+    execution = result.execution_payload()
+    if runtime_options is not None:
+        source = _opencode_auth_source_from_runtime_options(runtime_options)
+        execution["auth_source"] = source
+        execution["using_user_generation_key"] = bool(
+            source != "opencode_builtin"
+            and getattr(runtime_options, "generation_api_key_configured", False)
+        )
+    return {
+        "model": model,
+        "mode": "opencode",
+        "execution": execution,
+    }
+
+
+def _opencode_hybrid_ask_enabled() -> bool:
+    return bool(getattr(get_settings(), "opencode_hybrid_ask_enabled", False))
+
+
+def _opencode_hybrid_ask_usage_payload(
+    result: OpenCodeExecutionResult,
+    runtime_options: AgentRuntimeOptions | None = None,
+) -> dict[str, Any]:
+    model = str(result.model or get_settings().opencode_model or "opencode")
+    return {
+        "model": model,
+        "mode": "opencode_hybrid_ask",
+        "opencode": {
+            "ok": result.ok,
+            "run_id": result.run_id,
+            "model": result.model,
+            "exit_code": result.exit_code,
+            "log_lines": len(result.console_lines),
+            "auth_source": _opencode_auth_source_from_runtime_options(runtime_options),
+        },
+    }
+
+
+def _stream_opencode_ask_generation(
+    *,
+    prompt: str,
+    thread_id: str | None,
+    trace_id: str,
+    runtime_options: AgentRuntimeOptions | None,
+    retrieval_state: dict[str, Any],
+) -> Iterator[str]:
+    executor = OpenCodeExecutor(provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options))
+    stream = executor.stream(
+        prompt=prompt,
+        thread_id=thread_id,
+        trace_id=trace_id,
+        task="ask",
+        retrieved_context=str(retrieval_state.get("rag_result") or ""),
+        citation_labels=list(retrieval_state.get("citation_labels") or []),
+    )
+    while True:
+        try:
+            event = next(stream)
+        except StopIteration as stop:
+            return stop.value
+        event_type = str(event.get("type") or "")
+        if event_type == "opencode_phase":
+            label = str((event.get("content") or {}).get("label") or "").strip()
+            if label:
+                yield _sse({"type": "status", "message": label})
+        elif event_type == "terminal_log":
+            continue
+
+
+def _artifact_execution_for_user(
+    session: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    execution = get_thread_execution(session, user_id=user_id, thread_id=thread_id, run_id=run_id)
+    if not execution:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact run not found.")
+    if artifact_expired(execution):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Artifact run has expired.")
+    workspace = str(execution.get("workspace") or "").strip()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact workspace not found.")
+    return execution
+
+
+def _artifact_access_error(exc: ArtifactAccessError) -> HTTPException:
+    detail = str(exc) or "Artifact is not available."
+    if "unsafe" in detail.lower() or "absolute" in detail.lower() or "escapes" in detail.lower():
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+def _require_internal_admin_token(x_internal_token: str | None) -> None:
+    expected_token = get_settings().internal_api_token
+    if not expected_token or x_internal_token != expected_token:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def _cleanup_expired_artifacts() -> dict[str, Any]:
+    settings = get_settings()
+    removed = cleanup_expired_workspaces(
+        settings.ontology_workdir / settings.opencode_workspace_subdir,
+        retention_days=settings.opencode_artifact_retention_days,
+    )
+    if removed:
+        logger.info(_log_event("assistant_artifact_cleanup", removed_workspaces=removed))
+    return {
+        "removed_workspaces": removed,
+        "retention_days": settings.opencode_artifact_retention_days,
+    }
+
+
+def _artifact_filename(path: str, *, fallback: str = "artifact") -> str:
+    try:
+        clean_path = sanitize_artifact_path(path)
+    except ArtifactAccessError:
+        return fallback
+    return clean_path.name or fallback
+
+
+def _require_execution_path(execution: dict[str, Any], path: str) -> None:
+    try:
+        sanitize_artifact_path(path)
+    except ArtifactAccessError as exc:
+        raise _artifact_access_error(exc) from exc
+    if not execution_allows_path(execution, path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found in this run.")
+
+
 def _stream_agent_response(
     *,
     prompt: str,
     thread_id: str | None,
     agent_builder: Callable[[], OntoPortalAgent],
+    requested_mode: str | None = None,
     on_completed: Callable[[dict[str, Any], str], None] | None = None,
     log_context: dict[str, Any] | None = None,
 ) -> Iterator[str]:
@@ -1217,29 +1667,66 @@ def _stream_agent_response(
                 base_url=(runtime_options.openai_api_base if runtime_options else None) or get_settings().openai_api_base,
             )
             logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="runtime", model=resolved_model))
-            yield _sse({"type": "status", "message": "Classifying request..."})
-            intent = _classify_intent(llm, prompt)
-            logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
+            if _normalize_chat_mode(requested_mode) == "edit":
+                intent = "EDIT"
+                logger.info(
+                    _log_event(
+                        "assistant_stream_intent",
+                        **stream_context,
+                        intent=intent,
+                        requested_mode="edit",
+                        model=resolved_model,
+                    )
+                )
+            else:
+                yield _sse({"type": "status", "message": "Classifying request..."})
+                intent = _classify_intent(llm, prompt)
+                logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
             if intent == "EDIT":
-                yield _sse({"type": "status", "message": "Edit workflow uses buffered execution."})
-                edit_agent = agent
-                if _uses_vertex_gemini_provider(runtime_options):
-                    edit_runtime_options = _vertex_buffered_edit_runtime_options(runtime_options)
-                    resolved_model = str(edit_runtime_options.llm_model or resolved_model or "")
-                    logger.info(
+                yield _sse({"type": "status", "message": "Starting OpenCode workspace..."})
+                opencode_result = yield from _stream_opencode_execution(
+                    prompt=prompt,
+                    thread_id=thread_id,
+                    trace_id=stream_context["trace_id"],
+                    runtime_options=runtime_options,
+                )
+                resolved_model = str(opencode_result.model or get_settings().opencode_model or resolved_model or "")
+                final_state["generation_backend"] = "opencode"
+                final_state["generation_usage"] = _opencode_usage_payload(opencode_result, runtime_options)
+                final_state["citations"] = []
+                yield _sse({"type": "usage", "content": final_state["generation_usage"]})
+
+                if opencode_result.ok:
+                    final_response_text = _opencode_success_response(opencode_result)
+                    final_state["final_response"] = final_response_text
+                    for chunk in _iter_text_chunks(final_response_text):
+                        yield _sse({"type": "delta", "content": chunk})
+                else:
+                    final_response_text = _opencode_failure_response(opencode_result)
+                    error_details = {
+                        "trace_id": stream_context["trace_id"],
+                        "status": "OpenCode workspace failed.",
+                        "message": final_response_text,
+                        "error_class": "OpenCodeExecutionError",
+                        "status_code": 500,
+                    }
+                    final_state["generation_usage"]["error"] = error_details
+                    final_state["final_response"] = final_response_text
+                    logger.warning(
                         _log_event(
-                            "assistant_stream_edit_vertex_bridge",
+                            "assistant_stream_opencode_failed",
                             **stream_context,
                             intent=intent,
-                            model=resolved_model,
-                            base_url=_vertex_openai_base_url(runtime_options),
+                            model=resolved_model or final_state["generation_usage"].get("model"),
+                            workspace=opencode_result.workspace,
+                            exit_code=opencode_result.exit_code,
+                            changed_files=len(opencode_result.changed_files),
                         )
                     )
-                    edit_agent = OntoPortalAgent(runtime_options=edit_runtime_options)
-                final_state = _collect_graph_final_state(agent=edit_agent, prompt=prompt, thread_id=thread_id)
-                for event in _emit_final_state(final_state):
-                    yield event
-                final_response_text = str(final_state.get("final_response") or final_state.get("rag_result") or "").strip()
+                    yield _sse({"type": "status", "message": "OpenCode workspace failed."})
+                    yield _sse({"type": "error", "content": error_details})
+                    for chunk in _iter_text_chunks(final_response_text):
+                        yield _sse({"type": "delta", "content": chunk})
             else:
                 yield _sse({"type": "status", "message": "Retrieving ontology context..."})
                 final_state = _retrieve_runtime_state(prompt, runtime_options)
@@ -1257,12 +1744,63 @@ def _stream_agent_response(
                 )
                 if final_state.get("retrieval_error"):
                     yield _sse({"type": "status", "message": str(final_state["retrieval_error"])})
+                if isinstance(final_state.get("citations"), list) and final_state.get("citations"):
+                    yield _sse({"type": "citations", "content": final_state.get("citations")})
 
-                yield _sse({"type": "status", "message": "Streaming answer..."})
+                if _opencode_hybrid_ask_enabled():
+                    yield _sse({"type": "status", "message": "Generating answer with OpenCode..."})
+                    try:
+                        opencode_ask_result = yield from _stream_opencode_ask_generation(
+                            prompt=prompt,
+                            thread_id=thread_id,
+                            trace_id=stream_context["trace_id"],
+                            runtime_options=runtime_options,
+                            retrieval_state=final_state,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            _log_event(
+                                "assistant_stream_hybrid_ask_failed",
+                                **stream_context,
+                                intent=intent,
+                                model=get_settings().opencode_model,
+                                **_failure_log_fields(exc),
+                            )
+                        )
+                        yield _sse({"type": "status", "message": "OpenCode answer generation failed; using the standard model path."})
+                    else:
+                        if opencode_ask_result.ok and str(opencode_ask_result.final_text or "").strip():
+                            resolved_model = str(opencode_ask_result.model or get_settings().opencode_model or resolved_model or "")
+                            final_response_text = str(opencode_ask_result.final_text or "").strip()
+                            final_state["final_response"] = final_response_text
+                            final_state["generation_backend"] = "opencode:hybrid_ask"
+                            final_state["generation_usage"] = _opencode_hybrid_ask_usage_payload(
+                                opencode_ask_result,
+                                runtime_options,
+                            )
+                            for chunk in _iter_text_chunks(final_response_text):
+                                yield _sse({"type": "delta", "content": chunk})
+                            yield _sse({"type": "usage", "content": final_state["generation_usage"]})
+                            logger.info(
+                                _log_event(
+                                    "assistant_stream_hybrid_ask_completed",
+                                    **stream_context,
+                                    intent=intent,
+                                    model=resolved_model,
+                                    retrieval_backend=final_state.get("retrieval_backend"),
+                                    citations=len(final_state.get("citations") or []),
+                                )
+                            )
+                            model_candidates = []
+                        else:
+                            yield _sse({"type": "status", "message": "OpenCode answer generation produced no answer; using the standard model path."})
+
+                if not final_state.get("final_response"):
+                    yield _sse({"type": "status", "message": "Streaming answer..."})
                 messages = _build_response_messages(
                     question=prompt,
                     rag_result=str(final_state.get("rag_result") or ""),
-                    citations=list(final_state.get("citations") or []),
+                    citations=list(final_state.get("citation_labels") or []),
                     retrieval_backend=str(final_state.get("retrieval_backend") or "unknown"),
                     retrieval_error=str(final_state.get("retrieval_error") or ""),
                 )
@@ -1418,13 +1956,16 @@ def _stream_agent_response(
                 if not streamed_chunks and last_stream_error is not None:
                     raise last_stream_error
 
-                final_response_text = "".join(streamed_chunks).strip() or "No response generated."
-                final_state["final_response"] = final_response_text
-                final_state["generation_backend"] = f"llm:{resolved_model}"
-                final_state["generation_usage"] = stream_usage
-                if streamed_reasoning:
-                    final_state["generation_reasoning"] = "".join(streamed_reasoning).strip()
-                yield _sse({"type": "usage", "content": stream_usage})
+                if final_state.get("final_response"):
+                    final_response_text = str(final_state.get("final_response") or "").strip()
+                else:
+                    final_response_text = "".join(streamed_chunks).strip() or "No response generated."
+                    final_state["final_response"] = final_response_text
+                    final_state["generation_backend"] = f"llm:{resolved_model}"
+                    final_state["generation_usage"] = stream_usage
+                    if streamed_reasoning:
+                        final_state["generation_reasoning"] = "".join(streamed_reasoning).strip()
+                    yield _sse({"type": "usage", "content": stream_usage})
         logger.info(
             _log_event(
                 "assistant_stream_completed",
@@ -1507,11 +2048,129 @@ def _stream_agent_response(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    _cleanup_expired_artifacts()
 
 
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/api/v1/admin/artifacts/cleanup")
+def admin_artifact_cleanup(x_internal_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    _require_internal_admin_token(x_internal_token)
+    return _cleanup_expired_artifacts()
+
+
+@app.get("/api/v1/me/artifacts/{thread_id}/{run_id}/files")
+def me_artifact_files(
+    thread_id: str,
+    run_id: str,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    execution = _artifact_execution_for_user(
+        session,
+        user_id=user_context.user_id,
+        thread_id=thread_id,
+        run_id=run_id,
+    )
+    return {
+        "thread_id": thread_id,
+        "run_id": run_id,
+        "expires_at": execution.get("expires_at"),
+        "workspace": execution.get("workspace"),
+        "files": list_artifact_files(execution),
+        "bundle_url": f"/assistant/artifacts/{thread_id}/{run_id}/bundle.zip",
+    }
+
+
+@app.get("/api/v1/me/artifacts/{thread_id}/{run_id}/file")
+def me_artifact_file(
+    thread_id: str,
+    run_id: str,
+    request: Request,
+    path: str = Query(..., min_length=1),
+    view: str = Query(default="file"),
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    execution = _artifact_execution_for_user(
+        session,
+        user_id=user_context.user_id,
+        thread_id=thread_id,
+        run_id=run_id,
+    )
+    _require_execution_path(execution, path)
+    try:
+        if str(view or "").lower() == "diff":
+            payload = read_artifact_diff(
+                execution["workspace"],
+                path,
+                max_chars=max(10_000, int(get_settings().opencode_max_diff_chars)),
+            )
+            payload["view"] = "diff"
+            return payload
+
+        payload = read_artifact_text(execution["workspace"], path)
+        payload["view"] = "file"
+        return payload
+    except ArtifactAccessError as exc:
+        raise _artifact_access_error(exc) from exc
+
+
+@app.get("/api/v1/me/artifacts/{thread_id}/{run_id}/download")
+def me_artifact_download(
+    thread_id: str,
+    run_id: str,
+    request: Request,
+    path: str = Query(..., min_length=1),
+    session: Session = Depends(get_db_session),
+) -> FileResponse:
+    user_context = _resolve_user_context(request)
+    execution = _artifact_execution_for_user(
+        session,
+        user_id=user_context.user_id,
+        thread_id=thread_id,
+        run_id=run_id,
+    )
+    _require_execution_path(execution, path)
+    try:
+        file_path = resolve_artifact_file(execution["workspace"], path)
+    except ArtifactAccessError as exc:
+        raise _artifact_access_error(exc) from exc
+    return FileResponse(
+        path=str(file_path),
+        filename=_artifact_filename(path),
+        media_type=file_metadata(execution["workspace"], path).get("content_type") or "application/octet-stream",
+    )
+
+
+@app.get("/api/v1/me/artifacts/{thread_id}/{run_id}/bundle.zip")
+def me_artifact_bundle(
+    thread_id: str,
+    run_id: str,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> Response:
+    user_context = _resolve_user_context(request)
+    execution = _artifact_execution_for_user(
+        session,
+        user_id=user_context.user_id,
+        thread_id=thread_id,
+        run_id=run_id,
+    )
+    try:
+        payload = build_artifact_bundle(execution["workspace"], execution)
+    except ArtifactAccessError as exc:
+        raise _artifact_access_error(exc) from exc
+    filename = f"matportal-assistant-{run_id}.zip"
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/v1/me/bootstrap")
@@ -1559,15 +2218,18 @@ def me_put_settings(
     encryption_service = _encryption_required()
 
     existing_payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
-    normalized_payload = _normalize_settings_payload(payload.model_dump())
+    raw_payload = payload.model_dump()
+    normalized_payload = _normalize_settings_payload(raw_payload)
     for provider_key in ("generation", "embeddings", "reranker"):
         incoming_provider = normalized_payload.get(provider_key, {})
         existing_provider = existing_payload.get(provider_key, {})
+        raw_provider = raw_payload.get(provider_key, {})
+        if bool(raw_provider.get("clear_api_key", False)):
+            incoming_provider["api_key"] = ""
+            continue
         incoming_provider_name = str(incoming_provider.get("provider", "")).strip().lower()
         existing_provider_name = str(existing_provider.get("provider", "")).strip().lower()
         if (
-            incoming_provider_name != "vertex_gemini"
-            and
             incoming_provider_name == existing_provider_name
             and not str(incoming_provider.get("api_key", "")).strip()
             and _has_persisted_secret(existing_provider.get("api_key", ""))
@@ -1589,6 +2251,7 @@ def me_put_settings(
         "embeddings": normalized_payload["embeddings"],
         "reranker": normalized_payload["reranker"],
         "retrieval": normalized_payload["retrieval"],
+        "opencode": normalized_payload["opencode"],
     }
     encrypted_payload, key_version = encryption_service.encrypt_json(settings_blob)
     upsert_user_settings(
@@ -1605,6 +2268,57 @@ def me_put_settings(
         encrypt_api_key=lambda api_key: encryption_service.encrypt_json({"api_key": api_key}),
     )
     return _serialize_settings_for_output(normalized_payload)
+
+
+@app.post("/api/v1/me/settings/provider/check")
+def me_check_settings_provider(
+    payload: ProviderCheckIn,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    existing_payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
+    defaults = _default_settings_payload()
+    scope = str(payload.scope or "generation").strip().lower()
+    if scope not in ("generation", "embeddings", "reranker"):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unsupported provider scope.")
+
+    raw_provider = payload.model_dump()
+    provider = _normalize_provider(raw_provider, defaults.get(scope, defaults["generation"]))
+    existing_provider = existing_payload.get(scope, {})
+    incoming_name = str(provider.get("provider", "")).strip().lower()
+    existing_name = str(existing_provider.get("provider", "")).strip().lower()
+    if (
+        not str(provider.get("api_key", "")).strip()
+        and incoming_name == existing_name
+        and _has_persisted_secret(existing_provider.get("api_key", ""))
+    ):
+        provider["api_key"] = str(existing_provider.get("api_key", "")).strip()
+    if _uses_gemini_api_provider(provider.get("provider")) and not str(provider.get("base_url") or "").strip():
+        provider["base_url"] = _GOOGLE_GEMINI_OPENAI_BASE_URL
+
+    clean_provider = str(provider.get("provider") or "").strip().lower()
+    if clean_provider == "vertex_gemini":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Vertex service-account checks are not exposed in per-user settings.",
+        )
+    if clean_provider in ("none", ""):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No provider is configured.")
+
+    result = _check_openai_compatible_provider(
+        api_key=str(provider.get("api_key") or ""),
+        base_url=str(provider.get("base_url") or ""),
+        model=str(provider.get("model") or ""),
+    )
+    result.update(
+        {
+            "provider": provider.get("provider"),
+            "model": provider.get("model") or "",
+            "base_url": provider.get("base_url") or "",
+        }
+    )
+    return result
 
 
 @app.get("/api/v1/me/threads")
@@ -1786,6 +2500,7 @@ def me_chat_stream(
             prompt=prompt,
             thread_id=thread.thread_id,
             agent_builder=lambda: OntoPortalAgent(runtime_options=runtime_options),
+            requested_mode=payload.mode,
             on_completed=on_completed,
             log_context=log_context,
         ),
@@ -1822,6 +2537,7 @@ def chat_stream(
             prompt=prompt,
             thread_id=request.thread_id,
             agent_builder=lambda: _get_agent(),
+            requested_mode=request.mode,
             log_context={
                 "trace_id": uuid.uuid4().hex[:12],
                 "thread_id": request.thread_id,

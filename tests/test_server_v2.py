@@ -1,7 +1,11 @@
 import json
 import logging
 import importlib
+import os
+import subprocess
 import time
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +21,9 @@ from fastapi.testclient import TestClient
 from ontoportal_agent import config as config_module
 from ontoportal_agent import server
 from ontoportal_agent.db.base import get_engine, get_session_factory
+from ontoportal_agent.db.repositories import create_message
 from ontoportal_agent.db.user_context import build_signature
+from ontoportal_agent.opencode_executor import OpenCodeExecutionResult
 
 
 def _configure_env(monkeypatch, tmp_path: Path):
@@ -25,6 +31,7 @@ def _configure_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
     monkeypatch.setenv("ONTOAGENT_DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path / "ontology-workdir"))
     monkeypatch.setenv("ONTOAGENT_ENCRYPTION_KEY_CURRENT", "A" * 32)
     monkeypatch.setenv("ONTOAGENT_USER_CONTEXT_SECRET", "ctx-secret")
     monkeypatch.setenv("ONTOAGENT_INTERNAL_API_TOKEN", "internal-token")
@@ -235,6 +242,272 @@ def test_switching_provider_does_not_preserve_previous_secret(monkeypatch, tmp_p
     )
     assert repeated.status_code == 200
     assert repeated.json()["generation"]["api_key"] == ""
+
+
+def test_gemini_api_settings_preserve_user_api_key(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "embeddings": {
+                "provider": "openai_compatible",
+                "model": "text-embedding-005",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "reranker": {
+                "provider": "none",
+                "model": "",
+                "api_key": "",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    saved_body = saved.json()
+    assert saved_body["generation"]["api_key"] == "__configured__"
+    assert saved_body["generation"]["provider"] == "gemini_api"
+    assert saved_body["generation"]["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    repeated = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-3-flash-preview",
+                "api_key": "__configured__",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            },
+            "embeddings": saved_body["embeddings"],
+            "reranker": saved_body["reranker"],
+            "retrieval": saved_body["retrieval"],
+            "mcp_servers": saved_body["mcp_servers"],
+        },
+        headers=headers,
+    )
+    assert repeated.status_code == 200
+    repeated_body = repeated.json()
+    assert repeated_body["generation"]["api_key"] == "__configured__"
+    assert repeated_body["generation"]["model"] == "gemini-3-flash-preview"
+    assert repeated_body["generation"]["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def test_settings_clear_generation_api_key(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    assert saved.json()["generation"]["api_key"] == "__configured__"
+
+    cleared = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "clear_api_key": True,
+            },
+            "embeddings": saved.json()["embeddings"],
+            "reranker": saved.json()["reranker"],
+            "retrieval": saved.json()["retrieval"],
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["generation"]["api_key"] == ""
+
+    loaded = client.get("/api/v1/me/settings", headers=headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["generation"]["api_key"] == ""
+
+
+def test_settings_persist_opencode_auth_source(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "",
+                "base_url": "",
+            },
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "opencode": {"auth_source": "opencode_builtin"},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    assert saved.json()["opencode"] == {"auth_source": "opencode_builtin"}
+
+    loaded = client.get("/api/v1/me/settings", headers=headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["opencode"] == {"auth_source": "opencode_builtin"}
+
+
+def test_provider_check_uses_saved_gemini_api_key_without_returning_secret(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"data":[{"id":"gemini-2.5-pro"}]}'
+        text = content.decode("utf-8")
+
+        def json(self):
+            return {"data": [{"id": "gemini-2.5-pro"}]}
+
+    def fake_get(url, *, headers=None, timeout=None):
+        seen["url"] = url
+        seen["authorization"] = (headers or {}).get("Authorization")
+        seen["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(server.requests, "get", fake_get)
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+
+    checked = client.post(
+        "/api/v1/me/settings/provider/check",
+        json={
+            "scope": "generation",
+            "provider": "gemini_api",
+            "model": "gemini-2.5-pro",
+            "api_key": "",
+            "base_url": "",
+        },
+        headers=headers,
+    )
+    assert checked.status_code == 200
+    body = checked.json()
+    assert body["ok"] is True
+    assert body["model_available"] is True
+    assert "api_key" not in body
+    assert seen["url"] == "https://generativelanguage.googleapis.com/v1beta/openai/models"
+    assert seen["authorization"] == "Bearer user-gemini-api-key"
+
+
+def test_provider_check_redacts_failed_key(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+    fake_gemini_key = "AI" + "za" + "123456789012345678901234567890"
+
+    class FakeResponse:
+        status_code = 401
+        content = f'{{"error":"bad key {fake_gemini_key}"}}'.encode("utf-8")
+        text = content.decode("utf-8")
+
+        def json(self):
+            return {"error": "bad key"}
+
+    monkeypatch.setattr(server.requests, "get", lambda *args, **kwargs: FakeResponse())
+
+    checked = client.post(
+        "/api/v1/me/settings/provider/check",
+        json={
+            "scope": "generation",
+            "provider": "gemini_api",
+            "model": "gemini-2.5-pro",
+            "api_key": fake_gemini_key,
+            "base_url": "",
+        },
+        headers=headers,
+    )
+    assert checked.status_code == 400
+    detail = checked.json()["detail"]
+    assert fake_gemini_key not in detail
+    assert "[redacted]" in detail
+
+
+def test_provider_check_redacts_bearer_and_openai_style_keys(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+    fake_openai_key = "sk" + "-testsecret1234567890"
+
+    class FakeResponse:
+        status_code = 401
+        content = f"Authorization: Bearer {fake_openai_key} api_key={fake_openai_key}".encode("utf-8")
+        text = content.decode("utf-8")
+
+        def json(self):
+            return {"error": "bad key"}
+
+    monkeypatch.setattr(server.requests, "get", lambda *args, **kwargs: FakeResponse())
+
+    checked = client.post(
+        "/api/v1/me/settings/provider/check",
+        json={
+            "scope": "generation",
+            "provider": "openai_compatible",
+            "model": "gpt-test",
+            "api_key": fake_openai_key,
+            "base_url": "https://example.test/v1",
+        },
+        headers=headers,
+    )
+    assert checked.status_code == 400
+    detail = checked.json()["detail"]
+    assert fake_openai_key not in detail
+    assert "Bearer [redacted]" in detail
+    assert "api_key=[redacted]" in detail
 
 
 def test_serialize_message_hides_non_displayable_reasoning():
@@ -656,9 +929,189 @@ def test_retrieve_runtime_state_prefers_direct_rag(monkeypatch):
 
     assert state["retrieval_backend"] == "rag-http"
     assert state["rag_result"] == "Direct RAG answer"
-    assert state["citations"] == ["PROCESSONTOLOGY v1.0"]
+    assert state["citations"][0]["document_label"] == "PROCESSONTOLOGY v1.0"
+    assert state["citations"][0]["ontology_id"] == "PROCESSONTOLOGY"
     assert observed["top_k"] == 12
     assert "mcp_called" not in observed
+
+
+def test_artifact_endpoints_list_view_download_and_bundle(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    thread_resp = client.post("/api/v1/me/threads", json={"title": "Artifacts"}, headers=headers)
+    assert thread_resp.status_code == 200
+    thread_id = thread_resp.json()["thread_id"]
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess_result = subprocess.run(["git", "init"], cwd=str(workspace), capture_output=True, text=True)
+    assert subprocess_result.returncode == 0
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.org"], cwd=str(workspace), check=True)
+    (workspace / "proposal.ttl").write_text("@prefix ex: <https://example.org/> .\n", encoding="utf-8")
+    (workspace / "notes.md").write_text("# Notes\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(workspace), check=True)
+
+    run_id = "run-artifacts-1"
+    usage = {
+        "mode": "opencode",
+        "execution": {
+            "mode": "opencode",
+            "ok": True,
+            "run_id": run_id,
+            "workspace": str(workspace),
+            "changed_files": [
+                {"status": "A", "path": "proposal.ttl", "kind": "ttl"},
+                {"status": "A", "path": "notes.md", "kind": "md"},
+            ],
+            "artifact_candidates": [{"status": "A", "path": "proposal.ttl", "kind": "ttl"}],
+            "diff_summary": {},
+            "expires_at": "2999-01-01T00:00:00+00:00",
+        },
+    }
+    with get_session_factory()() as session:
+        create_message(
+            session,
+            user_id="user-1",
+            thread_id=thread_id,
+            role="assistant",
+            content="OpenCode finished.",
+            usage_json=usage,
+            citations_json=[],
+        )
+
+    files_resp = client.get(f"/api/v1/me/artifacts/{thread_id}/{run_id}/files", headers=headers)
+    assert files_resp.status_code == 200
+    files = files_resp.json()["files"]
+    assert [item["path"] for item in files] == ["proposal.ttl", "notes.md"]
+    assert files[0]["viewable"] is True
+    assert "absolute_path" not in files[0]
+
+    view_resp = client.get(
+        f"/api/v1/me/artifacts/{thread_id}/{run_id}/file",
+        params={"path": "proposal.ttl"},
+        headers=headers,
+    )
+    assert view_resp.status_code == 200
+    assert view_resp.json()["language"] == "turtle"
+    assert "@prefix ex:" in view_resp.json()["content"]
+
+    diff_resp = client.get(
+        f"/api/v1/me/artifacts/{thread_id}/{run_id}/file",
+        params={"path": "proposal.ttl", "view": "diff"},
+        headers=headers,
+    )
+    assert diff_resp.status_code == 200
+    assert "proposal.ttl" in diff_resp.json()["content"]
+
+    download_resp = client.get(
+        f"/api/v1/me/artifacts/{thread_id}/{run_id}/download",
+        params={"path": "notes.md"},
+        headers=headers,
+    )
+    assert download_resp.status_code == 200
+    assert download_resp.content == b"# Notes\n"
+
+    bundle_resp = client.get(f"/api/v1/me/artifacts/{thread_id}/{run_id}/bundle.zip", headers=headers)
+    assert bundle_resp.status_code == 200
+    with zipfile.ZipFile(BytesIO(bundle_resp.content)) as archive:
+        assert sorted(archive.namelist()) == ["notes.md", "proposal.ttl"]
+
+
+def test_artifact_endpoints_enforce_owner_and_safe_paths(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+    other_headers = _signed_headers(user_id="user-2", username="bob", email="bob@example.org")
+
+    thread_resp = client.post("/api/v1/me/threads", json={"title": "Safe artifacts"}, headers=headers)
+    assert thread_resp.status_code == 200
+    thread_id = thread_resp.json()["thread_id"]
+
+    workspace = tmp_path / "workspace-safe"
+    workspace.mkdir()
+    (workspace / "ok.ttl").write_text("ok", encoding="utf-8")
+    (workspace / "opencode.json").write_text('{"api_key":"secret"}', encoding="utf-8")
+    outside = tmp_path / "outside.ttl"
+    outside.write_text("outside", encoding="utf-8")
+    (workspace / "leak.ttl").symlink_to(outside)
+    run_id = "run-safe-1"
+    with get_session_factory()() as session:
+        create_message(
+            session,
+            user_id="user-1",
+            thread_id=thread_id,
+            role="assistant",
+            content="OpenCode finished.",
+            usage_json={
+                "execution": {
+                    "run_id": run_id,
+                    "workspace": str(workspace),
+                    "changed_files": [
+                        {"status": "A", "path": "ok.ttl", "kind": "ttl"},
+                        {"status": "A", "path": "leak.ttl", "kind": "ttl"},
+                    ],
+                    "artifact_candidates": [],
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                }
+            },
+            citations_json=[],
+        )
+
+    unsafe_resp = client.get(
+        f"/api/v1/me/artifacts/{thread_id}/{run_id}/file",
+        params={"path": "../outside.ttl"},
+        headers=headers,
+    )
+    assert unsafe_resp.status_code == 400
+
+    unlisted_resp = client.get(
+        f"/api/v1/me/artifacts/{thread_id}/{run_id}/file",
+        params={"path": "opencode.json"},
+        headers=headers,
+    )
+    assert unlisted_resp.status_code == 404
+
+    symlink_resp = client.get(
+        f"/api/v1/me/artifacts/{thread_id}/{run_id}/file",
+        params={"path": "leak.ttl"},
+        headers=headers,
+    )
+    assert symlink_resp.status_code == 400
+
+    other_resp = client.get(f"/api/v1/me/artifacts/{thread_id}/{run_id}/files", headers=other_headers)
+    assert other_resp.status_code == 404
+
+
+def test_admin_artifact_cleanup_requires_internal_token_and_removes_expired_runs(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_ARTIFACT_RETENTION_DAYS", "1")
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    settings = config_module.get_settings()
+    root = settings.ontology_workdir / settings.opencode_workspace_subdir
+    root.mkdir(parents=True, exist_ok=True)
+    old_workspace = root / "thread-old-run"
+    fresh_workspace = root / "thread-fresh-run"
+    for workspace in (old_workspace, fresh_workspace):
+        workspace.mkdir()
+        (workspace / "opencode.json").write_text("{}", encoding="utf-8")
+    old_time = time.time() - (3 * 24 * 60 * 60)
+    os.utime(old_workspace, (old_time, old_time))
+
+    forbidden = client.post("/api/v1/admin/artifacts/cleanup")
+    assert forbidden.status_code == 403
+
+    response = client.post(
+        "/api/v1/admin/artifacts/cleanup",
+        headers={"X-Internal-Token": settings.internal_api_token or ""},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["removed_workspaces"] == 1
+    assert not old_workspace.exists()
+    assert fresh_workspace.exists()
 
 
 def test_builtin_mcp_timeout_is_upgraded_for_runtime(monkeypatch):
@@ -707,6 +1160,345 @@ def test_builtin_mcp_timeout_is_upgraded_for_runtime(monkeypatch):
             "timeout_ms": 30000,
         }
     ]
+
+
+def test_runtime_options_tracks_user_generation_key_for_opencode(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gpt-5.2",
+                "api_key": "user-openai-key",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.openai_api_key == "user-openai-key"
+    assert runtime_options.generation_api_key_configured is True
+
+    auth = server._opencode_provider_auth_from_runtime_options(runtime_options)
+    assert auth is not None
+    assert auth.model_ref == "matportal-user/gpt-5.2"
+    assert auth.api_key == "user-openai-key"
+    assert auth.base_url == "https://deployment.example/openai"
+
+
+def test_runtime_options_treat_gemini_api_key_as_openai_compatible_for_opencode(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            vertex_project=None,
+            vertex_location="us-central1",
+            vertex_service_account_json=None,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.generation_provider == "openai_compatible"
+    assert runtime_options.openai_api_key == "user-gemini-api-key"
+    assert runtime_options.openai_api_base == "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert runtime_options.generation_api_key_configured is True
+
+    auth = server._opencode_provider_auth_from_runtime_options(runtime_options)
+    assert auth is not None
+    assert auth.model_ref == "matportal-user/gemini-2.5-pro"
+    assert auth.api_key == "user-gemini-api-key"
+    assert auth.base_url == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def test_opencode_builtin_auth_source_skips_user_generation_key(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            vertex_project=None,
+            vertex_location="us-central1",
+            vertex_service_account_json=None,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "opencode": {"auth_source": "opencode_builtin"},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.opencode_auth_source == "opencode_builtin"
+    assert runtime_options.generation_api_key_configured is True
+    assert server._opencode_provider_auth_from_runtime_options(runtime_options) is None
+
+
+def test_opencode_usage_reports_auth_source():
+    result = OpenCodeExecutionResult(
+        ok=True,
+        workspace="/tmp/workspace",
+        run_id="run-auth",
+        expires_at="2999-01-01T00:00:00+00:00",
+        model="opencode/big-pickle",
+    )
+    runtime_options = SimpleNamespace(
+        opencode_auth_source="generation_key",
+        generation_api_key_configured=True,
+    )
+
+    payload = server._opencode_usage_payload(result, runtime_options)
+
+    assert payload["execution"]["auth_source"] == "generation_key"
+    assert payload["execution"]["using_user_generation_key"] is True
+
+
+def test_runtime_options_track_user_vertex_account_for_opencode(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            vertex_project="deployment-project",
+            vertex_location="us-central1",
+            vertex_service_account_json='{"project_id":"deployment-project"}',
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+    service_account_json = json.dumps(
+        {
+            "type": "service_account",
+            "project_id": "json-user-project",
+            "client_email": "svc@example.org",
+            "private_key": "-----BEGIN " + "PRIVATE KEY-----\nabc\n-----END " + "PRIVATE KEY-----\n",
+        }
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "vertex_gemini",
+                "model": "gemini-2.5-pro",
+                "api_key": service_account_json,
+                "base_url": "",
+                "project": "explicit-user-project",
+                "location": "europe-west4",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.generation_provider == "vertex_gemini"
+    assert runtime_options.generation_api_key_configured is True
+    assert runtime_options.vertex_service_account_json == service_account_json
+    assert runtime_options.vertex_project == "explicit-user-project"
+    assert runtime_options.vertex_location == "europe-west4"
+    assert runtime_options.openai_api_key == "deployment-openai-key"
+
+    monkeypatch.setattr(server, "_vertex_access_token", lambda _runtime_options: "vertex-access-token")
+    auth = server._opencode_provider_auth_from_runtime_options(runtime_options)
+    assert auth is not None
+    assert auth.model_ref == "matportal-user/google/gemini-2.5-pro"
+    assert auth.api_key == "vertex-access-token"
+    assert auth.base_url == (
+        "https://aiplatform.googleapis.com/v1/projects/explicit-user-project/locations/global/endpoints/openapi"
+    )
+
+
+def test_runtime_options_use_vertex_project_from_user_service_account(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="vertex_gemini",
+            vertex_project="deployment-project",
+            vertex_location="us-central1",
+            vertex_service_account_json=None,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+    service_account_json = json.dumps(
+        {
+            "type": "service_account",
+            "project_id": "json-user-project",
+            "client_email": "svc@example.org",
+            "private_key": "-----BEGIN " + "PRIVATE KEY-----\nabc\n-----END " + "PRIVATE KEY-----\n",
+        }
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "vertex_gemini",
+                "model": "gemini-2.5-pro",
+                "api_key": service_account_json,
+                "base_url": "",
+                "project": "",
+                "location": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.vertex_project == "json-user-project"
+    assert runtime_options.vertex_location == "us-central1"
+
+
+def test_opencode_auth_skips_deployment_default_key(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gpt-5.2",
+                "api_key": "",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.openai_api_key == "deployment-openai-key"
+    assert runtime_options.generation_api_key_configured is False
+    assert server._opencode_provider_auth_from_runtime_options(runtime_options) is None
+
+
+def test_opencode_auth_skips_deployment_default_vertex_account(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="vertex_gemini",
+            vertex_project="deployment-project",
+            vertex_location="us-central1",
+            vertex_service_account_json='{"project_id":"deployment-project"}',
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "vertex_gemini",
+                "model": "gemini-2.5-pro",
+                "api_key": "",
+                "base_url": "",
+                "project": "",
+                "location": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [],
+        }
+    )
+
+    assert runtime_options.generation_api_key_configured is False
+    assert runtime_options.vertex_service_account_json == '{"project_id":"deployment-project"}'
+    assert server._opencode_provider_auth_from_runtime_options(runtime_options) is None
 
 
 def test_me_routes_reject_bad_signature(monkeypatch, tmp_path):
@@ -774,9 +1566,7 @@ def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypat
     assert "# Summary" in events
 
 
-def test_stream_agent_response_runs_edit_flow_on_vertex_via_openai_bridge(monkeypatch):
-    captured = {"graph_calls": [], "agent_runtime_options": []}
-
+def test_stream_agent_response_routes_edit_prompts_to_opencode_workspace(monkeypatch):
     initial_agent = SimpleNamespace(
         runtime_options=SimpleNamespace(
             generation_provider="vertex_gemini",
@@ -789,28 +1579,38 @@ def test_stream_agent_response_runs_edit_flow_on_vertex_via_openai_bridge(monkey
         )
     )
 
-    def _collect_graph(agent, prompt, thread_id):
-        captured["graph_calls"].append(
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options):
+        assert "tensile strength" in prompt
+        assert thread_id == "thread-edit-1"
+        assert trace_id
+        assert runtime_options is initial_agent.runtime_options
+        yield server._sse(
             {
-                "agent": agent,
-                "prompt": prompt,
-                "thread_id": thread_id,
+                "type": "workspace_mode",
+                "content": {
+                    "mode": "execution",
+                    "run_id": "run-test-1",
+                    "workspace": "/tmp/ontoportal-agent/opencode-runs/thread-edit-1",
+                },
             }
         )
-        return {
-            "final_response": "Proposed ontology edits (pending approval):\n- Add a class",
-            "generation_usage": {"model": "google/gemini-2.5-pro"},
-        }
-
-    class _BufferedEditAgent:
-        def __init__(self, *args, runtime_options=None, **kwargs):
-            captured["agent_runtime_options"].append(runtime_options)
-            self.runtime_options = runtime_options
+        yield server._sse({"type": "terminal_log", "content": {"line": "[bash] ls -la"}})
+        yield server._sse({"type": "changed_files", "content": [{"status": "A", "path": "proposal.ttl"}]})
+        yield server._sse({"type": "artifact_candidates", "content": [{"path": "proposal.ttl"}]})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-edit-1",
+            run_id="run-test-1",
+            expires_at="2999-01-01T00:00:00+00:00",
+            model="opencode/big-pickle",
+            final_text="Prepared a Turtle proposal for review.",
+            changed_files=[{"status": "A", "path": "proposal.ttl"}],
+            artifact_candidates=[{"path": "proposal.ttl"}],
+            diff_summary={"stat": "1 file changed"},
+        )
 
     monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "EDIT")
-    monkeypatch.setattr(server, "_vertex_access_token", lambda _runtime_options: "vertex-token-123")
-    monkeypatch.setattr(server, "_collect_graph_final_state", _collect_graph)
-    monkeypatch.setattr(server, "OntoPortalAgent", _BufferedEditAgent)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
 
     events = "".join(
         server._stream_agent_response(
@@ -820,15 +1620,141 @@ def test_stream_agent_response_runs_edit_flow_on_vertex_via_openai_bridge(monkey
         )
     )
 
-    assert "Edit workflow uses buffered execution." in events
-    assert "Proposed ontology edits (pending approval)" in events
-    assert len(captured["graph_calls"]) == 1
-    assert len(captured["agent_runtime_options"]) == 1
-    bridged = captured["agent_runtime_options"][0]
-    assert bridged.generation_provider == "openai_compatible"
-    assert bridged.openai_api_key == "vertex-token-123"
-    assert bridged.openai_api_base == "https://aiplatform.googleapis.com/v1/projects/ontoportal-llm-finetune/locations/global/endpoints/openapi"
-    assert bridged.llm_model == "google/gemini-2.5-pro"
+    assert "Prepared a Turtle proposal for review." in events
+    assert '"type": "changed_files"' in events
+    assert '"run_id": "run-test-1"' in events
+    assert '"mode": "opencode"' in events
+
+
+def test_stream_agent_response_respects_requested_edit_mode(monkeypatch):
+    initial_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="vertex_gemini",
+            llm_model="gemini-2.5-pro",
+            openai_api_key="",
+            openai_api_base="",
+            vertex_project="ontoportal-llm-finetune",
+            vertex_location="us-central1",
+            vertex_service_account_json='{"client_email":"svc@example.org"}',
+        )
+    )
+
+    def _unexpected_classifier(_llm, _prompt):
+        raise AssertionError("explicit edit mode should not call the classifier")
+
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options):
+        assert "Summarize the current proposal" in prompt
+        assert thread_id == "thread-edit-mode"
+        assert trace_id
+        assert runtime_options is initial_agent.runtime_options
+        yield server._sse(
+            {
+                "type": "workspace_mode",
+                "content": {
+                    "mode": "execution",
+                    "run_id": "run-forced-edit",
+                    "workspace": "/tmp/ontoportal-agent/opencode-runs/thread-edit-mode",
+                },
+            }
+        )
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-edit-mode",
+            run_id="run-forced-edit",
+            expires_at="2999-01-01T00:00:00+00:00",
+            model="opencode/big-pickle",
+            final_text="Ran the request in the OpenCode workspace.",
+        )
+
+    monkeypatch.setattr(server, "_classify_intent", _unexpected_classifier)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Summarize the current proposal in notes.md.",
+            thread_id="thread-edit-mode",
+            agent_builder=lambda: initial_agent,
+            requested_mode="edit",
+        )
+    )
+
+    assert "Starting OpenCode workspace..." in events
+    assert "Ran the request in the OpenCode workspace." in events
+    assert '"run_id": "run-forced-edit"' in events
+
+
+def test_stream_agent_response_hybrid_ask_uses_opencode_after_backend_retrieval(monkeypatch):
+    runtime_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="openai_compatible",
+            llm_model="gpt-5.2",
+            openai_api_key="test-key",
+            openai_api_base="https://api.openai.com/v1",
+            rag_top_k=12,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            mcp_endpoints=[],
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+        )
+    )
+    observed: dict[str, object] = {}
+
+    def _fake_opencode_ask_stream(*, prompt, thread_id, trace_id, runtime_options, retrieval_state):
+        observed["prompt"] = prompt
+        observed["thread_id"] = thread_id
+        observed["trace_id"] = trace_id
+        observed["runtime_options"] = runtime_options
+        observed["retrieval_state"] = retrieval_state
+        yield server._sse({"type": "status", "message": "OpenCode ask generation running."})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-hybrid-ask",
+            run_id="run-hybrid-ask",
+            expires_at="2999-01-01T00:00:00+00:00",
+            model="opencode/big-pickle",
+            final_text="OpenCode generated the answer from MATONTO context.",
+        )
+
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: SimpleNamespace())
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
+    monkeypatch.setattr(server, "_opencode_hybrid_ask_enabled", lambda: True)
+    monkeypatch.setattr(server, "_stream_opencode_ask_generation", _fake_opencode_ask_stream)
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda prompt, runtime_options: {
+            "rag_result": "MATONTO covers materials terminology.",
+            "citations": [{"document_label": "MATONTO v2.0", "rank": 1}],
+            "citation_labels": ["MATONTO v2.0"],
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+            "retrieval_chunk_count": 12,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_stream_openai_compatible_events",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("standard LLM path should not run")),
+    )
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Which ontology should I use for aluminium?",
+            thread_id="thread-hybrid-ask",
+            agent_builder=lambda: runtime_agent,
+        )
+    )
+
+    assert observed["thread_id"] == "thread-hybrid-ask"
+    assert observed["runtime_options"] is runtime_agent.runtime_options
+    assert observed["retrieval_state"]["rag_result"] == "MATONTO covers materials terminology."
+    assert "OpenCode ask generation running." in events
+    assert "OpenCode generated the answer from MATONTO context." in events
+    assert '"type": "citations"' in events
+    assert '"document_label": "MATONTO v2.0"' in events
+    assert '"mode": "opencode_hybrid_ask"' in events
+    assert "Streaming answer..." not in events
 
 
 def test_stream_agent_response_falls_back_to_latest_google_model(monkeypatch):

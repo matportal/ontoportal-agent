@@ -8,6 +8,7 @@ from typing import Any
 class AgentRuntimeOptions:
     openai_api_key: str
     generation_provider: str | None = None
+    generation_api_key_configured: bool = False
     openai_api_base: str | None = None
     llm_model: str | None = None
     vertex_project: str | None = None
@@ -19,3 +20,4 @@ class AgentRuntimeOptions:
     mcp_endpoints: list[str | dict[str, Any]] = field(default_factory=list)
     mcp_api_key: str | None = None
     mcp_rag_tool_name: str | None = None
+    opencode_auth_source: str = "auto"

@@ -114,6 +114,22 @@ def list_thread_messages(
     return list(session.execute(stmt).scalars().all())
 
 
+def get_thread_execution(
+    session: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+) -> dict[str, Any] | None:
+    messages = list_thread_messages(session, user_id=user_id, thread_id=thread_id)
+    for message in reversed(messages):
+        usage = message.usage_json if isinstance(message.usage_json, dict) else {}
+        execution = usage.get("execution") if isinstance(usage, dict) else None
+        if isinstance(execution, dict) and str(execution.get("run_id") or "") == str(run_id):
+            return execution
+    return None
+
+
 def create_message(
     session: Session,
     *,
