@@ -11,6 +11,7 @@ if importlib.util.find_spec("ontoportal_agent") is None:
 from ontoportal_agent.config import get_settings
 from ontoportal_agent.edit_runtime import DeepAgentsEditRuntime, OpenCodeEditRuntime, create_edit_runtime, normalize_edit_runtime_name
 from ontoportal_agent.edit_runtime.base import EditRuntimeRequest
+from ontoportal_agent.opencode_executor import OpenCodeAccountAuth
 
 
 def test_normalize_edit_runtime_name_accepts_compatibility_aliases():
@@ -67,6 +68,27 @@ def test_create_edit_runtime_gates_deepagents(monkeypatch, tmp_path):
     assert isinstance(runtime, DeepAgentsEditRuntime)
     assert runtime.capabilities.runtime == "deepagents"
     assert runtime.capabilities.supports_artifacts is True
+
+
+@pytest.mark.parametrize("auth_kind", ["codex", "gemini_antigravity"])
+def test_deepagents_runtime_preserves_opencode_account_auth_users(monkeypatch, tmp_path, auth_kind):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_DEEPAGENTS_ENABLED", "true")
+    get_settings.cache_clear()
+
+    runtime = create_edit_runtime(
+        "deepagents",
+        account_auth=OpenCodeAccountAuth(
+            kind=auth_kind,
+            opencode_auth_json='{"provider":"antigravity","refresh":"rotated-refresh"}',
+            codex_auth_json='{"tokens":{"access_token":"codex-token"}}',
+        ),
+    )
+
+    assert isinstance(runtime, OpenCodeEditRuntime)
+    assert runtime.capabilities.runtime == "opencode"
 
 
 def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, tmp_path):

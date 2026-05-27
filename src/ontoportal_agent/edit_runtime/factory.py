@@ -53,6 +53,15 @@ def create_edit_runtime(
     if runtime == "deepagents":
         if not settings.deepagents_enabled:
             raise ValueError("Deep Agents edit runtime is disabled by ONTOAGENT_DEEPAGENTS_ENABLED.")
+        if account_auth is not None:
+            # Codex subscription auth and Gemini Antigravity OAuth are OpenCode-specific
+            # account-auth formats today. Preserve those users by routing to the
+            # mature OpenCode runtime until Deep Agents has native account providers.
+            return OpenCodeEditRuntime(
+                provider_auth=provider_auth,
+                account_auth=account_auth,
+                mcp_servers=mcp_servers,
+            )
         return DeepAgentsEditRuntime(
             runtime_options=runtime_options,
             mcp_servers=mcp_servers,
