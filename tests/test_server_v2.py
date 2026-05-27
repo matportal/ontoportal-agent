@@ -2361,6 +2361,72 @@ def test_stream_agent_response_respects_requested_edit_mode(monkeypatch):
     assert '"run_id": "run-forced-edit"' in events
 
 
+def test_me_chat_stream_persists_opencode_session_record(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+
+    class _RuntimeAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = kwargs.get("runtime_options")
+
+    def _fake_build_chat_model(_runtime_options, model_override=None):
+        return None
+
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options, resume_workspace=None, resume_session_id=None):
+        yield server._sse({"type": "workspace_mode", "content": {"mode": "execution", "run_id": "run-session-record"}})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-session-record",
+            run_id="run-session-record",
+            expires_at="2999-01-01T00:00:00+00:00",
+            session_id="ses_session_record",
+            model="opencode/big-pickle",
+            final_text="Session record created.",
+            validation_report={"status": "pass"},
+        )
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _RuntimeAgent)
+    monkeypatch.setattr(server, "_build_chat_model", _fake_build_chat_model)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+    thread = client.post("/api/v1/me/threads", json={"title": "Session record"}, headers=headers).json()
+
+    response = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "Draft a proposal file.", "thread_id": thread["thread_id"], "mode": "edit"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert "Session record created." in response.text
+
+    sessions = client.get(
+        "/api/v1/me/opencode/sessions",
+        params={"thread_id": thread["thread_id"]},
+        headers=headers,
+    )
+    assert sessions.status_code == 200
+    body = sessions.json()
+    assert len(body["sessions"]) == 1
+    row = body["sessions"][0]
+    assert row["session_id"] == "ses_session_record"
+    assert row["opencode_session_id"] == "ses_session_record"
+    assert row["latest_run_id"] == "run-session-record"
+    assert row["status"] == "completed"
+    assert row["objective"] == "Draft a proposal file."
+    assert row["validation_summary"] == {"status": "pass"}
+
+    detail = client.get("/api/v1/me/opencode/sessions/ses_session_record", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["workspace"].endswith("thread-session-record")
+
+    other_user = client.get(
+        "/api/v1/me/opencode/sessions/ses_session_record",
+        headers=_signed_headers(user_id="user-2", username="bob", email="bob@example.org", include_internal_token=True),
+    )
+    assert other_user.status_code == 404
+
+
 def test_stream_agent_response_passes_resume_session_to_opencode(monkeypatch):
     initial_agent = SimpleNamespace(
         runtime_options=SimpleNamespace(

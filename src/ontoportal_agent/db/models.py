@@ -72,6 +72,37 @@ class AssistantThread(Base):
     )
 
 
+class AssistantOpenCodeSession(Base):
+    __tablename__ = "assistant_opencode_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("assistant_threads.thread_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    opencode_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    latest_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    workspace: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="completed", index=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    auth_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    auth_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    objective: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latest_execution_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    validation_summary_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class AssistantMessage(Base):
     __tablename__ = "assistant_messages"
 

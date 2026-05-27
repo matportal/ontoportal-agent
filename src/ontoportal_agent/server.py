@@ -67,12 +67,15 @@ from .db.repositories import (
     ensure_thread,
     get_thread_execution,
     get_latest_thread_execution,
+    get_opencode_session,
     get_user_settings,
     list_mcp_servers,
+    list_opencode_sessions,
     list_thread_messages,
     list_threads,
     replace_mcp_servers,
     update_thread_title,
+    upsert_opencode_session,
     upsert_user_settings,
 )
 from .db.user_context import AssistantUserContext, verify_user_context_headers
@@ -1744,6 +1747,97 @@ def _serialize_message(message) -> dict[str, Any]:
     }
 
 
+def _parse_opencode_expires_at(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _opencode_execution_status(execution: dict[str, Any]) -> str:
+    if bool(execution.get("timed_out")):
+        return "timed_out"
+    if bool(execution.get("blocked")):
+        return "blocked"
+    if bool(execution.get("ok")):
+        return "completed"
+    return "failed"
+
+
+def _session_expired(expires_at: datetime | None) -> bool:
+    if expires_at is None:
+        return False
+    comparable = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+    return comparable <= datetime.now(timezone.utc)
+
+
+def _serialize_opencode_session(row) -> dict[str, Any]:
+    expires_at = row.expires_at
+    status_value = "expired" if _session_expired(expires_at) else str(row.status or "unknown")
+    return {
+        "session_id": row.session_id,
+        "opencode_session_id": row.opencode_session_id or "",
+        "thread_id": row.thread_id,
+        "latest_run_id": row.latest_run_id or "",
+        "workspace": row.workspace,
+        "status": status_value,
+        "model": row.model or "",
+        "auth_source": row.auth_source or "",
+        "auth_kind": row.auth_kind or "",
+        "objective": row.objective or "",
+        "latest_execution": row.latest_execution_json or {},
+        "validation_summary": row.validation_summary_json or {},
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _persist_opencode_session_from_usage(
+    session: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+    objective: str,
+    usage: dict[str, Any],
+) -> None:
+    if not isinstance(usage, dict) or usage.get("mode") != "opencode":
+        return
+    execution = usage.get("execution")
+    if not isinstance(execution, dict):
+        return
+    run_id = str(execution.get("run_id") or "").strip()
+    workspace = str(execution.get("workspace") or "").strip()
+    if not run_id or not workspace:
+        return
+    opencode_session_id = str(execution.get("session_id") or "").strip() or None
+    session_id = opencode_session_id or run_id
+    validation_report = execution.get("validation_report") if isinstance(execution.get("validation_report"), dict) else {}
+    upsert_opencode_session(
+        session,
+        user_id=user_id,
+        thread_id=thread_id,
+        session_id=session_id,
+        opencode_session_id=opencode_session_id,
+        latest_run_id=run_id,
+        workspace=workspace,
+        status=_opencode_execution_status(execution),
+        model=str(execution.get("model") or usage.get("model") or "") or None,
+        auth_source=str(execution.get("auth_source") or "") or None,
+        auth_kind=str(execution.get("auth_kind") or "") or None,
+        objective=str(objective or "").strip(),
+        latest_execution_json=execution,
+        validation_summary_json=validation_report,
+        expires_at=_parse_opencode_expires_at(execution.get("expires_at")),
+    )
+
+
 def _persistable_reasoning_summary(final_state: dict[str, Any]) -> str:
     if not _reasoning_is_user_visible(final_state):
         return ""
@@ -3157,6 +3251,34 @@ def me_get_thread_messages(
     return {"thread_id": thread_id, "messages": messages}
 
 
+@app.get("/api/v1/me/opencode/sessions")
+def me_list_opencode_sessions(
+    request: Request,
+    thread_id: Optional[str] = Query(default=None),
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    rows = list_opencode_sessions(
+        session,
+        user_id=user_context.user_id,
+        thread_id=str(thread_id or "").strip() or None,
+    )
+    return {"sessions": [_serialize_opencode_session(row) for row in rows]}
+
+
+@app.get("/api/v1/me/opencode/sessions/{session_id}")
+def me_get_opencode_session(
+    session_id: str,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    row = get_opencode_session(session, user_id=user_context.user_id, session_id=session_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OpenCode session was not found.")
+    return _serialize_opencode_session(row)
+
+
 @app.delete("/api/v1/me/threads/{thread_id}")
 def me_delete_thread(
     thread_id: str,
@@ -3296,6 +3418,7 @@ def me_chat_stream(
             }
 
     def on_completed(final_state: dict[str, Any], final_response_text: str) -> None:
+        usage_payload = final_state.get("generation_usage") if isinstance(final_state.get("generation_usage"), dict) else {}
         create_message(
             session,
             user_id=user_context.user_id,
@@ -3303,8 +3426,15 @@ def me_chat_stream(
             role="assistant",
             content=final_response_text or "No response generated.",
             reasoning_summary=_persistable_reasoning_summary(final_state),
-            usage_json=final_state.get("generation_usage") if isinstance(final_state.get("generation_usage"), dict) else {},
+            usage_json=usage_payload,
             citations_json=final_state.get("citations") if isinstance(final_state.get("citations"), list) else [],
+        )
+        _persist_opencode_session_from_usage(
+            session,
+            user_id=user_context.user_id,
+            thread_id=thread.thread_id,
+            objective=prompt,
+            usage=usage_payload,
         )
 
     return StreamingResponse(

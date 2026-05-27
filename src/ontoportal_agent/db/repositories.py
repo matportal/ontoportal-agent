@@ -7,7 +7,7 @@ from typing import Any, Callable, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from .models import AssistantMcpServer, AssistantMessage, AssistantThread, AssistantUserSettings
+from .models import AssistantMcpServer, AssistantMessage, AssistantOpenCodeSession, AssistantThread, AssistantUserSettings
 
 
 def list_threads(session: Session, *, user_id: str, limit: int = 100) -> list[AssistantThread]:
@@ -93,6 +93,82 @@ def update_thread_title(
     session.commit()
     session.refresh(thread)
     return thread
+
+
+def list_opencode_sessions(
+    session: Session,
+    *,
+    user_id: str,
+    thread_id: str | None = None,
+    limit: int = 100,
+) -> list[AssistantOpenCodeSession]:
+    stmt = select(AssistantOpenCodeSession).where(AssistantOpenCodeSession.user_id == user_id)
+    if thread_id:
+        stmt = stmt.where(AssistantOpenCodeSession.thread_id == thread_id)
+    stmt = stmt.order_by(AssistantOpenCodeSession.updated_at.desc()).limit(limit)
+    return list(session.execute(stmt).scalars().all())
+
+
+def get_opencode_session(
+    session: Session,
+    *,
+    user_id: str,
+    session_id: str,
+) -> Optional[AssistantOpenCodeSession]:
+    stmt = select(AssistantOpenCodeSession).where(
+        AssistantOpenCodeSession.user_id == user_id,
+        AssistantOpenCodeSession.session_id == session_id,
+    )
+    return session.execute(stmt).scalars().first()
+
+
+def upsert_opencode_session(
+    session: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+    session_id: str,
+    workspace: str,
+    status: str,
+    opencode_session_id: str | None = None,
+    latest_run_id: str | None = None,
+    model: str | None = None,
+    auth_source: str | None = None,
+    auth_kind: str | None = None,
+    objective: str | None = None,
+    latest_execution_json: dict[str, Any] | None = None,
+    validation_summary_json: dict[str, Any] | None = None,
+    expires_at: datetime | None = None,
+) -> AssistantOpenCodeSession:
+    row = get_opencode_session(session, user_id=user_id, session_id=session_id)
+    now = datetime.now(timezone.utc)
+    if row is None:
+        row = AssistantOpenCodeSession(
+            session_id=session_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            workspace=workspace,
+            status=status,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    row.thread_id = thread_id
+    row.workspace = workspace
+    row.status = status
+    row.opencode_session_id = opencode_session_id
+    row.latest_run_id = latest_run_id
+    row.model = model
+    row.auth_source = auth_source
+    row.auth_kind = auth_kind
+    row.objective = objective[:4000] if isinstance(objective, str) else objective
+    row.latest_execution_json = latest_execution_json
+    row.validation_summary_json = validation_summary_json
+    row.expires_at = expires_at
+    row.updated_at = now
+    session.commit()
+    session.refresh(row)
+    return row
 
 
 def list_thread_messages(
