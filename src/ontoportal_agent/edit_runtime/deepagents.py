@@ -16,7 +16,7 @@ from ..agent.options import AgentRuntimeOptions
 from ..artifact_store import ArtifactAccessError, assert_artifact_safe_for_exposure, sanitize_artifact_path
 from ..config import AgentSettings, get_settings
 from ..mcp_client import McpClient
-from ..opencode_executor import OpenCodeExecutionResult, OpenCodeExecutor
+from ..opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor
 from ..rag_client import RagClient
 from .base import EditRuntimeCapabilities, EditRuntimeRequest
 
@@ -68,11 +68,13 @@ class DeepAgentsEditRuntime:
         settings: AgentSettings | None = None,
         runtime_options: AgentRuntimeOptions | None = None,
         mcp_servers: list[dict[str, Any] | str] | None = None,
+        account_auth: OpenCodeAccountAuth | None = None,
         model: Any | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.runtime_options = runtime_options
         self.mcp_servers = list(mcp_servers or [])
+        self.account_auth = account_auth
         self.model = model
         self._workspace_manager = OpenCodeExecutor(settings=self.settings, mcp_servers=self.mcp_servers)
         self._mcp_client = McpClient(
@@ -177,6 +179,8 @@ class DeepAgentsEditRuntime:
 
     def _build_model(self) -> ChatOpenAI:
         options = self.runtime_options
+        if self._uses_antigravity_account_auth():
+            return self._build_antigravity_account_model()
         api_key = str(getattr(options, "openai_api_key", "") or self.settings.openai_api_key or "")
         base_url = str(getattr(options, "openai_api_base", "") or self.settings.openai_api_base or "") or None
         model = str(self.settings.deepagents_model or getattr(options, "llm_model", "") or self.settings.llm_model or "").strip()
@@ -188,7 +192,32 @@ class DeepAgentsEditRuntime:
             raise DeepAgentsRuntimeError("Deep Agents runtime requires a configured model.")
         return ChatOpenAI(api_key=api_key, base_url=base_url, model=model, temperature=0.0)
 
+    def _uses_antigravity_account_auth(self) -> bool:
+        return bool(self.account_auth and str(self.account_auth.kind or "").strip().lower() == "gemini_antigravity")
+
+    def _build_antigravity_account_model(self) -> ChatOpenAI:
+        model = self._antigravity_proxy_model_id()
+        return ChatOpenAI(
+            api_key=str(self.settings.deepagents_antigravity_api_key or "proxy-managed"),
+            base_url=str(self.settings.deepagents_antigravity_base_url or "http://localhost:51200/v1"),
+            model=model,
+            temperature=0.0,
+        )
+
+    def _antigravity_proxy_model_id(self) -> str:
+        configured = str(self.settings.deepagents_model or "").strip()
+        if configured:
+            return configured.split("/", 1)[-1].replace("antigravity-", "")
+        raw = str(getattr(self.account_auth, "model_ref", "") or "").strip()
+        model_id = raw.split("/", 1)[-1] if raw else ""
+        model_id = model_id.replace("antigravity-", "")
+        if model_id in {"gemini-3-pro", "gemini-3.1-pro", ""}:
+            return "gemini-3.1-pro-high"
+        return model_id
+
     def _model_label(self) -> str:
+        if self._uses_antigravity_account_auth():
+            return f"deepagents/antigravity/{self._antigravity_proxy_model_id()}"
         configured = str(self.settings.deepagents_model or getattr(self.runtime_options, "llm_model", "") or self.settings.llm_model or "").strip()
         return f"deepagents/{configured or 'default'}"
 

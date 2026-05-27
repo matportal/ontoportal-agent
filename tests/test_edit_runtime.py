@@ -70,8 +70,7 @@ def test_create_edit_runtime_gates_deepagents(monkeypatch, tmp_path):
     assert runtime.capabilities.supports_artifacts is True
 
 
-@pytest.mark.parametrize("auth_kind", ["codex", "gemini_antigravity"])
-def test_deepagents_runtime_preserves_opencode_account_auth_users(monkeypatch, tmp_path, auth_kind):
+def test_deepagents_runtime_preserves_opencode_codex_account_auth_users(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
     monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
@@ -81,7 +80,7 @@ def test_deepagents_runtime_preserves_opencode_account_auth_users(monkeypatch, t
     runtime = create_edit_runtime(
         "deepagents",
         account_auth=OpenCodeAccountAuth(
-            kind=auth_kind,
+            kind="codex",
             opencode_auth_json='{"provider":"antigravity","refresh":"rotated-refresh"}',
             codex_auth_json='{"tokens":{"access_token":"codex-token"}}',
         ),
@@ -89,6 +88,25 @@ def test_deepagents_runtime_preserves_opencode_account_auth_users(monkeypatch, t
 
     assert isinstance(runtime, OpenCodeEditRuntime)
     assert runtime.capabilities.runtime == "opencode"
+
+
+def test_deepagents_runtime_uses_antigravity_account_bridge(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_DEEPAGENTS_ENABLED", "true")
+    get_settings.cache_clear()
+
+    account_auth = OpenCodeAccountAuth(
+        kind="gemini_antigravity",
+        opencode_auth_json='{"google":{"refresh":"rotated-refresh","access":"access-token"}}',
+        model_ref="google/antigravity-gemini-3-pro",
+    )
+    runtime = create_edit_runtime("deepagents", account_auth=account_auth)
+
+    assert isinstance(runtime, DeepAgentsEditRuntime)
+    assert runtime.account_auth is account_auth
+    assert runtime._antigravity_proxy_model_id() == "gemini-3.1-pro-high"
 
 
 def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, tmp_path):

@@ -93,6 +93,14 @@ class AgentSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("ONTOAGENT_DEEPAGENTS_MODEL", "DEEPAGENTS_MODEL"),
     )
+    deepagents_antigravity_base_url: str = Field(
+        default="http://localhost:51200/v1",
+        validation_alias=AliasChoices("ONTOAGENT_DEEPAGENTS_ANTIGRAVITY_BASE_URL", "DEEPAGENTS_ANTIGRAVITY_BASE_URL"),
+    )
+    deepagents_antigravity_api_key: str = Field(
+        default="proxy-managed",
+        validation_alias=AliasChoices("ONTOAGENT_DEEPAGENTS_ANTIGRAVITY_API_KEY", "DEEPAGENTS_ANTIGRAVITY_API_KEY"),
+    )
     pi_path: str = Field(
         default="pi",
         validation_alias=AliasChoices("ONTOAGENT_PI_PATH", "PI_PATH"),
