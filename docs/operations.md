@@ -16,6 +16,9 @@ integrating with broader OntoPortal infrastructure.
 ## Security & Safety Considerations
 - The sandbox executes Python code with access to rdflib, owlready2, and the standard library.
   While intended for trusted collaborators, treat it as semi-privileged code execution.
+- OpenCode runtime command blocking is enabled by default (`ONTOAGENT_OPENCODE_BLOCK_DANGEROUS_COMMANDS=true`).
+  This terminates runs that attempt package installation, privilege escalation, remote shell piping, or
+  host-level destructive commands.
 - Keep `ONTOAGENT_REQUIRE_MANUAL_APPROVAL=true` in environments where user prompts come from
   untrusted sources. This prevents automated publication of malicious or incorrect ontologies.
 - Review sandbox stdout carefully for warnings emitted by ROBOT or other validators and verify that
