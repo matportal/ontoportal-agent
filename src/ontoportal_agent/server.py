@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from threading import Lock
 from typing import Any, Callable, Iterator, Optional
+from urllib.parse import parse_qs, urlparse
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -24,9 +26,23 @@ import requests
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
+from .account_auth import (
+    AccountAuthManager,
+    AntigravityConfigError,
+    antigravity_oauth_config_summary,
+    antigravity_redirect_uri,
+    exchange_antigravity_code,
+    load_json_object,
+    parse_antigravity_callback,
+)
 from .agent.graph import _extract_generation_usage
 from .agent.options import AgentRuntimeOptions
 from .agent.runtime import OntoPortalAgent
+from .antigravity_models import (
+    DEFAULT_ANTIGRAVITY_MODEL_REF,
+    antigravity_model_options,
+    normalize_antigravity_model_ref,
+)
 from .artifact_store import (
     ArtifactAccessError,
     artifact_expired,
@@ -50,6 +66,7 @@ from .db.repositories import (
     delete_thread,
     ensure_thread,
     get_thread_execution,
+    get_latest_thread_execution,
     get_user_settings,
     list_mcp_servers,
     list_thread_messages,
@@ -74,9 +91,20 @@ app = FastAPI(
 
 _agent_lock = Lock()
 _agent_instance: Optional[OntoPortalAgent] = None
+_account_auth_manager = AccountAuthManager()
 
 _LEGACY_DEFAULT_MCP_TIMEOUT_MS = 10_000
 _BUILTIN_DEFAULT_MCP_TIMEOUT_MS = 30_000
+_MCP_AUTH_NONE = "none"
+_MCP_AUTH_API_KEY = "api_key"
+_MCP_AUTH_BASIC_USER = "basic_user"
+_MCP_AUTH_BASIC_BOT = "basic_bot"
+_MCP_AUTH_MODES = {
+    _MCP_AUTH_NONE,
+    _MCP_AUTH_API_KEY,
+    _MCP_AUTH_BASIC_USER,
+    _MCP_AUTH_BASIC_BOT,
+}
 _GOOGLE_OPENAI_BASE_MARKER = "generativelanguage.googleapis.com"
 _GOOGLE_GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GOOGLE_GEMINI_API_PROVIDER_ALIASES = {"google_gemini", "gemini", "gemini_api", "google_ai_studio"}
@@ -128,6 +156,9 @@ class ProviderCheckIn(ProviderConfigIn):
 class McpServerIn(BaseModel):
     name: str
     url: str
+    auth_mode: str = _MCP_AUTH_API_KEY
+    username: Optional[str] = None
+    password: Optional[str] = None
     api_key: Optional[str] = None
     enabled: bool = True
     timeout_ms: int = _BUILTIN_DEFAULT_MCP_TIMEOUT_MS
@@ -140,6 +171,7 @@ class RetrievalSettingsIn(BaseModel):
 class OpenCodeSettingsIn(BaseModel):
     auth_source: str = "auto"
     auth_kind: Optional[str] = None
+    antigravity_model: Optional[str] = None
     auth_json: Optional[str] = None
     codex_auth_json: Optional[str] = None
     clear_account_auth: bool = False
@@ -152,6 +184,15 @@ class AssistantSettingsIn(BaseModel):
     retrieval: RetrievalSettingsIn = Field(default_factory=RetrievalSettingsIn)
     opencode: OpenCodeSettingsIn = Field(default_factory=OpenCodeSettingsIn)
     mcp_servers: list[McpServerIn] = Field(default_factory=list)
+
+
+class AntigravityAuthStartIn(BaseModel):
+    project_id: Optional[str] = None
+
+
+class AntigravityAuthCompleteIn(BaseModel):
+    auth_session_id: str
+    callback_url_or_code: str
 
 
 class ThreadCreateRequest(BaseModel):
@@ -1033,6 +1074,10 @@ def _encryption_required() -> EncryptionService:
 def _default_settings_payload() -> dict[str, Any]:
     settings = get_settings()
     mcp_endpoints = settings.default_mcp_endpoints or settings.resolved_mcp_endpoints()
+    default_mcp_auth_mode = _normalize_mcp_auth_mode(
+        getattr(settings, "default_mcp_auth_mode", _MCP_AUTH_NONE),
+        api_key=str(getattr(settings, "default_mcp_api_key", "") or ""),
+    )
     default_generation_provider = settings.default_generation_provider
     default_generation_base = (
         settings.default_generation_base_url
@@ -1075,6 +1120,9 @@ def _default_settings_payload() -> dict[str, Any]:
             {
                 "name": f"MCP {index + 1}",
                 "url": endpoint,
+                "auth_mode": default_mcp_auth_mode,
+                "username": "",
+                "password": "",
                 "api_key": "",
                 "enabled": True,
                 "timeout_ms": _BUILTIN_DEFAULT_MCP_TIMEOUT_MS,
@@ -1150,6 +1198,28 @@ def _has_persisted_secret(value: Any) -> bool:
     return bool(text) and text != "__configured__"
 
 
+def _normalize_mcp_auth_mode(
+    value: Any,
+    *,
+    api_key: str = "",
+    username: str = "",
+    password: str = "",
+) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in _MCP_AUTH_MODES:
+        if str(api_key or "").strip():
+            return _MCP_AUTH_API_KEY
+        if str(username or "").strip() or str(password or "").strip():
+            return _MCP_AUTH_BASIC_USER
+        return _MCP_AUTH_NONE
+    return normalized
+
+
+def _basic_auth_header_value(username: str, password: str) -> str:
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
 def _normalize_opencode_settings(raw_payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = raw_payload or {}
     auth_source = str(raw.get("auth_source", "auto") or "auto").strip().lower()
@@ -1158,9 +1228,11 @@ def _normalize_opencode_settings(raw_payload: dict[str, Any] | None) -> dict[str
     auth_kind = str(raw.get("auth_kind", "") or "").strip().lower()
     if auth_kind not in {"", "gemini_antigravity", "codex"}:
         auth_kind = ""
+    antigravity_default = str(getattr(get_settings(), "opencode_antigravity_model", "") or "").strip() or DEFAULT_ANTIGRAVITY_MODEL_REF
     return {
         "auth_source": auth_source,
         "auth_kind": auth_kind,
+        "antigravity_model": normalize_antigravity_model_ref(raw.get("antigravity_model"), default=antigravity_default),
         "auth_json": str(raw.get("auth_json", "") or ""),
         "codex_auth_json": str(raw.get("codex_auth_json", "") or ""),
     }
@@ -1199,18 +1271,45 @@ def _normalize_settings_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
         )
     }
 
+    raw_mcp_servers = raw_payload.get("mcp_servers")
+    if raw_mcp_servers is None:
+        raw_mcp_servers = defaults.get("mcp_servers", [])
+
     mcp_servers = []
-    for item in raw_payload.get("mcp_servers", []):
+    for item in raw_mcp_servers:
         url = str(item.get("url", "")).strip()
         if not url:
             continue
-        api_key = str(item.get("api_key", "") or "")
-        if api_key == "__configured__":
+        raw_api_key = str(item.get("api_key", "") or "")
+        raw_username = str(item.get("username", "") or "")
+        raw_password = str(item.get("password", "") or "")
+        api_key = raw_api_key
+        username = raw_username
+        password = raw_password
+        if raw_api_key == "__configured__":
             api_key = ""
+        if raw_username == "__configured__":
+            username = ""
+        if raw_password == "__configured__":
+            password = ""
+        auth_mode = _normalize_mcp_auth_mode(
+            item.get("auth_mode"),
+            api_key=raw_api_key,
+            username=raw_username,
+            password=raw_password,
+        )
+        if auth_mode != _MCP_AUTH_API_KEY:
+            api_key = ""
+        if auth_mode != _MCP_AUTH_BASIC_USER:
+            username = ""
+            password = ""
         mcp_servers.append(
             {
                 "name": str(item.get("name", "MCP")).strip() or "MCP",
                 "url": url,
+                "auth_mode": auth_mode,
+                "username": username,
+                "password": password,
                 "api_key": api_key,
                 "enabled": bool(item.get("enabled", True)),
                 "timeout_ms": _normalized_mcp_timeout_ms(item.get("timeout_ms"), url=url),
@@ -1236,8 +1335,18 @@ def _redact_provider(provider_payload: dict[str, Any]) -> dict[str, Any]:
 
 def _redact_mcp_server(item: dict[str, Any]) -> dict[str, Any]:
     redacted = dict(item)
-    has_secret = bool((item.get("api_key") or "").strip())
-    redacted["api_key"] = "__configured__" if has_secret else ""
+    auth_mode = _normalize_mcp_auth_mode(
+        item.get("auth_mode"),
+        api_key=str(item.get("api_key", "") or ""),
+        username=str(item.get("username", "") or ""),
+        password=str(item.get("password", "") or ""),
+    )
+    redacted["auth_mode"] = auth_mode
+    has_api_key = bool((item.get("api_key") or "").strip())
+    has_password = bool((item.get("password") or "").strip())
+    redacted["api_key"] = "__configured__" if auth_mode == _MCP_AUTH_API_KEY and has_api_key else ""
+    redacted["username"] = str(item.get("username") or "").strip() if auth_mode == _MCP_AUTH_BASIC_USER else ""
+    redacted["password"] = "__configured__" if auth_mode == _MCP_AUTH_BASIC_USER and has_password else ""
     return redacted
 
 
@@ -1253,6 +1362,172 @@ def _serialize_settings_for_output(payload: dict[str, Any]) -> dict[str, Any]:
         "opencode": opencode,
         "mcp_servers": [_redact_mcp_server(item) for item in payload.get("mcp_servers", [])],
     }
+
+
+def _assistant_installed_skills(settings_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    settings = get_settings()
+    opencode = _normalize_opencode_settings(settings_payload.get("opencode", {}))
+    antigravity_connected = (
+        opencode.get("auth_source") == "account_auth"
+        and opencode.get("auth_kind") == "gemini_antigravity"
+        and _has_persisted_secret(opencode.get("auth_json"))
+    )
+    antigravity_model = normalize_antigravity_model_ref(
+        opencode.get("antigravity_model"),
+        default=str(settings.opencode_antigravity_model or "") or DEFAULT_ANTIGRAVITY_MODEL_REF,
+    )
+    skills = [
+        {
+            "id": "ontology_edit_workflow",
+            "name": "Ontology edit workflow",
+            "category": "OpenCode",
+            "enabled": True,
+            "status": "installed",
+            "description": "Plans ontology edits, inspects RAG/API context, drafts proposal artifacts, and prepares operator review notes.",
+            "details": [
+                "Requires RAG retrieval before drafting.",
+                "Requires exact OntoPortal/API inspection before and after drafting.",
+                "Writes proposal TTL/RDF/OWL, operator notes, and draft submission files into an isolated workspace.",
+            ],
+        },
+        {
+            "id": "matportal_rag_mcp",
+            "name": "MatPortal RAG MCP",
+            "category": "MCP",
+            "enabled": True,
+            "status": "installed",
+            "description": "Semantic retrieval for source chunks, terminology discovery, and provenance.",
+            "details": [
+                f"Tool/server name: {settings.opencode_rag_mcp_name}",
+                f"Endpoint: {str(settings.opencode_rag_mcp_url or '').strip() or settings.rag_base_url.rstrip('/') + '/mcp'}",
+                f"Timeout: {settings.opencode_rag_mcp_timeout_ms} ms",
+            ],
+        },
+        {
+            "id": "ontoportal_api_mcp",
+            "name": "OntoPortal API MCP",
+            "category": "MCP",
+            "enabled": True,
+            "status": "installed",
+            "description": "Exact portal/API access for ontology metadata, terms, submissions, and full ontology inspection.",
+            "details": [
+                f"Tool/server name: {settings.opencode_mcp_name}",
+                f"Mode: {settings.opencode_mcp_mode}",
+                f"Timeout: {settings.opencode_mcp_timeout_ms} ms",
+            ],
+        },
+        {
+            "id": "robot_validation",
+            "name": "ROBOT validation",
+            "category": "Validation",
+            "enabled": bool(settings.opencode_robot_enabled),
+            "status": "enabled" if settings.opencode_robot_enabled else "disabled",
+            "description": "Runs RDF parse checks plus ROBOT verify/report for ontology artifacts when configured.",
+            "details": [
+                f"Java: {settings.opencode_robot_java_path}",
+                f"ROBOT jar: {settings.opencode_robot_jar_path or 'auto/runtime'}",
+            ],
+        },
+        {
+            "id": "artifact_review",
+            "name": "Artifact review and downloads",
+            "category": "Artifacts",
+            "enabled": True,
+            "status": "installed",
+            "description": "Lists generated files, shows diffs/content, and provides individual or bundle downloads.",
+            "details": [
+                f"Retention: {settings.opencode_artifact_retention_days} day(s)",
+                f"Max diff: {settings.opencode_max_diff_chars} characters",
+            ],
+        },
+        {
+            "id": "antigravity_search",
+            "name": "Antigravity Google search",
+            "category": "Research",
+            "enabled": antigravity_connected,
+            "status": "connected" if antigravity_connected else "available after Gemini login",
+            "description": "Lets OpenCode use provider-native Google search for domain research when the user connects Gemini Antigravity.",
+            "details": [
+                f"Plugin: {settings.opencode_antigravity_plugin}",
+                f"Selected model: {antigravity_model}",
+            ],
+        },
+        {
+            "id": "exa_websearch",
+            "name": "OpenCode Exa web search",
+            "category": "Research",
+            "enabled": bool(settings.opencode_exa_websearch_enabled),
+            "status": "enabled" if settings.opencode_exa_websearch_enabled else "disabled",
+            "description": "Optional OpenCode websearch/webfetch permission path for Exa-backed research.",
+            "details": [
+                "Use Antigravity search first when Gemini Antigravity account auth is connected.",
+            ],
+        },
+        {
+            "id": "opencode_release_guards",
+            "name": "OpenCode release guards",
+            "category": "Safety",
+            "enabled": True,
+            "status": "guarded",
+            "description": "Feature flags keep interactive sessions, publishing, Mobi handoff, and strict workflow gates explicit during rollout.",
+            "details": [
+                f"Interactive sessions: {'enabled' if settings.opencode_interactive_sessions_enabled else 'disabled'}",
+                f"Strict workflow gates: {'enabled' if settings.opencode_strict_workflow_enabled else 'disabled'}",
+                f"Apply/publish actions: {'enabled' if settings.opencode_apply_publish_enabled else 'disabled'}",
+                f"Mobi handoff: {'enabled' if settings.opencode_mobi_handoff_enabled else 'disabled'}",
+                f"Strict sandbox: {'enabled' if settings.opencode_strict_sandbox_enabled else 'disabled'}",
+                f"Concurrency: {settings.opencode_user_concurrency_limit} per user / {settings.opencode_global_concurrency_limit} global",
+            ],
+        },
+    ]
+    if bool(settings.opencode_hybrid_ask_enabled):
+        skills.append(
+            {
+                "id": "hybrid_ask",
+                "name": "Hybrid Ask generation",
+                "category": "Ask",
+                "enabled": True,
+                "status": "enabled",
+                "description": "Retrieves chunks in MatPortal, then lets OpenCode generate the Ask answer from backend-owned context.",
+                "details": ["Retrieved chunks remain MatPortal-owned and visible in the chat."],
+            }
+        )
+    return skills
+
+
+def _persist_opencode_account_auth(
+    session: Session,
+    *,
+    user_id: str,
+    auth_kind: str,
+    opencode_auth_json: str | None = None,
+    codex_auth_json: str | None = None,
+) -> dict[str, Any]:
+    encryption_service = _encryption_required()
+    settings_payload = _load_effective_settings(session, user_id=user_id, include_secrets=True)
+    opencode = _normalize_opencode_settings(settings_payload.get("opencode", {}))
+    opencode["auth_source"] = "account_auth"
+    opencode["auth_kind"] = auth_kind
+    if opencode_auth_json is not None:
+        opencode["auth_json"] = _validate_auth_json(opencode_auth_json, label="OpenCode auth JSON")
+    if codex_auth_json is not None:
+        opencode["codex_auth_json"] = _validate_auth_json(codex_auth_json, label="Codex auth JSON")
+    settings_payload["opencode"] = opencode
+    settings_blob = {
+        "generation": settings_payload["generation"],
+        "embeddings": settings_payload["embeddings"],
+        "reranker": settings_payload["reranker"],
+        "retrieval": settings_payload["retrieval"],
+        "opencode": settings_payload["opencode"],
+    }
+    encrypted_payload, key_version = encryption_service.encrypt_json(settings_blob)
+    upsert_user_settings(
+        session,
+        user_id=user_id,
+        settings_encrypted=encrypted_payload,
+        key_version=key_version,
+    )
+    return _serialize_settings_for_output(settings_payload)
 
 
 def _load_effective_settings(
@@ -1276,7 +1551,9 @@ def _load_effective_settings(
     if mcp_rows:
         resolved = []
         for server in mcp_rows:
+            auth_mode = _normalize_mcp_auth_mode(getattr(server, "auth_mode", None))
             api_key = ""
+            password = ""
             if include_secrets and server.api_key_encrypted and encryption_service.enabled:
                 try:
                     api_key_payload, _ = encryption_service.decrypt_json(server.api_key_encrypted)
@@ -1285,11 +1562,22 @@ def _load_effective_settings(
                     logger.warning("Failed to decrypt MCP server key for %s/%s: %s", user_id, server.id, exc)
             elif not include_secrets and server.api_key_encrypted:
                 api_key = "__configured__"
+            if include_secrets and getattr(server, "password_encrypted", None) and encryption_service.enabled:
+                try:
+                    password_payload, _ = encryption_service.decrypt_json(server.password_encrypted)
+                    password = str(password_payload.get("password", "") or "")
+                except Exception as exc:
+                    logger.warning("Failed to decrypt MCP server password for %s/%s: %s", user_id, server.id, exc)
+            elif not include_secrets and getattr(server, "password_encrypted", None):
+                password = "__configured__"
 
             resolved.append(
                 {
                     "name": server.name,
                     "url": server.url,
+                    "auth_mode": auth_mode,
+                    "username": str(getattr(server, "username", "") or ""),
+                    "password": password,
                     "api_key": api_key,
                     "enabled": bool(server.enabled),
                     "timeout_ms": _normalized_mcp_timeout_ms(server.timeout_ms, url=server.url),
@@ -1298,6 +1586,31 @@ def _load_effective_settings(
         payload["mcp_servers"] = resolved
 
     return payload
+
+
+def _runtime_mcp_headers_for_server(item: dict[str, Any], settings: Any) -> dict[str, str]:
+    auth_mode = _normalize_mcp_auth_mode(
+        item.get("auth_mode"),
+        api_key=str(item.get("api_key", "") or ""),
+        username=str(item.get("username", "") or ""),
+        password=str(item.get("password", "") or ""),
+    )
+    if auth_mode == _MCP_AUTH_API_KEY:
+        api_key = str(item.get("api_key", "") or "").strip()
+        return {"X-API-Key": api_key} if api_key else {}
+    if auth_mode == _MCP_AUTH_BASIC_USER:
+        username = str(item.get("username", "") or "").strip()
+        password = str(item.get("password", "") or "").strip()
+        if username and password:
+            return {"Authorization": _basic_auth_header_value(username, password)}
+        return {}
+    if auth_mode == _MCP_AUTH_BASIC_BOT:
+        username = str(getattr(settings, "mcp_bot_username", "") or "").strip()
+        password = str(getattr(settings, "mcp_bot_password", "") or "").strip()
+        if username and password:
+            return {"Authorization": _basic_auth_header_value(username, password)}
+        return {}
+    return {}
 
 
 def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRuntimeOptions:
@@ -1309,13 +1622,16 @@ def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRun
     enabled_mcp = [item for item in mcp_servers if bool(item.get("enabled", True))]
     mcp_endpoint_configs: list[dict[str, Any]] = []
     for item in enabled_mcp:
+        name = str(item.get("name", "")).strip()
         endpoint = str(item.get("url", "")).strip()
         if not endpoint:
             continue
+        headers = _runtime_mcp_headers_for_server(item, settings)
         mcp_endpoint_configs.append(
             {
+                "name": name or None,
                 "url": endpoint,
-                "api_key": str(item.get("api_key", "") or "").strip() or None,
+                "headers": headers or None,
                 "timeout_ms": _normalized_mcp_timeout_ms(item.get("timeout_ms"), url=endpoint),
             }
         )
@@ -1372,6 +1688,7 @@ def _runtime_options_from_settings(settings_payload: dict[str, Any]) -> AgentRun
         mcp_rag_tool_name=settings.mcp_rag_tool_name,
         opencode_auth_source=opencode["auth_source"],
         opencode_auth_kind=opencode["auth_kind"],
+        opencode_antigravity_model=opencode["antigravity_model"],
         opencode_auth_json=opencode["auth_json"],
         codex_auth_json=opencode["codex_auth_json"],
     )
@@ -1507,6 +1824,7 @@ def _opencode_account_auth_from_runtime_options(
         kind=str(getattr(runtime_options, "opencode_auth_kind", "") or "").strip() or "account_auth",
         opencode_auth_json=opencode_auth_json or None,
         codex_auth_json=codex_auth_json or None,
+        model_ref=str(getattr(runtime_options, "opencode_antigravity_model", "") or "").strip() or None,
     )
 
 
@@ -1516,12 +1834,21 @@ def _stream_opencode_execution(
     thread_id: str | None,
     trace_id: str,
     runtime_options: AgentRuntimeOptions | None = None,
+    resume_workspace: str | None = None,
+    resume_session_id: str | None = None,
 ) -> Iterator[str]:
     executor = OpenCodeExecutor(
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
+        mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
     )
-    stream = executor.stream(prompt=prompt, thread_id=thread_id, trace_id=trace_id)
+    stream = executor.stream(
+        prompt=prompt,
+        thread_id=thread_id,
+        trace_id=trace_id,
+        resume_workspace=resume_workspace,
+        resume_session_id=resume_session_id,
+    )
     while True:
         try:
             event = next(stream)
@@ -1531,6 +1858,17 @@ def _stream_opencode_execution(
 
 
 def _opencode_success_response(result: OpenCodeExecutionResult) -> str:
+    verification_url = _extract_antigravity_verification_url(result.console_lines)
+    if verification_url:
+        return (
+            "Gemini Antigravity needs account verification before it can continue. "
+            f"Use this link, then retry:\n{verification_url}"
+        )
+    if _contains_antigravity_verification_error(result.console_lines):
+        return "Gemini Antigravity needs account verification before it can continue. Complete verification and retry."
+    provider_error = _antigravity_provider_error_message(result.console_lines)
+    if provider_error:
+        return provider_error
     summary = str(result.final_text or "").strip()
     if summary:
         return summary
@@ -1545,6 +1883,20 @@ def _opencode_success_response(result: OpenCodeExecutionResult) -> str:
 
 
 def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
+    if result.blocked:
+        detail = str(result.blocked_reason or "unsafe command detected").strip()
+        return f"OpenCode run was stopped by sandbox policy: {detail}."
+    verification_url = _extract_antigravity_verification_url(result.console_lines)
+    if verification_url:
+        return (
+            "Gemini Antigravity blocked this run pending Google account verification. "
+            f"Open this link and complete verification, then retry:\n{verification_url}"
+        )
+    if _contains_antigravity_verification_error(result.console_lines):
+        return "Gemini Antigravity blocked this run pending Google account verification. Complete verification and retry."
+    provider_error = _antigravity_provider_error_message(result.console_lines)
+    if provider_error:
+        return provider_error
     if result.changed_files:
         return (
             f"OpenCode did not finish cleanly, but it still changed {len(result.changed_files)} file(s) "
@@ -1553,12 +1905,104 @@ def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
     return "OpenCode could not finish the ontology edit proposal."
 
 
+def _contains_antigravity_verification_error(lines: list[str]) -> bool:
+    for line in lines:
+        text = str(line or "")
+        if "Verify your account to continue" in text:
+            return True
+    return False
+
+
+def _extract_antigravity_verification_url(lines: list[str]) -> str:
+    for line in lines:
+        text = str(line or "")
+        if "accounts.google.com/signin/continue" not in text:
+            continue
+        match = re.search(r"https://accounts\.google\.com/signin/continue[^\s\"\\]+", text)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _joined_console_text(lines: list[str]) -> str:
+    return "\n".join(str(line or "") for line in lines)
+
+
+def _extract_antigravity_project_id(lines: list[str]) -> str:
+    match = re.search(r"projects/([a-z][a-z0-9-]{4,}[a-z0-9])", _joined_console_text(lines), re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _extract_antigravity_requested_model(lines: list[str]) -> str:
+    text = _joined_console_text(lines)
+    match = re.search(r"Requested Model:\s*([^\n]+)", text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"Effective Model:\s*([^\n]+)", text, re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _contains_antigravity_iam_error(lines: list[str]) -> bool:
+    text = _joined_console_text(lines)
+    return "cloudaicompanion.companions.generateChat" in text or "IAM_PERMISSION_DENIED" in text
+
+
+def _contains_antigravity_tool_schema_error(lines: list[str]) -> bool:
+    text = _joined_console_text(lines)
+    return bool(
+        re.search(
+            r"custom\.input_schema|input_schema\.properties|Property keys should match pattern|INVALID_ARGUMENT",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _contains_antigravity_provider_error(lines: list[str]) -> bool:
+    return bool(
+        _extract_antigravity_verification_url(lines)
+        or _contains_antigravity_verification_error(lines)
+        or _contains_antigravity_iam_error(lines)
+        or _contains_antigravity_tool_schema_error(lines)
+    )
+
+
+def _antigravity_provider_error_message(lines: list[str]) -> str:
+    if _contains_antigravity_iam_error(lines):
+        project_id = _extract_antigravity_project_id(lines)
+        project_label = f"project `{project_id}`" if project_id else "the configured Google Cloud project"
+        return (
+            "Gemini Antigravity reached Google, but the connected account is missing Gemini Code Assist "
+            f"permission for {project_label} (`cloudaicompanion.companions.generateChat`). "
+            "Ask an admin to grant access or reconnect a Google account with access, then retry."
+        )
+
+    if _contains_antigravity_tool_schema_error(lines):
+        model = _extract_antigravity_requested_model(lines) or "the selected Antigravity model"
+        return (
+            f"{model} rejected one of the MatPortal tool definitions before the run started. "
+            "The assistant runtime needs the provider-safe OntoPortal MCP schema, then this request can be retried."
+        )
+
+    return ""
+
+
 def _opencode_usage_payload(
     result: OpenCodeExecutionResult,
     runtime_options: AgentRuntimeOptions | None = None,
 ) -> dict[str, Any]:
     model = str(result.model or get_settings().opencode_model or "opencode")
     execution = result.execution_payload()
+    verification_url = _extract_antigravity_verification_url(result.console_lines)
+    if verification_url:
+        execution["verification_url"] = verification_url
+        execution["verification_required"] = True
+    elif _contains_antigravity_verification_error(result.console_lines):
+        execution["verification_required"] = True
+    if _contains_antigravity_iam_error(result.console_lines):
+        execution["provider_error"] = "antigravity_iam_permission_denied"
+        execution["google_project"] = _extract_antigravity_project_id(result.console_lines) or None
+    elif _contains_antigravity_tool_schema_error(result.console_lines):
+        execution["provider_error"] = "antigravity_tool_schema_rejected"
     if runtime_options is not None:
         source = _opencode_auth_source_from_runtime_options(runtime_options)
         execution["auth_source"] = source
@@ -1610,6 +2054,7 @@ def _stream_opencode_ask_generation(
     executor = OpenCodeExecutor(
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
+        mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
     )
     stream = executor.stream(
         prompt=prompt,
@@ -1703,6 +2148,7 @@ def _stream_agent_response(
     requested_mode: str | None = None,
     on_completed: Callable[[dict[str, Any], str], None] | None = None,
     log_context: dict[str, Any] | None = None,
+    opencode_resume: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     stream_context = dict(log_context or {})
     stream_context.setdefault("thread_id", thread_id)
@@ -1752,19 +2198,28 @@ def _stream_agent_response(
                 logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
             if intent == "EDIT":
                 yield _sse({"type": "status", "message": "Starting OpenCode workspace..."})
+                stream_kwargs: dict[str, Any] = {}
+                if isinstance(opencode_resume, dict):
+                    workspace = str(opencode_resume.get("workspace") or "").strip()
+                    session_id = str(opencode_resume.get("session_id") or "").strip()
+                    if workspace:
+                        stream_kwargs["resume_workspace"] = workspace
+                    if session_id:
+                        stream_kwargs["resume_session_id"] = session_id
                 opencode_result = yield from _stream_opencode_execution(
                     prompt=prompt,
                     thread_id=thread_id,
                     trace_id=stream_context["trace_id"],
                     runtime_options=runtime_options,
+                    **stream_kwargs,
                 )
                 resolved_model = str(opencode_result.model or get_settings().opencode_model or resolved_model or "")
                 final_state["generation_backend"] = "opencode"
                 final_state["generation_usage"] = _opencode_usage_payload(opencode_result, runtime_options)
                 final_state["citations"] = []
                 yield _sse({"type": "usage", "content": final_state["generation_usage"]})
-
-                if opencode_result.ok:
+                provider_blocked = _contains_antigravity_provider_error(opencode_result.console_lines)
+                if opencode_result.ok and not provider_blocked:
                     final_response_text = _opencode_success_response(opencode_result)
                     final_state["final_response"] = final_response_text
                     for chunk in _iter_text_chunks(final_response_text):
@@ -1775,7 +2230,7 @@ def _stream_agent_response(
                         "trace_id": stream_context["trace_id"],
                         "status": "OpenCode workspace failed.",
                         "message": final_response_text,
-                        "error_class": "OpenCodeExecutionError",
+                        "error_class": "OpenCodeProviderError" if provider_blocked else "OpenCodeExecutionError",
                         "status_code": 500,
                     }
                     final_state["generation_usage"]["error"] = error_details
@@ -2276,6 +2731,21 @@ def me_get_settings(
     return _serialize_settings_for_output(payload)
 
 
+@app.get("/api/v1/me/skills")
+def me_get_skills(
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
+    skills = _assistant_installed_skills(payload)
+    return {
+        "skills": skills,
+        "installed_count": len(skills),
+        "enabled_count": len([item for item in skills if item.get("enabled")]),
+    }
+
+
 @app.put("/api/v1/me/settings")
 def me_put_settings(
     payload: AssistantSettingsIn,
@@ -2329,8 +2799,43 @@ def me_put_settings(
     for server in normalized_payload.get("mcp_servers", []):
         identity = (server.get("name", "").strip(), server.get("url", "").strip())
         existing_server = existing_mcp_by_identity.get(identity)
-        if existing_server and not str(server.get("api_key", "")).strip() and _has_persisted_secret(existing_server.get("api_key", "")):
-            server["api_key"] = str(existing_server.get("api_key", "")).strip()
+        auth_mode = _normalize_mcp_auth_mode(
+            server.get("auth_mode"),
+            api_key=str(server.get("api_key", "") or ""),
+            username=str(server.get("username", "") or ""),
+            password=str(server.get("password", "") or ""),
+        )
+        server["auth_mode"] = auth_mode
+        if auth_mode == _MCP_AUTH_API_KEY:
+            server["username"] = ""
+            server["password"] = ""
+            if (
+                existing_server
+                and _normalize_mcp_auth_mode(existing_server.get("auth_mode"), api_key=existing_server.get("api_key")) == _MCP_AUTH_API_KEY
+                and not str(server.get("api_key", "")).strip()
+                and _has_persisted_secret(existing_server.get("api_key", ""))
+            ):
+                server["api_key"] = str(existing_server.get("api_key", "")).strip()
+            continue
+        if auth_mode == _MCP_AUTH_BASIC_USER:
+            server["api_key"] = ""
+            if (
+                existing_server
+                and _normalize_mcp_auth_mode(
+                    existing_server.get("auth_mode"),
+                    api_key=existing_server.get("api_key"),
+                    username=existing_server.get("username"),
+                    password=existing_server.get("password"),
+                )
+                == _MCP_AUTH_BASIC_USER
+                and not str(server.get("password", "")).strip()
+                and _has_persisted_secret(existing_server.get("password", ""))
+            ):
+                server["password"] = str(existing_server.get("password", "")).strip()
+            continue
+        server["api_key"] = ""
+        server["username"] = ""
+        server["password"] = ""
 
     settings_blob = {
         "generation": normalized_payload["generation"],
@@ -2351,9 +2856,214 @@ def me_put_settings(
         session,
         user_id=user_context.user_id,
         mcp_servers=normalized_payload["mcp_servers"],
-        encrypt_api_key=lambda api_key: encryption_service.encrypt_json({"api_key": api_key}),
+        encrypt_secret=lambda secret_payload: encryption_service.encrypt_json(secret_payload),
     )
     return _serialize_settings_for_output(normalized_payload)
+
+
+@app.post("/api/v1/me/auth/codex/start")
+def me_codex_auth_start(request: Request) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    try:
+        auth_session = _account_auth_manager.start_codex_device_auth(user_id=user_context.user_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Codex CLI is not installed in the assistant runtime.",
+        ) from exc
+    return {
+        "auth_session_id": auth_session.id,
+        "provider": "codex",
+        "login_url": auth_session.login_url,
+        "user_code": auth_session.user_code,
+        "expires_at": auth_session.expires_at.isoformat(),
+        "status": "pending",
+    }
+
+
+@app.get("/api/v1/me/auth/codex/status")
+def me_codex_auth_status(
+    auth_session_id: str,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    try:
+        auth_session = _account_auth_manager.get(
+            session_id=auth_session_id,
+            user_id=user_context.user_id,
+            provider="codex",
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Codex login session was not found.") from exc
+    auth_path = _account_auth_manager.codex_auth_json_path(auth_session)
+    if auth_path is None:
+        failed = bool(auth_session.process and auth_session.process.poll() is not None)
+        return {
+            "auth_session_id": auth_session.id,
+            "provider": "codex",
+            "status": "failed" if failed else "pending",
+            "login_url": auth_session.login_url,
+            "user_code": auth_session.user_code,
+            "expires_at": auth_session.expires_at.isoformat(),
+            "message": "Codex login is still waiting for browser confirmation." if not failed else "Codex login exited before saving auth.",
+        }
+
+    try:
+        codex_auth_json = load_json_object(auth_path)
+        settings_payload = _persist_opencode_account_auth(
+            session,
+            user_id=user_context.user_id,
+            auth_kind="codex",
+            codex_auth_json=codex_auth_json,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    finally:
+        _account_auth_manager.pop(session_id=auth_session.id, user_id=user_context.user_id, provider="codex")
+        _account_auth_manager.finish(auth_session)
+    return {
+        "auth_session_id": auth_session.id,
+        "provider": "codex",
+        "status": "connected",
+        "settings": settings_payload,
+    }
+
+
+@app.post("/api/v1/me/auth/antigravity/start")
+def me_antigravity_auth_start(payload: AntigravityAuthStartIn, request: Request) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    try:
+        auth_session = _account_auth_manager.start_antigravity(
+            user_id=user_context.user_id,
+            project_id=payload.project_id or "",
+        )
+    except AntigravityConfigError as exc:
+        logger.warning(
+            "Gemini Antigravity auth start blocked by missing OAuth config user=%s oauth=%s",
+            user_context.user_id,
+            antigravity_oauth_config_summary(),
+        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    logger.info(
+        "Gemini Antigravity auth start user=%s session=%s project_set=%s oauth=%s",
+        user_context.user_id,
+        auth_session.id,
+        bool(auth_session.project_id),
+        antigravity_oauth_config_summary(),
+    )
+    return {
+        "auth_session_id": auth_session.id,
+        "provider": "gemini_antigravity",
+        "login_url": auth_session.login_url,
+        "expires_at": auth_session.expires_at.isoformat(),
+        "callback_required": True,
+        "redirect_uri": antigravity_redirect_uri(),
+        "status": "pending",
+    }
+
+
+@app.post("/api/v1/me/auth/antigravity/complete")
+def me_antigravity_auth_complete(
+    payload: AntigravityAuthCompleteIn,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    completed = False
+    try:
+        auth_session = _account_auth_manager.get(
+            session_id=payload.auth_session_id,
+            user_id=user_context.user_id,
+            provider="gemini_antigravity",
+        )
+        callback_text = str(payload.callback_url_or_code or "").strip()
+        parsed_callback = urlparse(callback_text)
+        callback_query = parse_qs(parsed_callback.query) if parsed_callback.scheme and parsed_callback.netloc else {}
+        logger.info(
+            "Gemini Antigravity auth complete received user=%s session=%s callback_url=%s callback_has_code=%s callback_has_state=%s callback_query_keys=%s",
+            user_context.user_id,
+            payload.auth_session_id,
+            bool(parsed_callback.scheme and parsed_callback.netloc),
+            bool((callback_query.get("code") or [""])[0]) if callback_query else bool(callback_text),
+            bool((callback_query.get("state") or [""])[0]) if callback_query else False,
+            sorted(key for key in callback_query.keys() if key not in {"code"}),
+        )
+        code, _state = parse_antigravity_callback(
+            payload.callback_url_or_code,
+            expected_state=auth_session.state,
+        )
+        opencode_auth = exchange_antigravity_code(
+            code=code,
+            code_verifier=auth_session.code_verifier,
+            project_id=auth_session.project_id,
+        )
+        settings_payload = _persist_opencode_account_auth(
+            session,
+            user_id=user_context.user_id,
+            auth_kind="gemini_antigravity",
+            opencode_auth_json=json.dumps(opencode_auth, separators=(",", ":"), ensure_ascii=False),
+        )
+        completed = True
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gemini Antigravity login session was not found.") from exc
+    except AntigravityConfigError as exc:
+        logger.warning(
+            "Gemini Antigravity auth completion blocked by missing OAuth config user=%s oauth=%s",
+            user_context.user_id,
+            antigravity_oauth_config_summary(),
+        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ValueError as exc:
+        logger.info(
+            "Gemini Antigravity auth completion failed for user=%s reason=%s",
+            user_context.user_id,
+            _sanitize_provider_error(str(exc)),
+        )
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    finally:
+        if completed:
+            try:
+                auth_session = _account_auth_manager.pop(
+                    session_id=payload.auth_session_id,
+                    user_id=user_context.user_id,
+                    provider="gemini_antigravity",
+                )
+                _account_auth_manager.finish(auth_session)
+            except KeyError:
+                pass
+    return {
+        "auth_session_id": payload.auth_session_id,
+        "provider": "gemini_antigravity",
+        "status": "connected",
+        "settings": settings_payload,
+    }
+
+
+@app.get("/api/v1/me/auth/antigravity/models")
+def me_antigravity_auth_models(
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    settings_payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
+    opencode = _normalize_opencode_settings(settings_payload.get("opencode", {}))
+    connected = (
+        opencode.get("auth_source") == "account_auth"
+        and opencode.get("auth_kind") == "gemini_antigravity"
+        and _has_persisted_secret(opencode.get("auth_json"))
+    )
+    selected = normalize_antigravity_model_ref(
+        opencode.get("antigravity_model"),
+        default=str(get_settings().opencode_antigravity_model or "") or DEFAULT_ANTIGRAVITY_MODEL_REF,
+    )
+    return {
+        "provider": "gemini_antigravity",
+        "connected": connected,
+        "default_model": normalize_antigravity_model_ref(get_settings().opencode_antigravity_model),
+        "selected_model": selected,
+        "models": antigravity_model_options(selected_model_ref=selected),
+    }
 
 
 @app.post("/api/v1/me/settings/provider/check")
@@ -2465,6 +3175,7 @@ def me_mcp_health(
     request: Request,
     session: Session = Depends(get_db_session),
 ) -> dict[str, Any]:
+    settings = get_settings()
     user_context = _resolve_user_context(request)
     payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
     servers = payload.get("mcp_servers", [])
@@ -2487,11 +3198,12 @@ def me_mcp_health(
             )
             continue
         try:
+            headers = _runtime_mcp_headers_for_server(item, settings)
             client = McpClient(
                 [
                     {
                         "url": endpoint,
-                        "api_key": item.get("api_key") or "",
+                        "headers": headers or None,
                         "timeout_ms": timeout_ms,
                     }
                 ]
@@ -2568,6 +3280,20 @@ def me_chat_stream(
         "follow_up": bool(payload.thread_id),
         "request_id": request.headers.get("x-request-id") or request.headers.get("X-Request-Id"),
     }
+    latest_execution = get_latest_thread_execution(
+        session,
+        user_id=user_context.user_id,
+        thread_id=thread.thread_id,
+    )
+    opencode_resume: dict[str, Any] | None = None
+    if isinstance(latest_execution, dict) and not artifact_expired(latest_execution):
+        resume_workspace = str(latest_execution.get("workspace") or "").strip()
+        resume_session_id = str(latest_execution.get("session_id") or "").strip()
+        if resume_workspace or resume_session_id:
+            opencode_resume = {
+                "workspace": resume_workspace,
+                "session_id": resume_session_id,
+            }
 
     def on_completed(final_state: dict[str, Any], final_response_text: str) -> None:
         create_message(
@@ -2589,6 +3315,7 @@ def me_chat_stream(
             requested_mode=payload.mode,
             on_completed=on_completed,
             log_context=log_context,
+            opencode_resume=opencode_resume,
         ),
         media_type="text/event-stream",
         headers={

@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from ontoportal_agent import config as config_module
 from ontoportal_agent import server
+from ontoportal_agent.account_auth import AuthSession
 from ontoportal_agent.db.base import get_engine, get_session_factory
 from ontoportal_agent.db.repositories import create_message
 from ontoportal_agent.db.user_context import build_signature
@@ -36,11 +37,14 @@ def _configure_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ONTOAGENT_USER_CONTEXT_SECRET", "ctx-secret")
     monkeypatch.setenv("ONTOAGENT_INTERNAL_API_TOKEN", "internal-token")
     monkeypatch.setenv("ONTOAGENT_MCP_ENDPOINTS", "")
+    monkeypatch.setenv("ONTOAGENT_ANTIGRAVITY_CLIENT_ID", "test-antigravity-client.apps.googleusercontent.com")
+    monkeypatch.setenv("ONTOAGENT_ANTIGRAVITY_CLIENT_SECRET", "test-antigravity-secret")
 
     config_module.get_settings.cache_clear()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     server._agent_instance = None
+    server._account_auth_manager = server.AccountAuthManager()
     server.startup()
 
 
@@ -118,6 +122,7 @@ def test_settings_crud_redacts_secrets(monkeypatch, tmp_path):
     assert body["embeddings"]["api_key"] == "__configured__"
     assert body["reranker"]["api_key"] == "__configured__"
     assert body["retrieval"]["chunk_count"] == 12
+    assert body["mcp_servers"][0]["auth_mode"] == "api_key"
     assert body["mcp_servers"][0]["api_key"] == "__configured__"
 
     get_response = client.get("/api/v1/me/settings", headers=headers)
@@ -149,6 +154,77 @@ def test_settings_crud_redacts_secrets(monkeypatch, tmp_path):
     assert masked_body["generation"]["api_key"] == "__configured__"
     assert masked_body["generation"]["model"] == "gemini-2.5-pro"
     assert masked_body["mcp_servers"][0]["api_key"] == "__configured__"
+
+
+def test_settings_crud_preserves_basic_user_password(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    response = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gemini-3-flash-preview",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "embeddings": {
+                "provider": "openai_compatible",
+                "model": "text-embedding-005",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "reranker": {
+                "provider": "none",
+                "model": "",
+                "api_key": "",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [
+                {
+                    "name": "MOBI MCP",
+                    "url": "https://mobi.example/mcp",
+                    "auth_mode": "basic_user",
+                    "username": "alice-mobi",
+                    "password": "mobi-pass",
+                    "enabled": True,
+                    "timeout_ms": 15000,
+                }
+            ],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mcp_servers"][0]["auth_mode"] == "basic_user"
+    assert body["mcp_servers"][0]["username"] == "alice-mobi"
+    assert body["mcp_servers"][0]["password"] == "__configured__"
+    assert body["mcp_servers"][0]["api_key"] == ""
+
+    loaded = client.get("/api/v1/me/settings", headers=headers)
+    assert loaded.status_code == 200
+    loaded_server = loaded.json()["mcp_servers"][0]
+    assert loaded_server["auth_mode"] == "basic_user"
+    assert loaded_server["username"] == "alice-mobi"
+    assert loaded_server["password"] == "__configured__"
+
+    re_saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": loaded.json()["generation"],
+            "embeddings": loaded.json()["embeddings"],
+            "reranker": loaded.json()["reranker"],
+            "retrieval": loaded.json()["retrieval"],
+            "opencode": loaded.json()["opencode"],
+            "mcp_servers": loaded.json()["mcp_servers"],
+        },
+        headers=headers,
+    )
+    assert re_saved.status_code == 200
+    assert re_saved.json()["mcp_servers"][0]["password"] == "__configured__"
 
 
 def test_switching_provider_does_not_preserve_previous_secret(monkeypatch, tmp_path):
@@ -439,6 +515,266 @@ def test_settings_persist_account_auth_json_redacted(monkeypatch, tmp_path):
     assert loaded.status_code == 200
     assert loaded.json()["opencode"]["auth_json"] == "__configured__"
     assert loaded.json()["opencode"]["codex_auth_json"] == "__configured__"
+
+
+def test_codex_auth_status_persists_device_login_auth(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+    auth_dir = tmp_path / "codex-auth"
+    auth_dir.mkdir()
+    (auth_dir / "auth.json").write_text('{"tokens":{"access_token":"codex-token"}}', encoding="utf-8")
+    auth_session = AuthSession(
+        id="codex-session",
+        user_id="user-1",
+        provider="codex",
+        expires_at=server.datetime.now(server.timezone.utc) + server.timedelta(minutes=10),
+        login_url="https://auth.openai.com/codex/device",
+        user_code="ABCD-EFGH",
+        temp_dir=auth_dir,
+    )
+
+    class FakeManager:
+        def get(self, *, session_id, user_id, provider=None):
+            assert session_id == "codex-session"
+            assert user_id == "user-1"
+            assert provider == "codex"
+            return auth_session
+
+        def pop(self, *, session_id, user_id, provider=None):
+            return auth_session
+
+        def finish(self, auth_session):
+            return None
+
+        def codex_auth_json_path(self, auth_session):
+            return auth_dir / "auth.json"
+
+    monkeypatch.setattr(server, "_account_auth_manager", FakeManager())
+    response = client.get("/api/v1/me/auth/codex/status", params={"auth_session_id": "codex-session"}, headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "connected"
+    assert body["settings"]["opencode"]["auth_source"] == "account_auth"
+    assert body["settings"]["opencode"]["auth_kind"] == "codex"
+    assert body["settings"]["opencode"]["codex_auth_json"] == "__configured__"
+    assert "codex-token" not in json.dumps(body)
+
+    loaded = client.get("/api/v1/me/settings", headers=headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["opencode"]["codex_auth_json"] == "__configured__"
+
+
+def test_antigravity_auth_start_and_complete_persists_opencode_auth(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    start = client.post("/api/v1/me/auth/antigravity/start", json={"project_id": ""}, headers=headers)
+    assert start.status_code == 200
+    start_body = start.json()
+    assert start_body["callback_required"] is True
+    assert "accounts.google.com" in start_body["login_url"]
+    assert "localhost%3A51121%2Foauth-callback" in start_body["login_url"]
+
+    seen = {}
+
+    def fake_exchange(*, code, code_verifier, project_id):
+        seen["code"] = code
+        seen["verifier"] = code_verifier
+        return {
+            "google": {
+                "type": "oauth",
+                "refresh": "refresh-token|",
+                "access": "access-token",
+                "expires": 2000000000000,
+                "email": "alice@example.org",
+                "projectId": "",
+            }
+        }
+
+    monkeypatch.setattr(server, "exchange_antigravity_code", fake_exchange)
+    auth_session = server._account_auth_manager.get(
+        session_id=start_body["auth_session_id"],
+        user_id="user-1",
+        provider="gemini_antigravity",
+    )
+    callback = f"http://localhost:51121/oauth-callback?code=google-code&state={auth_session.state}"
+    complete = client.post(
+        "/api/v1/me/auth/antigravity/complete",
+        json={"auth_session_id": start_body["auth_session_id"], "callback_url_or_code": callback},
+        headers=headers,
+    )
+    assert complete.status_code == 200
+    body = complete.json()
+    assert body["status"] == "connected"
+    assert body["settings"]["opencode"]["auth_source"] == "account_auth"
+    assert body["settings"]["opencode"]["auth_kind"] == "gemini_antigravity"
+    assert body["settings"]["opencode"]["auth_json"] == "__configured__"
+    assert seen["code"] == "google-code"
+    assert "access-token" not in json.dumps(body)
+
+
+def test_antigravity_auth_start_requires_oauth_app_credentials(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("ONTOAGENT_ANTIGRAVITY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("ONTOAGENT_ANTIGRAVITY_CLIENT_SECRET", raising=False)
+    client = TestClient(server.app)
+
+    response = client.post("/api/v1/me/auth/antigravity/start", json={}, headers=_signed_headers())
+
+    assert response.status_code == 503
+    assert "Gemini Antigravity login is not configured" in response.json()["detail"]
+
+
+def test_antigravity_auth_tokens_are_per_user(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    user_one_headers = _signed_headers(user_id="user-1", username="alice", email="alice@example.org")
+    user_two_headers = _signed_headers(user_id="user-2", username="bob", email="bob@example.org")
+
+    def fake_exchange(*, code, code_verifier, project_id):
+        return {
+            "google": {
+                "type": "oauth",
+                "refresh": "alice-refresh|",
+                "access": "alice-access",
+                "expires": 2000000000000,
+                "email": "alice@example.org",
+                "projectId": "",
+            }
+        }
+
+    monkeypatch.setattr(server, "exchange_antigravity_code", fake_exchange)
+    start = client.post("/api/v1/me/auth/antigravity/start", json={}, headers=user_one_headers)
+    assert start.status_code == 200
+    auth_session = server._account_auth_manager.get(
+        session_id=start.json()["auth_session_id"],
+        user_id="user-1",
+        provider="gemini_antigravity",
+    )
+    callback = f"http://localhost:51121/oauth-callback?code=google-code&state={auth_session.state}"
+    complete = client.post(
+        "/api/v1/me/auth/antigravity/complete",
+        json={"auth_session_id": start.json()["auth_session_id"], "callback_url_or_code": callback},
+        headers=user_one_headers,
+    )
+    assert complete.status_code == 200
+
+    user_one_settings = client.get("/api/v1/me/settings", headers=user_one_headers)
+    user_two_settings = client.get("/api/v1/me/settings", headers=user_two_headers)
+    assert user_one_settings.status_code == 200
+    assert user_two_settings.status_code == 200
+    assert user_one_settings.json()["opencode"]["auth_source"] == "account_auth"
+    assert user_one_settings.json()["opencode"]["auth_kind"] == "gemini_antigravity"
+    assert user_one_settings.json()["opencode"]["auth_json"] == "__configured__"
+    assert user_two_settings.json()["opencode"]["auth_source"] != "account_auth"
+    assert user_two_settings.json()["opencode"]["auth_json"] == ""
+    assert "alice-access" not in json.dumps(user_one_settings.json())
+    assert "alice-refresh" not in json.dumps(user_one_settings.json())
+
+
+def test_antigravity_models_endpoint_returns_user_selection(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {"provider": "gemini_api", "model": "gemini-2.5-pro", "api_key": "", "base_url": ""},
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "opencode": {
+                "auth_source": "account_auth",
+                "auth_kind": "gemini_antigravity",
+                "antigravity_model": "google/antigravity-claude-opus-4-6-thinking",
+                "auth_json": '{"google":{"type":"oauth","refresh":"refresh-token|","access":"access-token","expires":2000000000000}}',
+            },
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+
+    response = client.get("/api/v1/me/auth/antigravity/models", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["connected"] is True
+    assert body["selected_model"] == "google/antigravity-claude-opus-4-6-thinking"
+    assert any(item["model_ref"] == body["selected_model"] and item["selected"] for item in body["models"])
+    assert "access-token" not in json.dumps(body)
+
+
+def test_skills_endpoint_lists_installed_capabilities_without_secrets(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    saved = client.put(
+        "/api/v1/me/settings",
+        json={
+            "generation": {"provider": "gemini_api", "model": "gemini-2.5-pro", "api_key": "", "base_url": ""},
+            "embeddings": {"provider": "openai_compatible", "model": "", "api_key": "", "base_url": ""},
+            "reranker": {"provider": "none", "model": "", "api_key": "", "base_url": ""},
+            "retrieval": {"chunk_count": 12},
+            "opencode": {
+                "auth_source": "account_auth",
+                "auth_kind": "gemini_antigravity",
+                "antigravity_model": "google/antigravity-claude-opus-4-6-thinking",
+                "auth_json": '{"google":{"type":"oauth","refresh":"refresh-token|","access":"access-token","expires":2000000000000}}',
+            },
+            "mcp_servers": [],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200
+
+    response = client.get("/api/v1/me/skills", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    skill_ids = {item["id"] for item in body["skills"]}
+    assert {"ontology_edit_workflow", "matportal_rag_mcp", "ontoportal_api_mcp", "robot_validation", "artifact_review", "antigravity_search"} <= skill_ids
+    antigravity_search = next(item for item in body["skills"] if item["id"] == "antigravity_search")
+    assert antigravity_search["enabled"] is True
+    assert antigravity_search["status"] == "connected"
+    assert "antigravity-claude-opus-4-6-thinking" in json.dumps(antigravity_search)
+    assert "access-token" not in json.dumps(body)
+    assert "refresh-token" not in json.dumps(body)
+
+
+def test_antigravity_auth_session_is_user_scoped(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    start = client.post("/api/v1/me/auth/antigravity/start", json={}, headers=_signed_headers(user_id="user-1"))
+    assert start.status_code == 200
+
+    other_headers = _signed_headers(user_id="user-2", username="bob", email="bob@example.org")
+    complete = client.post(
+        "/api/v1/me/auth/antigravity/complete",
+        json={"auth_session_id": start.json()["auth_session_id"], "callback_url_or_code": "code"},
+        headers=other_headers,
+    )
+    assert complete.status_code == 404
+
+
+def test_antigravity_auth_complete_invalid_state_returns_message(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    start = client.post("/api/v1/me/auth/antigravity/start", json={}, headers=headers)
+    assert start.status_code == 200
+    callback = "http://localhost:51121/oauth-callback?code=google-code&state=wrong-state"
+    complete = client.post(
+        "/api/v1/me/auth/antigravity/complete",
+        json={"auth_session_id": start.json()["auth_session_id"], "callback_url_or_code": callback},
+        headers=headers,
+    )
+
+    assert complete.status_code == 422
+    assert complete.json()["detail"] == "The callback state did not match this login session."
 
 
 def test_provider_check_uses_saved_gemini_api_key_without_returning_secret(monkeypatch, tmp_path):
@@ -1213,11 +1549,194 @@ def test_builtin_mcp_timeout_is_upgraded_for_runtime(monkeypatch):
 
     assert runtime_options.mcp_endpoints == [
         {
+            "name": "MCP 1",
             "url": "http://rag.internal/mcp",
-            "api_key": None,
+            "headers": None,
             "timeout_ms": 30000,
         }
     ]
+
+
+def test_default_settings_payload_uses_default_mcp_auth_mode(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            default_mcp_endpoints=["https://mobi.dev.matportal.org/api/mcp"],
+            default_mcp_api_key=None,
+            default_mcp_auth_mode="basic_bot",
+            default_generation_provider="gemini_api",
+            default_generation_model="gemini-2.5-pro",
+            default_generation_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            default_embeddings_provider="openai_compatible",
+            default_embeddings_model="text-embedding-005",
+            default_embeddings_base_url="",
+            default_reranker_provider="cohere",
+            default_reranker_model="rerank-v3.5",
+            default_reranker_base_url="",
+            llm_model="gemini-2.5-pro",
+            openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    payload = server._default_settings_payload()
+
+    assert payload["mcp_servers"] == [
+        {
+            "name": "MCP 1",
+            "url": "https://mobi.dev.matportal.org/api/mcp",
+            "auth_mode": "basic_bot",
+            "username": "",
+            "password": "",
+            "api_key": "",
+            "enabled": True,
+            "timeout_ms": 30000,
+        }
+    ]
+
+
+def test_normalize_settings_payload_inherits_default_mcp_when_missing(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            default_mcp_endpoints=["https://mobi.dev.matportal.org/api/mcp"],
+            default_mcp_api_key=None,
+            default_mcp_auth_mode="basic_bot",
+            default_generation_provider="gemini_api",
+            default_generation_model="gemini-2.5-pro",
+            default_generation_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            default_embeddings_provider="openai_compatible",
+            default_embeddings_model="text-embedding-005",
+            default_embeddings_base_url="",
+            default_reranker_provider="cohere",
+            default_reranker_model="rerank-v3.5",
+            default_reranker_base_url="",
+            llm_model="gemini-2.5-pro",
+            openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    payload = server._normalize_settings_payload(
+        {
+            "generation": {},
+            "embeddings": {},
+            "reranker": {},
+            "retrieval": {},
+            "opencode": {},
+        }
+    )
+
+    assert payload["mcp_servers"] == [
+        {
+            "name": "MCP 1",
+            "url": "https://mobi.dev.matportal.org/api/mcp",
+            "auth_mode": "basic_bot",
+            "username": "",
+            "password": "",
+            "api_key": "",
+            "enabled": True,
+            "timeout_ms": 30000,
+        }
+    ]
+
+
+def test_runtime_options_builds_basic_user_mcp_headers(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="test-openai-key",
+            openai_api_base="https://example.test/openai",
+            llm_model="gemini-3-flash-preview",
+            default_generation_provider="openai_compatible",
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            mcp_bot_username="",
+            mcp_bot_password="",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gemini-3-flash-preview",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [
+                {
+                    "name": "MOBI MCP",
+                    "url": "https://mobi.example/mcp",
+                    "auth_mode": "basic_user",
+                    "username": "mobi-user",
+                    "password": "mobi-pass",
+                    "enabled": True,
+                    "timeout_ms": 12000,
+                }
+            ],
+        }
+    )
+
+    assert runtime_options.mcp_endpoints[0]["headers"] == {
+        "Authorization": server._basic_auth_header_value("mobi-user", "mobi-pass")
+    }
+
+
+def test_runtime_options_builds_basic_bot_mcp_headers(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="test-openai-key",
+            openai_api_base="https://example.test/openai",
+            llm_model="gemini-3-flash-preview",
+            default_generation_provider="openai_compatible",
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            mcp_bot_username="matportal-bot",
+            mcp_bot_password="bot-pass",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "openai_compatible",
+                "model": "gemini-3-flash-preview",
+                "api_key": "",
+                "base_url": "https://example.test/openai",
+            },
+            "retrieval": {"chunk_count": 12},
+            "mcp_servers": [
+                {
+                    "name": "MOBI MCP",
+                    "url": "https://mobi.example/mcp",
+                    "auth_mode": "basic_bot",
+                    "enabled": True,
+                    "timeout_ms": 12000,
+                }
+            ],
+        }
+    )
+
+    assert runtime_options.mcp_endpoints[0]["headers"] == {
+        "Authorization": server._basic_auth_header_value("matportal-bot", "bot-pass")
+    }
 
 
 def test_runtime_options_tracks_user_generation_key_for_opencode(monkeypatch):
@@ -1398,6 +1917,53 @@ def test_account_auth_source_builds_account_auth(monkeypatch):
     assert account_auth.kind == "codex"
     assert account_auth.opencode_auth_json == '{"provider":"openai"}'
     assert "codex-token" in (account_auth.codex_auth_json or "")
+
+
+def test_account_auth_source_keeps_selected_antigravity_model(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="deployment-openai-key",
+            openai_api_base="https://deployment.example/openai",
+            llm_model="deployment-model",
+            default_generation_provider="openai_compatible",
+            vertex_project=None,
+            vertex_location="us-central1",
+            vertex_service_account_json=None,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            default_mcp_endpoints=[],
+            default_mcp_api_key=None,
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+            opencode_antigravity_model="google/antigravity-gemini-3-pro",
+            resolved_mcp_endpoints=lambda: ["http://rag.internal/mcp"],
+        ),
+    )
+
+    runtime_options = server._runtime_options_from_settings(
+        {
+            "generation": {
+                "provider": "gemini_api",
+                "model": "gemini-2.5-pro",
+                "api_key": "user-gemini-api-key",
+                "base_url": "",
+            },
+            "retrieval": {"chunk_count": 12},
+            "opencode": {
+                "auth_source": "account_auth",
+                "auth_kind": "gemini_antigravity",
+                "antigravity_model": "google/antigravity-claude-opus-4-6-thinking",
+                "auth_json": '{"provider":"antigravity"}',
+            },
+            "mcp_servers": [],
+        }
+    )
+
+    account_auth = server._opencode_account_auth_from_runtime_options(runtime_options)
+    assert account_auth is not None
+    assert account_auth.model_ref == "google/antigravity-claude-opus-4-6-thinking"
 
 
 def test_opencode_usage_reports_auth_source():
@@ -1791,6 +2357,53 @@ def test_stream_agent_response_respects_requested_edit_mode(monkeypatch):
     assert '"run_id": "run-forced-edit"' in events
 
 
+def test_stream_agent_response_passes_resume_session_to_opencode(monkeypatch):
+    initial_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="vertex_gemini",
+            llm_model="gemini-2.5-pro",
+            openai_api_key="",
+            openai_api_base="",
+            vertex_project="ontoportal-llm-finetune",
+            vertex_location="us-central1",
+            vertex_service_account_json='{"client_email":"svc@example.org"}',
+        )
+    )
+    observed: dict[str, object] = {}
+
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options, resume_workspace=None, resume_session_id=None):
+        observed["resume_workspace"] = resume_workspace
+        observed["resume_session_id"] = resume_session_id
+        yield server._sse({"type": "workspace_mode", "content": {"mode": "execution", "run_id": "run-resume"}})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace=str(resume_workspace or "/tmp/ontoportal-agent/opencode-runs/thread-resume"),
+            run_id="run-resume",
+            expires_at="2999-01-01T00:00:00+00:00",
+            model="opencode/big-pickle",
+            final_text="Continued existing OpenCode session.",
+        )
+
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "EDIT")
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Continue previous ontology draft.",
+            thread_id="thread-resume",
+            agent_builder=lambda: initial_agent,
+            opencode_resume={
+                "workspace": "/tmp/ontoportal-agent/opencode-runs/thread-resume",
+                "session_id": "ses_resume_123",
+            },
+        )
+    )
+
+    assert observed["resume_workspace"] == "/tmp/ontoportal-agent/opencode-runs/thread-resume"
+    assert observed["resume_session_id"] == "ses_resume_123"
+    assert "Continued existing OpenCode session." in events
+
+
 def test_stream_agent_response_hybrid_ask_uses_opencode_after_backend_retrieval(monkeypatch):
     runtime_agent = SimpleNamespace(
         runtime_options=SimpleNamespace(
@@ -1928,3 +2541,69 @@ def test_stream_agent_response_falls_back_to_latest_google_model(monkeypatch):
     assert "Primary model unavailable. Switching to gemini-3-pro-preview." in events
     assert "Fallback reasoning from Gemini 3 Pro." in events
     assert "Fallback answer from Gemini 3 Pro." in events
+
+
+def test_opencode_failure_response_surfaces_antigravity_verification_url():
+    result = OpenCodeExecutionResult(
+        ok=False,
+        workspace="/tmp/workspace",
+        run_id="run-1",
+        expires_at="2999-01-01T00:00:00+00:00",
+        console_lines=[
+            'APIError: Verify your account to continue. validation_url":"https://accounts.google.com/signin/continue?flowName=GlifWebSignIn"'
+        ],
+    )
+    message = server._opencode_failure_response(result)
+    assert "Gemini Antigravity blocked this run pending Google account verification." in message
+    assert "https://accounts.google.com/signin/continue?flowName=GlifWebSignIn" in message
+
+
+def test_opencode_success_response_prefers_antigravity_verification_notice():
+    result = OpenCodeExecutionResult(
+        ok=True,
+        workspace="/tmp/workspace",
+        run_id="run-2",
+        expires_at="2999-01-01T00:00:00+00:00",
+        console_lines=[
+            'VALIDATION_REQUIRED validation_url":"https://accounts.google.com/signin/continue?flowName=GlifWebSignIn"'
+        ],
+    )
+    message = server._opencode_success_response(result)
+    assert "Gemini Antigravity needs account verification" in message
+    assert "https://accounts.google.com/signin/continue?flowName=GlifWebSignIn" in message
+
+
+def test_opencode_failure_response_surfaces_antigravity_iam_error():
+    result = OpenCodeExecutionResult(
+        ok=False,
+        workspace="/tmp/workspace",
+        run_id="run-3",
+        expires_at="2999-01-01T00:00:00+00:00",
+        console_lines=[
+            'IAM_PERMISSION_DENIED permission "cloudaicompanion.companions.generateChat" on resource "projects/rising-fact-p41fc"'
+        ],
+    )
+
+    message = server._opencode_failure_response(result)
+
+    assert "missing Gemini Code Assist permission" in message
+    assert "rising-fact-p41fc" in message
+    assert "cloudaicompanion.companions.generateChat" in message
+
+
+def test_opencode_success_response_surfaces_antigravity_tool_schema_error():
+    result = OpenCodeExecutionResult(
+        ok=True,
+        workspace="/tmp/workspace",
+        run_id="run-4",
+        expires_at="2999-01-01T00:00:00+00:00",
+        console_lines=[
+            "Requested Model: antigravity-claude-opus-4-6-thinking",
+            "tools.6.custom.input_schema.properties: Property keys should match pattern '^[a-zA-Z0-9_.-]{1,64}$'",
+        ],
+    )
+
+    message = server._opencode_success_response(result)
+
+    assert "antigravity-claude-opus-4-6-thinking rejected one of the MatPortal tool definitions" in message
+    assert "provider-safe OntoPortal MCP schema" in message
