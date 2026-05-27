@@ -75,6 +75,7 @@ def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, 
     monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
     monkeypatch.setenv("ONTOAGENT_DEEPAGENTS_ENABLED", "true")
     monkeypatch.setenv("ONTOAGENT_OPENCODE_ROBOT_ENABLED", "false")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_KEEP_WORKSPACE", "false")
     get_settings.cache_clear()
 
     captured: dict[str, object] = {}
@@ -103,6 +104,13 @@ def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, 
             )
             validation = self.tools["matportal_validate_workspace"].invoke({})
             captured["validation"] = validation
+            self.tools["matportal_write_artifact"].invoke(
+                {"path": "operator-report.md", "content": "# Operator report\n\nValidation ran before this file.\n"}
+            )
+            with pytest.raises(Exception):
+                self.tools["matportal_write_artifact"].invoke(
+                    {"path": "leaky-note.md", "content": "api_key = sk-testsecretvalue12345\n"}
+                )
             return {"messages": [AIMessage(content="Deep Agents prepared proposal.ttl.")]}
 
     def _create_deep_agent(**kwargs):
@@ -134,7 +142,9 @@ def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, 
     # assert through streamed parity events and the workspace diff contract.
     assert any(event["type"] == "workspace_mode" and event["content"].get("runtime") == "deepagents" for event in events)
     changed = next(event["content"] for event in events if event["type"] == "changed_files")
-    assert {item["path"] for item in changed} >= {"proposal.ttl", "validation-summary.json"}
+    changed_paths = {item["path"] for item in changed}
+    assert changed_paths >= {"proposal.ttl", "validation-summary.json", "operator-report.md"}
+    assert "leaky-note.md" not in changed_paths
     validation_event = next(event["content"] for event in events if event["type"] == "validation_report")
     assert validation_event["ok"] is True
     assert any(item["path"] == "proposal.ttl" and item["status"] == "passed" for item in validation_event["checked_files"])

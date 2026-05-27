@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,6 +75,10 @@ class DeepAgentsEditRuntime:
         self.mcp_servers = list(mcp_servers or [])
         self.model = model
         self._workspace_manager = OpenCodeExecutor(settings=self.settings, mcp_servers=self.mcp_servers)
+        self._mcp_client = McpClient(
+            self.mcp_servers or getattr(self.runtime_options, "mcp_endpoints", []) or self.settings.resolved_mcp_endpoints(),
+            api_key=getattr(self.runtime_options, "mcp_api_key", None) or self.settings.mcp_api_key,
+        )
 
     def stream(self, request: EditRuntimeRequest) -> Iterator[dict[str, Any]]:
         if not self.settings.deepagents_enabled:
@@ -175,6 +180,8 @@ class DeepAgentsEditRuntime:
         api_key = str(getattr(options, "openai_api_key", "") or self.settings.openai_api_key or "")
         base_url = str(getattr(options, "openai_api_base", "") or self.settings.openai_api_base or "") or None
         model = str(self.settings.deepagents_model or getattr(options, "llm_model", "") or self.settings.llm_model or "").strip()
+        if not base_url and model.lower().startswith("gemini"):
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
         if not api_key:
             raise DeepAgentsRuntimeError("Deep Agents runtime requires a configured generation API key.")
         if not model:
@@ -189,16 +196,26 @@ class DeepAgentsEditRuntime:
         def write_artifact(path: str, content: str) -> dict[str, Any]:
             safe = sanitize_artifact_path(path)
             target = (workspace / safe).resolve()
-            target.relative_to(workspace.resolve())
+            try:
+                target.relative_to(workspace.resolve())
+            except ValueError as exc:
+                raise ArtifactAccessError("Artifact path escapes the Deep Agents workspace.") from exc
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(str(content or ""), encoding="utf-8")
-            assert_artifact_safe_for_exposure(target)
+            try:
+                assert_artifact_safe_for_exposure(target)
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
             return {"path": safe.as_posix(), "bytes": target.stat().st_size, "status": "written"}
 
         def read_artifact(path: str) -> dict[str, Any]:
             safe = sanitize_artifact_path(path)
             target = (workspace / safe).resolve()
-            target.relative_to(workspace.resolve())
+            try:
+                target.relative_to(workspace.resolve())
+            except ValueError as exc:
+                raise ArtifactAccessError("Artifact path escapes the Deep Agents workspace.") from exc
             if not target.is_file():
                 return {"path": safe.as_posix(), "error": "not_found"}
             return {"path": safe.as_posix(), "content": target.read_text(encoding="utf-8", errors="replace")[:120_000]}
@@ -225,15 +242,12 @@ class DeepAgentsEditRuntime:
             if not isinstance(arguments, dict):
                 return {"error": "arguments_json must decode to a JSON object"}
             try:
-                return McpClient(
-                    self.mcp_servers or getattr(self.runtime_options, "mcp_endpoints", []) or self.settings.resolved_mcp_endpoints(),
-                    api_key=getattr(self.runtime_options, "mcp_api_key", None) or self.settings.mcp_api_key,
-                ).invoke(tool_name, arguments)
+                return self._mcp_client.invoke(tool_name, arguments)
             except Exception as exc:  # noqa: BLE001 - failed evidence tools should be captured in artifacts.
                 return {"error": str(exc), "tool_name": tool_name}
 
         def validate_workspace() -> dict[str, Any]:
-            self._workspace_manager._finalize_workspace(workspace=workspace, result=result)
+            self._refresh_workspace_report(workspace=workspace, result=result)
             return result.validation_report
 
         return [
@@ -267,6 +281,22 @@ class DeepAgentsEditRuntime:
                 description="Run the MatPortal artifact validators over current workspace changes.",
             ),
         ]
+
+    def _refresh_workspace_report(self, *, workspace: Path, result: OpenCodeExecutionResult) -> None:
+        subprocess.run(["git", "add", "-A"], cwd=str(workspace), check=False, capture_output=True, text=True)
+        status_output = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        result.changed_files = self._workspace_manager._parse_changed_files(status_output, workspace=workspace)
+        result.artifact_candidates = self._workspace_manager._artifact_candidates(result.changed_files)
+        result.validation_report = self._workspace_manager._build_validation_report(
+            workspace=workspace,
+            changed_files=result.changed_files,
+        )
 
     def _system_prompt(self, workspace: Path) -> str:
         return "\n".join(
