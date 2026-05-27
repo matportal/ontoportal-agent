@@ -117,6 +117,42 @@ class AgentSettings(BaseSettings):
         default=20000,
         validation_alias=AliasChoices("ONTOAGENT_OPENCODE_MCP_TIMEOUT_MS", "OPENCODE_MCP_TIMEOUT_MS"),
     )
+    opencode_rag_mcp_name: str = Field(
+        default="matportal_rag",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_RAG_MCP_NAME", "OPENCODE_RAG_MCP_NAME"),
+    )
+    opencode_rag_mcp_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_RAG_MCP_URL", "OPENCODE_RAG_MCP_URL"),
+    )
+    opencode_rag_mcp_timeout_ms: int = Field(
+        default=30000,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_RAG_MCP_TIMEOUT_MS", "OPENCODE_RAG_MCP_TIMEOUT_MS"),
+    )
+    opencode_antigravity_plugin: str = Field(
+        default="opencode-antigravity-auth@latest",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_ANTIGRAVITY_PLUGIN", "OPENCODE_ANTIGRAVITY_PLUGIN"),
+    )
+    opencode_antigravity_model: str = Field(
+        default="google/antigravity-gemini-3-pro",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_ANTIGRAVITY_MODEL", "OPENCODE_ANTIGRAVITY_MODEL"),
+    )
+    opencode_exa_websearch_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_EXA_WEBSEARCH_ENABLED", "OPENCODE_EXA_WEBSEARCH_ENABLED"),
+    )
+    opencode_robot_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_ROBOT_ENABLED", "OPENCODE_ROBOT_ENABLED"),
+    )
+    opencode_robot_jar_path: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_ROBOT_JAR_PATH", "OPENCODE_ROBOT_JAR_PATH"),
+    )
+    opencode_robot_java_path: str = Field(
+        default="java",
+        validation_alias=AliasChoices("ONTOAGENT_OPENCODE_ROBOT_JAVA_PATH", "OPENCODE_ROBOT_JAVA_PATH"),
+    )
     opencode_keep_workspace: bool = Field(
         default=True,
         validation_alias=AliasChoices("ONTOAGENT_OPENCODE_KEEP_WORKSPACE", "OPENCODE_KEEP_WORKSPACE"),
@@ -143,6 +179,62 @@ class AgentSettings(BaseSettings):
     opencode_hybrid_ask_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("ONTOAGENT_OPENCODE_HYBRID_ASK_ENABLED", "OPENCODE_HYBRID_ASK_ENABLED"),
+    )
+    opencode_block_dangerous_commands: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_BLOCK_DANGEROUS_COMMANDS",
+            "OPENCODE_BLOCK_DANGEROUS_COMMANDS",
+        ),
+    )
+    opencode_interactive_sessions_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_INTERACTIVE_SESSIONS_ENABLED",
+            "OPENCODE_INTERACTIVE_SESSIONS_ENABLED",
+        ),
+    )
+    opencode_strict_workflow_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_STRICT_WORKFLOW_ENABLED",
+            "OPENCODE_STRICT_WORKFLOW_ENABLED",
+        ),
+    )
+    opencode_apply_publish_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_APPLY_PUBLISH_ENABLED",
+            "OPENCODE_APPLY_PUBLISH_ENABLED",
+        ),
+    )
+    opencode_mobi_handoff_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_MOBI_HANDOFF_ENABLED",
+            "OPENCODE_MOBI_HANDOFF_ENABLED",
+        ),
+    )
+    opencode_strict_sandbox_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_STRICT_SANDBOX_ENABLED",
+            "OPENCODE_STRICT_SANDBOX_ENABLED",
+        ),
+    )
+    opencode_global_concurrency_limit: int = Field(
+        default=1,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_GLOBAL_CONCURRENCY_LIMIT",
+            "OPENCODE_GLOBAL_CONCURRENCY_LIMIT",
+        ),
+    )
+    opencode_user_concurrency_limit: int = Field(
+        default=1,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_OPENCODE_USER_CONCURRENCY_LIMIT",
+            "OPENCODE_USER_CONCURRENCY_LIMIT",
+        ),
     )
 
     # Approval gate
@@ -242,6 +334,25 @@ class AgentSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_MCP_API_KEY", "DEFAULT_MCP_API_KEY"),
     )
+    default_mcp_auth_mode: str = Field(
+        default="none",
+        validation_alias=AliasChoices("ONTOAGENT_DEFAULT_MCP_AUTH_MODE", "DEFAULT_MCP_AUTH_MODE"),
+    )
+    mcp_bot_username: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_MCP_BOT_USERNAME", "MCP_BOT_USERNAME"),
+    )
+    mcp_bot_password: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_MCP_BOT_PASSWORD", "MCP_BOT_PASSWORD"),
+    )
+
+    @field_validator("opencode_global_concurrency_limit", "opencode_user_concurrency_limit")
+    @classmethod
+    def _positive_concurrency_limit(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError("OpenCode concurrency limits must be at least 1")
+        return int(value)
 
     @field_validator("mcp_endpoints", mode="before")
     @classmethod
@@ -260,6 +371,14 @@ class AgentSettings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("default_mcp_auth_mode")
+    @classmethod
+    def _normalize_default_mcp_auth_mode(cls, value: str) -> str:
+        normalized = str(value or "none").strip().lower()
+        if normalized not in {"none", "api_key", "basic_user", "basic_bot"}:
+            raise ValueError("default_mcp_auth_mode must be one of: none, api_key, basic_user, basic_bot")
+        return normalized
 
     @field_validator("opencode_mcp_mode")
     @classmethod

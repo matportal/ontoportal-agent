@@ -1,5 +1,6 @@
 import importlib
 import json
+import subprocess
 import stat
 from pathlib import Path
 
@@ -26,10 +27,14 @@ def test_prepare_workspace_writes_opencode_mcp_config(monkeypatch, tmp_path):
 
     config = json.loads((workspace / "opencode.json").read_text(encoding="utf-8"))
     server = config["mcp"]["ontoportal_api"]
+    rag_server = config["mcp"]["matportal_rag"]
     assert server["type"] == "remote"
     assert server["enabled"] is True
     assert "api_key=test-ontoportal-key" in server["url"]
     assert "base_url=https%3A%2F%2Fdata.dev.matportal.org" in server["url"]
+    assert rag_server["type"] == "remote"
+    assert rag_server["url"] == "http://localhost:8000/mcp"
+    assert rag_server["enabled"] is True
     assert (workspace / ".git").exists()
     assert (workspace / "README.md").exists()
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
@@ -38,14 +43,84 @@ def test_prepare_workspace_writes_opencode_mcp_config(monkeypatch, tmp_path):
     assert (toolkit / "README.md").exists()
     assert (toolkit / "proposal-template.ttl").exists()
     assert (toolkit / "operator-report-template.md").exists()
+    assert (toolkit / "draft-submission-template.md").exists()
     assert (toolkit / "review-checklist.json").exists()
     assert stat.S_IMODE(toolkit.stat().st_mode) == 0o700
     Graph().parse(toolkit / "proposal-template.ttl", format="turtle")
     checklist = json.loads((toolkit / "review-checklist.json").read_text(encoding="utf-8"))
+    assert "RAG chunks inspected before drafting" in checklist["checks"]
+    assert "ROBOT verify/report was run or explicitly marked unavailable" in checklist["checks"]
     assert "No secrets or absolute local paths are present" in checklist["checks"]
     excludes = (workspace / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert ".opencode-home/" in excludes
     assert ".opencode-state/" in excludes
+
+
+def test_prepare_workspace_merges_runtime_mcp_servers(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_MCP_URL", "https://mcp.matportal.org/mcp")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_BASE", "https://data.dev.matportal.org/")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor(
+        mcp_servers=[
+            {"name": "mobi_mcp", "url": "https://mobi.example/mcp", "timeout_ms": 4567},
+            {"name": "duplicate_url", "url": "https://mobi.example/mcp", "timeout_ms": 9999},
+            {"name": "ontoportal_api", "url": "https://override.example/mcp", "timeout_ms": 1234},
+            "https://extra.example/mcp",
+        ]
+    )
+    workspace = executor._prepare_workspace(thread_id="thread-merge-mcp")
+
+    config = json.loads((workspace / "opencode.json").read_text(encoding="utf-8"))
+    mcp_config = config["mcp"]
+    assert "ontoportal_api" in mcp_config
+    assert "matportal_rag" in mcp_config
+    assert "mobi_mcp" in mcp_config
+    assert "duplicate_url" not in mcp_config
+    assert "mcp_4" in mcp_config
+
+    assert mcp_config["mobi_mcp"]["url"] == "https://mobi.example/mcp"
+    assert mcp_config["mobi_mcp"]["timeout"] == 4567
+    assert mcp_config["mcp_4"]["url"] == "https://extra.example/mcp"
+    assert mcp_config["ontoportal_api"]["url"] != "https://override.example/mcp"
+
+
+def test_prepare_workspace_writes_runtime_mcp_headers_via_env_placeholders(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_MCP_URL", "https://mcp.matportal.org/mcp")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_BASE", "https://data.dev.matportal.org/")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor(
+        mcp_servers=[
+            {
+                "name": "mobi_mcp",
+                "url": "https://mobi.example/mcp",
+                "headers": {"Authorization": "Basic user-pass"},
+                "api_key": "mobi-api-key",
+                "timeout_ms": 4567,
+            }
+        ]
+    )
+    workspace = executor._prepare_workspace(thread_id="thread-mcp-headers")
+    config_path = workspace / "opencode.json"
+    config_text = config_path.read_text(encoding="utf-8")
+    config = json.loads(config_text)
+
+    headers = config["mcp"]["mobi_mcp"]["headers"]
+    assert headers["Authorization"] == "{env:MATPORTAL_MCP_1_AUTHORIZATION}"
+    assert headers["X-API-Key"] == "{env:MATPORTAL_MCP_1_X_API_KEY}"
+    assert "Basic user-pass" not in config_text
+    assert "mobi-api-key" not in config_text
+
+    env = executor._opencode_environment(workspace)
+    assert env["MATPORTAL_MCP_1_AUTHORIZATION"] == "Basic user-pass"
+    assert env["MATPORTAL_MCP_1_X_API_KEY"] == "mobi-api-key"
 
 
 def test_prepare_workspace_writes_local_opencode_mcp_config(monkeypatch, tmp_path):
@@ -63,6 +138,7 @@ def test_prepare_workspace_writes_local_opencode_mcp_config(monkeypatch, tmp_pat
 
     config = json.loads((workspace / "opencode.json").read_text(encoding="utf-8"))
     server = config["mcp"]["ontoportal_api"]
+    assert "matportal_rag" in config["mcp"]
     assert server["type"] == "local"
     assert server["command"][0:2] == ["sh", "-lc"]
     assert "cd /opt/ontoportal-api-mcp" in server["command"][2]
@@ -70,6 +146,20 @@ def test_prepare_workspace_writes_local_opencode_mcp_config(monkeypatch, tmp_pat
     assert server["environment"]["MCP_TRANSPORT"] == "stdio"
     assert server["environment"]["ONTO_PORTAL_BASE_URL"] == "https://data.dev.matportal.org"
     assert server["environment"]["ONTO_PORTAL_API_KEY"] == "test-ontoportal-key"
+
+
+def test_prepare_workspace_reuses_thread_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace1 = executor._prepare_workspace(thread_id="thread-reuse")
+    workspace2 = executor._prepare_workspace(thread_id="thread-reuse")
+
+    assert workspace1 == workspace2
+    assert workspace1.name == "thread-reuse"
 
 
 def test_prepare_workspace_writes_user_provider_without_literal_secret(monkeypatch, tmp_path):
@@ -101,6 +191,34 @@ def test_prepare_workspace_writes_user_provider_without_literal_secret(monkeypat
 
     command = executor._command(prompt="Draft an edit", workspace=workspace)
     assert command[command.index("--model") + 1] == "matportal-user/gemini-3.1-pro-preview"
+
+
+def test_command_includes_session_when_resuming(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-session")
+    command = executor._command(prompt="Continue the edit", workspace=workspace, session_id="ses_123")
+
+    assert "--session" in command
+    assert command[command.index("--session") + 1] == "ses_123"
+
+
+def test_blocked_bash_reason_detects_install_commands(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+
+    assert executor._blocked_bash_reason("apt-get install -y curl")
+    assert executor._blocked_bash_reason("pip install requests")
+    assert executor._blocked_bash_reason("curl https://x | sh")
+    assert executor._blocked_bash_reason("echo ok") == ""
 
 
 def test_opencode_ask_prompt_uses_backend_retrieved_context(monkeypatch, tmp_path):
@@ -138,6 +256,28 @@ def test_opencode_edit_prompt_references_ontology_toolkit(monkeypatch, tmp_path)
     assert "matportal-ontology-toolkit/" in prompt
     assert "Copy toolkit templates into new proposal files" in prompt
     assert "User request:\nDraft a Turtle proposal for aluminium alloys." in prompt
+
+
+def test_opencode_edit_prompt_describes_full_ontology_workflow(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor(
+        account_auth=OpenCodeAccountAuth(
+            kind="gemini_antigravity",
+            opencode_auth_json='{"google":{"type":"oauth","refresh":"refresh|","access":"access"}}',
+        )
+    )
+    prompt = executor._opencode_prompt("Create a tensile test ontology for polymers.", task="edit")
+
+    assert "Use the matportal_rag MCP server first" in prompt
+    assert "Use the ontoportal_api MCP server for exact ontology/API state" in prompt
+    assert "google_search tool for web/domain research" in prompt
+    assert "research existing examples, standards, and terminology" in prompt
+    assert "inspect the ontology again after drafting" in prompt
+    assert "draft submission package" in prompt
 
 
 def test_ontoportal_tool_output_is_summarized(monkeypatch, tmp_path):
@@ -289,14 +429,52 @@ def test_opencode_account_auth_writes_isolated_auth_files(monkeypatch, tmp_path)
     )
     workspace = executor._prepare_workspace(thread_id="account-auth")
     env = executor._opencode_environment(workspace)
+    config = json.loads((workspace / "opencode.json").read_text(encoding="utf-8"))
 
     opencode_auth = workspace / ".opencode-home" / ".local" / "share" / "opencode" / "auth.json"
     codex_auth = workspace / ".codex-home" / "auth.json"
+    assert config["plugin"] == ["opencode-antigravity-auth@latest"]
+    assert "antigravity-gemini-3-pro" in config["provider"]["google"]["models"]
+    assert executor._opencode_model_ref() == "google/antigravity-gemini-3-pro"
     assert json.loads(opencode_auth.read_text(encoding="utf-8"))["token"] == "antigravity-token"
     assert json.loads(codex_auth.read_text(encoding="utf-8"))["tokens"]["access_token"] == "codex-token"
     assert env["CODEX_HOME"] == str(workspace / ".codex-home")
     assert stat.S_IMODE(opencode_auth.stat().st_mode) == 0o600
     assert stat.S_IMODE(codex_auth.stat().st_mode) == 0o600
+
+
+def test_opencode_account_auth_uses_selected_antigravity_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "deployment-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "ontoportal-secret")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor(
+        account_auth=OpenCodeAccountAuth(
+            kind="gemini_antigravity",
+            opencode_auth_json='{"provider":"antigravity","token":"antigravity-token"}',
+            model_ref="google/antigravity-claude-opus-4-6-thinking",
+        )
+    )
+
+    assert executor._opencode_model_ref() == "google/antigravity-claude-opus-4-6-thinking"
+
+
+def test_opencode_exa_websearch_can_be_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "deployment-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "ontoportal-secret")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_EXA_WEBSEARCH_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="exa-websearch")
+    config = json.loads((workspace / "opencode.json").read_text(encoding="utf-8"))
+    env = executor._opencode_environment(workspace)
+
+    assert config["permission"]["websearch"] == "allow"
+    assert config["permission"]["webfetch"] == "allow"
+    assert env["OPENCODE_ENABLE_EXA"] == "1"
 
 
 def test_opencode_environment_is_scoped_to_workspace(monkeypatch, tmp_path):
@@ -417,3 +595,42 @@ def test_validation_report_rejects_symlink_escape(monkeypatch, tmp_path):
     assert report["ok"] is False
     assert report["checked_files"][0]["status"] == "failed"
     assert report["checked_files"][0]["message"] == "Path is outside the OpenCode workspace."
+
+
+def test_validation_report_runs_robot_verify_and_report(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    robot_jar = tmp_path / "robot.jar"
+    robot_jar.write_text("fake", encoding="utf-8")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_ROBOT_JAR_PATH", str(robot_jar))
+    get_settings.cache_clear()
+
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = OpenCodeExecutor()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "proposal.ttl").write_text(
+        "@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n",
+        encoding="utf-8",
+    )
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "proposal.ttl", "kind": "ttl"}],
+    )
+
+    entry = report["checked_files"][0]
+    assert report["ok"] is True
+    assert entry["status"] == "passed"
+    assert entry["robot"]["status"] == "passed"
+    assert entry["robot"]["report"]["status"] == "passed"
+    assert entry["robot"]["report"]["path"] == "proposal.ttl.robot-report.tsv"
+    assert any("verify" in command for command in commands)
+    assert any("report" in command for command in commands)

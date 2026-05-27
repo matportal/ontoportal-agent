@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 
 from rdflib import Graph
 
+from .antigravity_models import antigravity_opencode_provider_config, normalize_antigravity_model_ref
 from .config import AgentSettings, get_settings
 
 _ONTOLOGY_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
@@ -31,10 +32,21 @@ _SECRET_PATTERNS = (
     (re.compile(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"), r"\1[redacted]"),
     (re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s\"']+"), r"\1[redacted]"),
 )
+_BLOCKED_BASH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(^|\s)(apt|apt-get)\s+install(\s|$)", re.IGNORECASE), "system package installation is blocked"),
+    (re.compile(r"(^|\s)(dnf|yum|apk|pacman|zypper)\s+install(\s|$)", re.IGNORECASE), "system package installation is blocked"),
+    (re.compile(r"(^|\s)(pip|pip3)\s+install(\s|$)", re.IGNORECASE), "python package installation is blocked"),
+    (re.compile(r"(^|\s)npm\s+install(\s|$)", re.IGNORECASE), "node package installation is blocked"),
+    (re.compile(r"(^|\s)(curl|wget)\b[^\n]*\|\s*(sh|bash)\b", re.IGNORECASE), "remote shell execution is blocked"),
+    (re.compile(r"(^|\s)sudo(\s|$)", re.IGNORECASE), "privilege escalation is blocked"),
+    (re.compile(r"(^|\s)(shutdown|reboot|poweroff|halt)(\s|$)", re.IGNORECASE), "host power control is blocked"),
+    (re.compile(r"(^|\s)(mkfs|fdisk|parted)(\s|$)", re.IGNORECASE), "disk formatting commands are blocked"),
+)
 _USER_PROVIDER_ID = "matportal-user"
 _USER_PROVIDER_API_KEY_ENV = "MATPORTAL_OPENCODE_API_KEY"
 _OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible"
 _ONTOLOGY_TOOLKIT_DIR = "matportal-ontology-toolkit"
+_ANTIGRAVITY_AUTH_KIND = "gemini_antigravity"
 _OPENCODE_ENV_PASSTHROUGH = {
     "ALL_PROXY",
     "HTTPS_PROXY",
@@ -77,6 +89,7 @@ class OpenCodeAccountAuth:
     kind: str
     opencode_auth_json: str | None = field(default=None, repr=False)
     codex_auth_json: str | None = field(default=None, repr=False)
+    model_ref: str | None = None
 
 
 @dataclass
@@ -90,6 +103,8 @@ class OpenCodeExecutionResult:
     final_text: str = ""
     exit_code: int = 0
     timed_out: bool = False
+    blocked: bool = False
+    blocked_reason: str = ""
     console_lines: list[str] = field(default_factory=list)
     changed_files: list[dict[str, Any]] = field(default_factory=list)
     diff_summary: dict[str, Any] = field(default_factory=dict)
@@ -106,6 +121,8 @@ class OpenCodeExecutionResult:
             "model": self.model,
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
+            "blocked": self.blocked,
+            "blocked_reason": self.blocked_reason,
             "logs": self.console_lines,
             "changed_files": self.changed_files,
             "diff_summary": self.diff_summary,
@@ -121,10 +138,13 @@ class OpenCodeExecutor:
         settings: AgentSettings | None = None,
         provider_auth: OpenCodeProviderAuth | None = None,
         account_auth: OpenCodeAccountAuth | None = None,
+        mcp_servers: list[str | dict[str, Any]] | None = None,
     ):
         self.settings = settings or get_settings()
         self.provider_auth = provider_auth
         self.account_auth = account_auth
+        self.mcp_servers = list(mcp_servers or [])
+        self._runtime_mcp_secret_env: dict[str, str] = {}
 
     def stream(
         self,
@@ -135,12 +155,18 @@ class OpenCodeExecutor:
         task: str = "edit",
         retrieved_context: str = "",
         citation_labels: list[str] | None = None,
+        resume_workspace: str | None = None,
+        resume_session_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         run_id = uuid.uuid4().hex
         expires_at = (
             datetime.now(timezone.utc) + timedelta(days=max(1, int(self.settings.opencode_artifact_retention_days)))
         ).isoformat()
-        workspace = self._prepare_workspace(thread_id=thread_id, run_id=run_id)
+        workspace = self._prepare_workspace(
+            thread_id=thread_id,
+            run_id=run_id,
+            resume_workspace=resume_workspace,
+        )
         result = OpenCodeExecutionResult(
             ok=False,
             workspace=str(workspace),
@@ -172,6 +198,7 @@ class OpenCodeExecutor:
             task=task,
             retrieved_context=retrieved_context,
             citation_labels=citation_labels,
+            session_id=resume_session_id,
         )
         self._append_console_line(result, f"$ {' '.join(command)}")
         yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
@@ -239,21 +266,40 @@ class OpenCodeExecutor:
 
         return result
 
-    def _prepare_workspace(self, *, thread_id: str | None, run_id: str | None = None) -> Path:
+    def _prepare_workspace(
+        self,
+        *,
+        thread_id: str | None,
+        run_id: str | None = None,
+        resume_workspace: str | None = None,
+    ) -> Path:
         root = self.settings.ontology_workdir / self.settings.opencode_workspace_subdir
         root.mkdir(parents=True, exist_ok=True)
         self._chmod_private(root, 0o700)
-        token = str(thread_id or "standalone").replace("/", "-")
-        workspace = root / f"{token}-{run_id or int(time.time())}"
+        workspace: Path
+        if resume_workspace:
+            workspace = Path(resume_workspace)
+        elif thread_id:
+            token = str(thread_id).replace("/", "-")
+            workspace = root / token
+        else:
+            token = "standalone"
+            workspace = root / f"{token}-{run_id or int(time.time())}"
+        is_new_workspace = not workspace.exists()
         workspace.mkdir(parents=True, exist_ok=True)
         self._chmod_private(workspace, 0o700)
+        self._runtime_mcp_secret_env = {}
 
         config = {
             "$schema": "https://opencode.ai/config.json",
-            "mcp": {
-                self.settings.opencode_mcp_name: self._opencode_mcp_config(),
-            },
+            "mcp": self._opencode_mcp_configs(),
         }
+        plugins = self._opencode_plugins()
+        if plugins:
+            config["plugin"] = plugins
+        permissions = self._opencode_permissions()
+        if permissions:
+            config["permission"] = permissions
         if self.provider_auth:
             config["provider"] = {
                 self.provider_auth.provider_id: {
@@ -270,6 +316,8 @@ class OpenCodeExecutor:
                     },
                 }
             }
+        elif self._uses_antigravity_account_auth():
+            config["provider"] = antigravity_opencode_provider_config()
         config_path = workspace / "opencode.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         self._chmod_private(config_path, 0o600)
@@ -279,9 +327,11 @@ class OpenCodeExecutor:
                     "# OpenCode Ontology Workspace",
                     "",
                     "This workspace is disposable.",
-                    "- Inspect ontology state through the ontoportal_api MCP server.",
+                    "- Use the matportal_rag MCP server for semantic retrieval and source chunks.",
+                    "- Use the ontoportal_api MCP server for exact ontology/API state and full ontology access.",
+                    "- If Antigravity auth is active, use google_search for domain research with citations.",
                     f"- Use `{_ONTOLOGY_TOOLKIT_DIR}/` for proposal templates and review checklists.",
-                    "- Write proposed ontology changes into files under this directory.",
+                    "- Write proposed ontology changes into files under this directory and prepare a draft submission bundle.",
                     "- Copy toolkit templates into new proposal files; do not edit toolkit files unless asked.",
                     "- Do not commit, push, or modify remotes.",
                 ]
@@ -289,7 +339,8 @@ class OpenCodeExecutor:
             encoding="utf-8",
         )
         self._write_ontology_toolkit(workspace)
-        self._init_git_repo(workspace)
+        if is_new_workspace or not (workspace / ".git").exists():
+            self._init_git_repo(workspace)
         self._write_workspace_excludes(workspace)
         return workspace
 
@@ -328,6 +379,7 @@ class OpenCodeExecutor:
             "proposal-template.ttl": self._ontology_turtle_template(),
             "operator-report-template.md": self._operator_report_template(),
             "review-checklist.json": self._review_checklist_template(),
+            "draft-submission-template.md": self._draft_submission_template(),
         }
         for name, content in files.items():
             (toolkit / name).write_text(content, encoding="utf-8")
@@ -340,11 +392,14 @@ class OpenCodeExecutor:
                 "Use these files as references when preparing ontology edit artifacts.",
                 "",
                 "Expected workflow:",
-                "1. Inspect the relevant ontology/API state through the configured MCP server.",
-                "2. Copy `proposal-template.ttl` into a new `.ttl` file for RDF/Turtle proposals.",
-                "3. Copy `operator-report-template.md` into a new review note when the edit needs explanation.",
-                "4. Keep generated artifacts at the workspace root or in a purpose-named subdirectory.",
-                "5. Finish with a short summary naming changed files, validation status, and assumptions.",
+                "1. Use `matportal_rag` first to retrieve source chunks and terminology relevant to the request.",
+                "2. Use `ontoportal_api` to inspect exact ontology metadata, terms, classes, submissions, and full ontology files when needed.",
+                "3. Use provider web search only when needed for domain modeling; with Antigravity, prefer `google_search` and cite sources.",
+                "4. Write an edit plan before drafting, then inspect the ontology again after drafting or validation feedback.",
+                "5. Copy `proposal-template.ttl` into a new `.ttl` file for RDF/Turtle proposals.",
+                "6. Copy `operator-report-template.md` and `draft-submission-template.md` for review notes and a draft submission package.",
+                "7. Keep generated artifacts at the workspace root or in a purpose-named subdirectory.",
+                "8. Finish with a short summary naming changed files, validation status, search/provenance, and assumptions.",
                 "",
                 "Do not put credentials, API keys, or absolute local paths into generated artifacts.",
                 "Do not edit toolkit files unless the user explicitly asks for a toolkit change.",
@@ -382,12 +437,22 @@ class OpenCodeExecutor:
                 "- User request:",
                 "",
                 "## Inspected Context",
-                "- Ontologies/API endpoints checked:",
-                "- Relevant source terms:",
+                "- RAG chunks checked:",
+                "- OntoPortal API tools/endpoints checked:",
+                "- Full ontology files inspected:",
+                "- Web sources checked:",
+                "",
+                "## Edit Plan",
+                "-",
                 "",
                 "## Proposed Artifacts",
                 "- Files changed:",
                 "- Validation result:",
+                "- Draft submission bundle:",
+                "",
+                "## Provenance",
+                "- Ontology/API evidence:",
+                "- Web citations:",
                 "",
                 "## Assumptions",
                 "-",
@@ -402,16 +467,52 @@ class OpenCodeExecutor:
         return json.dumps(
             {
                 "checks": [
-                    "Relevant ontology/API state inspected",
+                    "RAG chunks inspected before drafting",
+                    "Exact ontology/API state inspected before drafting",
+                    "Ontology state inspected again after drafting or validation",
+                    "Domain web research performed when requested or needed",
+                    "Web sources are cited in operator notes when used",
                     "Generated RDF parses successfully when applicable",
+                    "ROBOT verify/report was run or explicitly marked unavailable",
                     "New terms have labels and definitions where appropriate",
                     "Mappings or external references use stable IRIs",
+                    "Draft submission package is present for human review",
                     "Operator notes list assumptions and follow-up actions",
                     "No secrets or absolute local paths are present",
                 ]
             },
             indent=2,
         ) + "\n"
+
+    def _draft_submission_template(self) -> str:
+        return "\n".join(
+            [
+                "# Draft MatPortal Submission",
+                "",
+                "## Target Ontology",
+                "- Acronym:",
+                "- Latest submission inspected:",
+                "- Base ontology/version IRI:",
+                "",
+                "## Files",
+                "- Proposed ontology artifact:",
+                "- Operator report:",
+                "- Validation report:",
+                "",
+                "## Submission Metadata",
+                "- Version:",
+                "- Released:",
+                "- Status: draft",
+                "- Description:",
+                "",
+                "## Human Approval Checklist",
+                "- Review class/property IRIs and namespace choices.",
+                "- Review provenance and citations.",
+                "- Review ROBOT report warnings.",
+                "- Confirm whether to publish or request revisions.",
+                "",
+            ]
+        )
 
     def _opencode_environment(self, workspace: Path) -> dict[str, str]:
         env = {
@@ -439,6 +540,10 @@ class OpenCodeExecutor:
             env["CODEX_HOME"] = str(codex_home)
         if self.provider_auth:
             env[self.provider_auth.env_api_key_name] = self.provider_auth.api_key
+        for key, value in self._runtime_mcp_secret_env.items():
+            env[key] = value
+        if self.settings.opencode_exa_websearch_enabled:
+            env["OPENCODE_ENABLE_EXA"] = "1"
         return env
 
     def _write_private_json_file(self, path: Path, raw_json: str) -> None:
@@ -487,6 +592,9 @@ class OpenCodeExecutor:
                 if not raw_line:
                     continue
                 yield from self._events_for_stdout_line(raw_line=raw_line, result=result)
+                if result.blocked:
+                    self._terminate_process_group(process)
+                    break
 
             if timed_out:
                 self._append_console_line(
@@ -548,6 +656,123 @@ class OpenCodeExecutor:
         except (subprocess.TimeoutExpired, OSError):
             pass
 
+    def _opencode_mcp_configs(self) -> dict[str, dict[str, Any]]:
+        configs: dict[str, dict[str, Any]] = {}
+        seen_urls: set[str] = set()
+
+        def register(name: str, config: dict[str, Any]) -> None:
+            clean_name = str(name or "").strip()
+            if not clean_name or clean_name in configs:
+                return
+            url = str(config.get("url") or "").strip()
+            if url and url in seen_urls:
+                return
+            configs[clean_name] = config
+            if url:
+                seen_urls.add(url)
+
+        register(self.settings.opencode_mcp_name, self._opencode_mcp_config())
+        rag_name = str(self.settings.opencode_rag_mcp_name or "").strip()
+        if rag_name:
+            register(rag_name, self._opencode_rag_mcp_config())
+        for index, server in enumerate(self.mcp_servers, start=1):
+            resolved = self._runtime_mcp_server_config(server=server, index=index)
+            if not resolved:
+                continue
+            register(resolved["name"], resolved["config"])
+        return configs
+
+    def _runtime_mcp_server_config(
+        self,
+        *,
+        server: str | dict[str, Any],
+        index: int,
+    ) -> dict[str, Any] | None:
+        if isinstance(server, str):
+            endpoint = str(server).strip()
+            if not endpoint:
+                return None
+            return {
+                "name": f"mcp_{index}",
+                "config": {
+                    "type": "remote",
+                    "url": endpoint,
+                    "enabled": True,
+                    "timeout": self.settings.opencode_rag_mcp_timeout_ms,
+                },
+            }
+
+        endpoint = str(server.get("url") or "").strip()
+        if not endpoint:
+            return None
+        timeout = server.get("timeout_ms")
+        try:
+            timeout_ms = int(timeout)
+        except (TypeError, ValueError):
+            timeout_ms = 0
+        if timeout_ms <= 0:
+            timeout_ms = self.settings.opencode_rag_mcp_timeout_ms
+        name = str(server.get("name") or "").strip() or f"mcp_{index}"
+        headers = self._runtime_mcp_headers(server=server, index=index)
+        config: dict[str, Any] = {
+            "type": "remote",
+            "url": endpoint,
+            "enabled": True,
+            "timeout": timeout_ms,
+        }
+        if headers:
+            config["headers"] = headers
+        return {
+            "name": name,
+            "config": config,
+        }
+
+    def _runtime_mcp_headers(self, *, server: dict[str, Any], index: int) -> dict[str, str]:
+        literal_headers: dict[str, str] = {}
+        raw_headers = server.get("headers")
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                header_name = str(key or "").strip()
+                if not header_name:
+                    continue
+                header_value = str(value or "").strip()
+                if not header_value:
+                    continue
+                literal_headers[header_name] = header_value
+        api_key = str(server.get("api_key") or "").strip()
+        if api_key and not any(key.lower() == "x-api-key" for key in literal_headers):
+            literal_headers["X-API-Key"] = api_key
+
+        rendered_headers: dict[str, str] = {}
+        for header_name, value in literal_headers.items():
+            env_name = self._runtime_mcp_env_var_name(index=index, header_name=header_name)
+            self._runtime_mcp_secret_env[env_name] = value
+            rendered_headers[header_name] = f"{{env:{env_name}}}"
+        return rendered_headers
+
+    def _runtime_mcp_env_var_name(self, *, index: int, header_name: str) -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9]", "_", header_name.strip().upper()).strip("_")
+        if not safe_name:
+            safe_name = "HEADER"
+        return f"MATPORTAL_MCP_{index}_{safe_name}"
+
+    def _opencode_plugins(self) -> list[str]:
+        if self._uses_antigravity_account_auth():
+            plugin = str(self.settings.opencode_antigravity_plugin or "").strip()
+            return [plugin] if plugin else []
+        return []
+
+    def _opencode_permissions(self) -> dict[str, str]:
+        if self.settings.opencode_exa_websearch_enabled:
+            return {
+                "websearch": "allow",
+                "webfetch": "allow",
+            }
+        return {}
+
+    def _uses_antigravity_account_auth(self) -> bool:
+        return bool(self.account_auth and str(self.account_auth.kind or "").strip().lower() == _ANTIGRAVITY_AUTH_KIND)
+
     def _opencode_mcp_config(self) -> dict[str, Any]:
         if self.settings.opencode_mcp_mode == "local":
             return {
@@ -564,6 +789,17 @@ class OpenCodeExecutor:
             "enabled": True,
             "timeout": self.settings.opencode_mcp_timeout_ms,
         }
+
+    def _opencode_rag_mcp_config(self) -> dict[str, Any]:
+        return {
+            "type": "remote",
+            "url": self._opencode_rag_mcp_url(),
+            "enabled": True,
+            "timeout": self.settings.opencode_rag_mcp_timeout_ms,
+        }
+
+    def _opencode_rag_mcp_url(self) -> str:
+        return str(self.settings.opencode_rag_mcp_url or "").strip() or self.settings.rag_base_url.rstrip("/") + "/mcp"
 
     def _opencode_mcp_url(self) -> str:
         query = urlencode(
@@ -600,6 +836,7 @@ class OpenCodeExecutor:
         task: str = "edit",
         retrieved_context: str = "",
         citation_labels: list[str] | None = None,
+        session_id: str | None = None,
     ) -> list[str]:
         command = [
             self.settings.opencode_path,
@@ -612,6 +849,8 @@ class OpenCodeExecutor:
         model_ref = self._opencode_model_ref()
         if model_ref:
             command.extend(["--model", model_ref])
+        if session_id:
+            command.extend(["--session", str(session_id)])
         command.append(
             self._opencode_prompt(
                 prompt,
@@ -625,6 +864,11 @@ class OpenCodeExecutor:
     def _opencode_model_ref(self) -> str:
         if self.provider_auth:
             return self.provider_auth.model_ref
+        if self._uses_antigravity_account_auth():
+            return normalize_antigravity_model_ref(
+                self.account_auth.model_ref if self.account_auth else None,
+                default=self.settings.opencode_antigravity_model or self.settings.opencode_model or "",
+            )
         return self.settings.opencode_model or ""
 
     def _opencode_prompt(
@@ -651,18 +895,28 @@ class OpenCodeExecutor:
                 "Return only the answer text."
             )
 
-        mcp_name = self.settings.opencode_mcp_name
+        api_mcp_name = self.settings.opencode_mcp_name
+        rag_mcp_name = self.settings.opencode_rag_mcp_name
+        search_guidance = (
+            "- Antigravity auth is active: use the google_search tool for web/domain research when current external evidence is needed.\n"
+            if self._uses_antigravity_account_auth()
+            else "- Do not assume provider-native web search is available; if no explicit search tool is present, continue with RAG/API evidence and note the limitation.\n"
+        )
         return (
             "You are preparing an ontology-edit proposal for MatPortal.\n"
             "Mandatory rules:\n"
-            f"- Use the {mcp_name} MCP server to inspect the ontology/API state relevant to this request before editing.\n"
+            f"- Use the {rag_mcp_name} MCP server first for semantic retrieval, source chunks, and terminology discovery.\n"
+            f"- Use the {api_mcp_name} MCP server for exact ontology/API state, classes, submissions, metadata, and full ontology inspection.\n"
+            "- If the edit creates domain content or the user asks for ontology creation, research existing examples, standards, and terminology before modeling.\n"
+            f"{search_guidance}"
+            "- Write an edit plan before drafting artifacts, then inspect the ontology again after drafting or validation feedback.\n"
             "- Work only inside the current workspace.\n"
             f"- Use the `{_ONTOLOGY_TOOLKIT_DIR}/` templates and checklist as references for ontology artifacts and review notes.\n"
             "- Copy toolkit templates into new proposal files; do not edit toolkit files unless the user explicitly asks.\n"
             "- Do not commit, push, or access git remotes.\n"
-            "- Write proposed artifacts and notes into files in this workspace.\n"
+            "- Write proposed artifacts, operator notes, provenance, and a draft submission package into files in this workspace.\n"
             "- Prefer Turtle (.ttl) unless the user explicitly requests another format.\n"
-            "- Finish with a concise operator-facing summary of the proposed changes.\n\n"
+            "- Finish with a concise operator-facing summary of proposed changes, validation status, sources used, and remaining assumptions.\n\n"
             f"User request:\n{prompt.strip()}"
         )
 
@@ -706,6 +960,17 @@ class OpenCodeExecutor:
         if event_type == "tool_use":
             tool = str(part.get("tool") or "tool").strip()
             state = part.get("state") or {}
+            if self.settings.opencode_block_dangerous_commands and tool == "bash":
+                command = str((state.get("input") or {}).get("command") or "").strip()
+                blocked_reason = self._blocked_bash_reason(command)
+                if blocked_reason:
+                    result.blocked = True
+                    result.blocked_reason = blocked_reason
+                    denial = f"Blocked OpenCode command: {blocked_reason}."
+                    self._append_console_line(result, denial)
+                    events.append({"type": "opencode_phase", "content": {"label": "Blocked unsafe command"}})
+                    events.append({"type": "terminal_log", "content": {"line": denial}})
+                    return events
             title = str(state.get("title") or state.get("input", {}).get("description") or tool).strip()
             header = f"[{tool}] {title}"
             self._append_console_line(result, header)
@@ -766,6 +1031,15 @@ class OpenCodeExecutor:
         if exit_code is not None:
             details.append(f"exit: {exit_code}")
         return details
+
+    def _blocked_bash_reason(self, command: str) -> str:
+        text = str(command or "").strip()
+        if not text:
+            return ""
+        for pattern, reason in _BLOCKED_BASH_PATTERNS:
+            if pattern.search(text):
+                return reason
+        return ""
 
     def _summarize_tool_output(self, *, tool: str, output_text: str) -> list[str]:
         if tool.startswith("ontoportal_api_"):
@@ -943,6 +1217,9 @@ class OpenCodeExecutor:
                 errors.append({"path": path_text, "message": str(entry.get("message") or "Validation failed.")})
             elif entry.get("status") == "skipped":
                 warnings.append({"path": path_text, "message": str(entry.get("message") or "Validation skipped.")})
+            robot_check = entry.get("robot")
+            if isinstance(robot_check, dict) and robot_check.get("status") in {"skipped", "unavailable"}:
+                warnings.append({"path": path_text, "message": str(robot_check.get("message") or "ROBOT validation unavailable.")})
 
         passed = sum(1 for item in checked_files if item.get("status") == "passed")
         failed = sum(1 for item in checked_files if item.get("status") == "failed")
@@ -981,12 +1258,24 @@ class OpenCodeExecutor:
             graph = Graph()
             try:
                 graph.parse(path, format=rdf_format)
+                robot_check = self._validate_robot_file(path=path, display_path=display_path)
+                if robot_check.get("status") == "failed":
+                    return {
+                        "path": display_path,
+                        "kind": path.suffix.lstrip("."),
+                        "status": "failed",
+                        "parser": rdf_format,
+                        "triples": len(graph),
+                        "robot": robot_check,
+                        "message": str(robot_check.get("message") or "ROBOT validation failed."),
+                    }
                 return {
                     "path": display_path,
                     "kind": path.suffix.lstrip("."),
                     "status": "passed",
                     "parser": rdf_format,
                     "triples": len(graph),
+                    "robot": robot_check,
                 }
             except Exception as exc:
                 last_error = self._format_validation_error(exc, workspace=path.parent)
@@ -996,6 +1285,109 @@ class OpenCodeExecutor:
             "status": "failed",
             "message": last_error or "RDF parser rejected the artifact.",
         }
+
+    def _validate_robot_file(self, *, path: Path, display_path: str) -> dict[str, Any]:
+        command = self._robot_command("verify", path)
+        if command is None:
+            return {
+                "status": "unavailable",
+                "message": "ROBOT is not configured in this runtime.",
+            }
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(path.parent),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "failed",
+                "tool": command[0],
+                "command": self._redacted_command(command, workspace=path.parent),
+                "message": "ROBOT verify timed out after 60 seconds.",
+            }
+        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
+        message = self._truncate_console_line(output, max_chars=400) if output else ""
+        if completed.returncode == 0:
+            result = {
+                "status": "passed",
+                "tool": command[0],
+                "command": self._redacted_command(command, workspace=path.parent),
+                "message": message or "ROBOT verify passed.",
+            }
+            report_result = self._build_robot_report(path=path)
+            if report_result:
+                result["report"] = report_result
+            return result
+        return {
+            "status": "failed",
+            "tool": command[0],
+            "command": self._redacted_command(command, workspace=path.parent),
+            "message": message or f"ROBOT verify failed for {display_path}.",
+        }
+
+    def _build_robot_report(self, *, path: Path) -> dict[str, Any] | None:
+        output_path = path.with_name(f"{path.name}.robot-report.tsv")
+        command = self._robot_command("report", path, output_path=output_path)
+        if command is None:
+            return None
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(path.parent),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "failed",
+                "path": output_path.name,
+                "message": "ROBOT report timed out after 60 seconds.",
+            }
+        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
+        message = self._truncate_console_line(output, max_chars=400) if output else ""
+        if completed.returncode == 0:
+            return {
+                "status": "passed",
+                "path": output_path.name,
+                "message": message or "ROBOT report generated.",
+            }
+        return {
+            "status": "failed",
+            "path": output_path.name,
+            "message": message or "ROBOT report failed.",
+        }
+
+    def _robot_command(self, action: str, path: Path, *, output_path: Path | None = None) -> list[str] | None:
+        if not bool(self.settings.opencode_robot_enabled):
+            return None
+        action = str(action or "").strip()
+        if action not in {"verify", "report"}:
+            return None
+        args = [action, "--input", str(path)]
+        if output_path is not None:
+            args.extend(["--output", str(output_path)])
+        robot_jar = self.settings.opencode_robot_jar_path
+        if robot_jar and robot_jar.exists():
+            return [
+                self.settings.opencode_robot_java_path,
+                "-jar",
+                str(robot_jar),
+                *args,
+            ]
+        robot_path = shutil.which("robot")
+        if robot_path:
+            return [robot_path, *args]
+        return None
+
+    def _redacted_command(self, command: list[str], *, workspace: Path) -> list[str]:
+        workspace_text = str(workspace)
+        return [str(item).replace(workspace_text, "<workspace>") for item in command]
 
     def _validate_json_file(self, *, path: Path, display_path: str) -> dict[str, Any]:
         try:

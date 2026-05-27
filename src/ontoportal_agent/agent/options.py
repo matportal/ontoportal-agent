@@ -24,3 +24,4 @@ class AgentRuntimeOptions:
     opencode_auth_kind: str | None = None
     opencode_auth_json: str | None = None
     codex_auth_json: str | None = None
+    opencode_antigravity_model: str | None = None
