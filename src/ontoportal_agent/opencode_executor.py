@@ -101,6 +101,7 @@ class OpenCodeExecutionResult:
     expires_at: str
     session_id: str | None = None
     model: str | None = None
+    runtime: str = "opencode"
     final_text: str = ""
     exit_code: int = 0
     timed_out: bool = False
@@ -114,7 +115,7 @@ class OpenCodeExecutionResult:
 
     def execution_payload(self) -> dict[str, Any]:
         return {
-            "mode": "opencode",
+            "mode": self.runtime,
             "ok": self.ok,
             "run_id": self.run_id,
             "workspace": self.workspace,

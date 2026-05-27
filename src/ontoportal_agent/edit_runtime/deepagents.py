@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import StructuredTool
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from ..agent.options import AgentRuntimeOptions
+from ..artifact_store import ArtifactAccessError, assert_artifact_safe_for_exposure, sanitize_artifact_path
+from ..config import AgentSettings, get_settings
+from ..mcp_client import McpClient
+from ..opencode_executor import OpenCodeExecutionResult, OpenCodeExecutor
+from ..rag_client import RagClient
+from .base import EditRuntimeCapabilities, EditRuntimeRequest
+
+
+class DeepAgentsRuntimeError(RuntimeError):
+    status_code = 503
+
+
+class _ArtifactWriteInput(BaseModel):
+    path: str = Field(..., description="Relative artifact path inside the assistant workspace")
+    content: str = Field(..., description="Complete UTF-8 text content to write")
+
+
+class _ArtifactReadInput(BaseModel):
+    path: str = Field(..., description="Relative artifact path inside the assistant workspace")
+
+
+class _RagQueryInput(BaseModel):
+    query: str = Field(..., description="Ontology or materials-domain question to retrieve evidence for")
+    top_k: int | None = Field(default=None, description="Optional number of chunks to retrieve")
+
+
+class _McpInvokeInput(BaseModel):
+    tool_name: str = Field(..., description="Name of the configured MCP tool to invoke")
+    arguments_json: str = Field(default="{}", description="JSON object string containing tool arguments")
+
+
+class DeepAgentsEditRuntime:
+    """LangChain Deep Agents based edit runtime for ontology workspaces.
+
+    This adapter deliberately reuses the existing OpenCode workspace/finalization
+    boundary so artifacts, diffs, validation, expiry, and session persistence keep
+    the same backend/UI contract while the agent loop can be swapped.
+    """
+
+    capabilities = EditRuntimeCapabilities(
+        runtime="deepagents",
+        supports_sessions=False,
+        supports_cancel=False,
+        supports_mcp=True,
+        supports_artifacts=True,
+    )
+
+    runtime = "deepagents"
+
+    def __init__(
+        self,
+        *,
+        settings: AgentSettings | None = None,
+        runtime_options: AgentRuntimeOptions | None = None,
+        mcp_servers: list[dict[str, Any] | str] | None = None,
+        model: Any | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.runtime_options = runtime_options
+        self.mcp_servers = list(mcp_servers or [])
+        self.model = model
+        self._workspace_manager = OpenCodeExecutor(settings=self.settings, mcp_servers=self.mcp_servers)
+
+    def stream(self, request: EditRuntimeRequest) -> Iterator[dict[str, Any]]:
+        if not self.settings.deepagents_enabled:
+            raise DeepAgentsRuntimeError("Deep Agents edit runtime is disabled by ONTOAGENT_DEEPAGENTS_ENABLED.")
+        run_id = uuid.uuid4().hex
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=max(1, int(self.settings.opencode_artifact_retention_days)))
+        ).isoformat()
+        workspace = self._workspace_manager._prepare_workspace(
+            thread_id=request.thread_id,
+            run_id=run_id,
+            resume_workspace=request.resume_workspace,
+        )
+        result = OpenCodeExecutionResult(
+            ok=False,
+            workspace=str(workspace),
+            run_id=run_id,
+            expires_at=expires_at,
+            session_id=request.resume_session_id or run_id,
+            model=self._model_label(),
+            runtime=self.runtime,
+        )
+
+        yield {
+            "type": "workspace_mode",
+            "content": {
+                "mode": "execution",
+                "runtime": self.runtime,
+                "run_id": run_id,
+                "workspace": str(workspace),
+                "expires_at": expires_at,
+                "title": "Deep Agents workspace",
+            },
+        }
+        yield {"type": "opencode_phase", "content": {"label": "Preparing Deep Agents workspace", "run_id": run_id, "workspace": str(workspace), "runtime": self.runtime}}
+
+        try:
+            final_text = yield from self._run_deep_agent(request=request, workspace=workspace, result=result)
+            result.final_text = final_text.strip() or "Deep Agents completed the ontology edit workspace."
+            result.exit_code = 0
+        except Exception as exc:  # noqa: BLE001 - convert runtime failures to the established result contract.
+            result.exit_code = int(getattr(exc, "status_code", 1) or 1)
+            result.final_text = str(exc) or exc.__class__.__name__
+            self._append_console_line(result, f"Deep Agents failed: {result.final_text}")
+            yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+
+        self._workspace_manager._finalize_workspace(workspace=workspace, result=result)
+        yield {"type": "changed_files", "content": result.changed_files}
+        yield {"type": "diff_summary", "content": result.diff_summary}
+        yield {"type": "artifact_candidates", "content": result.artifact_candidates}
+        yield {"type": "validation_report", "content": result.validation_report}
+
+        result.ok = result.exit_code == 0 and bool(result.validation_report.get("ok", True))
+        if result.ok:
+            yield {"type": "opencode_phase", "content": {"label": "Deep Agents workspace complete", "workspace": str(workspace), "runtime": self.runtime}}
+        else:
+            yield {
+                "type": "opencode_phase",
+                "content": {
+                    "label": "Deep Agents workspace failed",
+                    "workspace": str(workspace),
+                    "runtime": self.runtime,
+                    "exit_code": result.exit_code,
+                },
+            }
+        return result
+
+    def _run_deep_agent(self, *, request: EditRuntimeRequest, workspace: Path, result: OpenCodeExecutionResult) -> Iterator[str]:
+        try:
+            from deepagents import create_deep_agent
+            from deepagents.backends import StateBackend
+            from deepagents.middleware import FilesystemPermission
+        except Exception as exc:  # pragma: no cover - covered in integration environments with optional dep absent.
+            raise DeepAgentsRuntimeError("Python package deepagents is not installed in the assistant runtime.") from exc
+
+        tools = self._tools(workspace=workspace, result=result)
+        model = self.model or self._build_model()
+        agent = create_deep_agent(
+            model=model,
+            tools=tools,
+            system_prompt=self._system_prompt(workspace),
+            backend=StateBackend(),
+            permissions=[FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny")],
+            interrupt_on=None,
+            debug=False,
+            name="matportal-deepagents-edit",
+        )
+        prompt = self._user_prompt(request)
+        self._append_console_line(result, "Deep Agents run started.")
+        yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+        final_state = agent.invoke({"messages": [HumanMessage(content=prompt)]})
+        final_text = self._extract_final_text(final_state)
+        self._append_console_line(result, "Deep Agents run finished.")
+        yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+        return final_text
+
+    def _build_model(self) -> ChatOpenAI:
+        options = self.runtime_options
+        api_key = str(getattr(options, "openai_api_key", "") or self.settings.openai_api_key or "")
+        base_url = str(getattr(options, "openai_api_base", "") or self.settings.openai_api_base or "") or None
+        model = str(self.settings.deepagents_model or getattr(options, "llm_model", "") or self.settings.llm_model or "").strip()
+        if not api_key:
+            raise DeepAgentsRuntimeError("Deep Agents runtime requires a configured generation API key.")
+        if not model:
+            raise DeepAgentsRuntimeError("Deep Agents runtime requires a configured model.")
+        return ChatOpenAI(api_key=api_key, base_url=base_url, model=model, temperature=0.0)
+
+    def _model_label(self) -> str:
+        configured = str(self.settings.deepagents_model or getattr(self.runtime_options, "llm_model", "") or self.settings.llm_model or "").strip()
+        return f"deepagents/{configured or 'default'}"
+
+    def _tools(self, *, workspace: Path, result: OpenCodeExecutionResult) -> list[StructuredTool]:
+        def write_artifact(path: str, content: str) -> dict[str, Any]:
+            safe = sanitize_artifact_path(path)
+            target = (workspace / safe).resolve()
+            target.relative_to(workspace.resolve())
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(content or ""), encoding="utf-8")
+            assert_artifact_safe_for_exposure(target)
+            return {"path": safe.as_posix(), "bytes": target.stat().st_size, "status": "written"}
+
+        def read_artifact(path: str) -> dict[str, Any]:
+            safe = sanitize_artifact_path(path)
+            target = (workspace / safe).resolve()
+            target.relative_to(workspace.resolve())
+            if not target.is_file():
+                return {"path": safe.as_posix(), "error": "not_found"}
+            return {"path": safe.as_posix(), "content": target.read_text(encoding="utf-8", errors="replace")[:120_000]}
+
+        def rag_query(query: str, top_k: int | None = None) -> dict[str, Any]:
+            options = self.runtime_options
+            base_url = str(getattr(options, "rag_base_url", "") or self.settings.rag_base_url or "")
+            query_path = str(getattr(options, "rag_query_path", "") or self.settings.rag_query_path or "")
+            rag_top_k = int(top_k or getattr(options, "rag_top_k", 0) or 10)
+            try:
+                rag_result = RagClient(base_url=base_url, query_path=query_path).query(query, top_k=rag_top_k)
+                return {
+                    "answer": rag_result.answer,
+                    "sources": [source.__dict__ for source in rag_result.sources],
+                }
+            except Exception as exc:  # noqa: BLE001 - model needs unavailable evidence recorded, not a crash.
+                return {"answer": "", "sources": [], "error": str(exc)}
+
+        def invoke_mcp_tool(tool_name: str, arguments_json: str = "{}") -> dict[str, Any]:
+            try:
+                arguments = json.loads(arguments_json or "{}")
+            except json.JSONDecodeError as exc:
+                return {"error": f"arguments_json must be a JSON object: {exc}"}
+            if not isinstance(arguments, dict):
+                return {"error": "arguments_json must decode to a JSON object"}
+            try:
+                return McpClient(
+                    self.mcp_servers or getattr(self.runtime_options, "mcp_endpoints", []) or self.settings.resolved_mcp_endpoints(),
+                    api_key=getattr(self.runtime_options, "mcp_api_key", None) or self.settings.mcp_api_key,
+                ).invoke(tool_name, arguments)
+            except Exception as exc:  # noqa: BLE001 - failed evidence tools should be captured in artifacts.
+                return {"error": str(exc), "tool_name": tool_name}
+
+        def validate_workspace() -> dict[str, Any]:
+            self._workspace_manager._finalize_workspace(workspace=workspace, result=result)
+            return result.validation_report
+
+        return [
+            StructuredTool.from_function(
+                func=write_artifact,
+                name="matportal_write_artifact",
+                description="Write a proposal, evidence, report, validation, or draft artifact under the assistant workspace.",
+                args_schema=_ArtifactWriteInput,
+            ),
+            StructuredTool.from_function(
+                func=read_artifact,
+                name="matportal_read_artifact",
+                description="Read a previously written workspace artifact by relative path.",
+                args_schema=_ArtifactReadInput,
+            ),
+            StructuredTool.from_function(
+                func=rag_query,
+                name="matportal_rag_query",
+                description="Retrieve MatPortal ontology evidence and source chunks before drafting ontology edits.",
+                args_schema=_RagQueryInput,
+            ),
+            StructuredTool.from_function(
+                func=invoke_mcp_tool,
+                name="matportal_mcp_invoke",
+                description="Invoke a configured MatPortal MCP tool such as ontoportal_api for exact ontology/API evidence.",
+                args_schema=_McpInvokeInput,
+            ),
+            StructuredTool.from_function(
+                func=validate_workspace,
+                name="matportal_validate_workspace",
+                description="Run the MatPortal artifact validators over current workspace changes.",
+            ),
+        ]
+
+    def _system_prompt(self, workspace: Path) -> str:
+        return "\n".join(
+            [
+                "You are the MatPortal ontology edit runtime running inside LangChain Deep Agents.",
+                "You must prepare reviewable ontology edit artifacts, not publish live data.",
+                f"Workspace root: {workspace}",
+                "Use matportal_rag_query before drafting when semantic evidence is needed.",
+                "Use matportal_mcp_invoke for exact OntoPortal API/MCP evidence when configured, and record unavailability if it fails.",
+                "Write files only through matportal_write_artifact; do not rely on built-in filesystem scratch files for deliverables.",
+                "Required artifacts for edit tasks: edit-plan.json, evidence-ledger.json, operator-report.md, validation-summary.json, draft-submission.md, and at least one ontology artifact when a content change is requested.",
+                "Call matportal_validate_workspace after writing ontology artifacts and reflect the result in validation-summary.json.",
+                "Never include secrets, API keys, OAuth tokens, local absolute paths, or runtime config in artifacts.",
+                "Do not publish, commit, push, modify remotes, or mutate live OntoPortal data.",
+            ]
+        )
+
+    def _user_prompt(self, request: EditRuntimeRequest) -> str:
+        if request.task == "ask":
+            return request.prompt
+        return "\n".join(
+            [
+                "User ontology edit request:",
+                request.prompt,
+                "",
+                "Return a concise operator summary after all required files are written and validation has run.",
+            ]
+        )
+
+    def _extract_final_text(self, final_state: Any) -> str:
+        if isinstance(final_state, dict):
+            messages = final_state.get("messages") or []
+            for message in reversed(messages):
+                if isinstance(message, AIMessage):
+                    return self._stringify_content(message.content)
+                if getattr(message, "type", None) == "ai" or message.__class__.__name__ == "AIMessage":
+                    return self._stringify_content(getattr(message, "content", ""))
+            structured = final_state.get("structured_response")
+            if structured is not None:
+                return json.dumps(structured, ensure_ascii=False, default=str)
+        return str(final_state or "")
+
+    def _stringify_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text") or item.get("content") or ""))
+                else:
+                    parts.append(str(item))
+            return "".join(parts).strip()
+        return str(content or "")
+
+    def _append_console_line(self, result: OpenCodeExecutionResult, line: str) -> None:
+        result.console_lines.append(line)
+        max_lines = max(1, int(self.settings.opencode_max_log_lines))
+        if len(result.console_lines) > max_lines:
+            del result.console_lines[: len(result.console_lines) - max_lines]

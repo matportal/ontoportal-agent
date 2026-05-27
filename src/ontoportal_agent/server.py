@@ -1851,7 +1851,7 @@ def _persist_opencode_session_from_usage(
     objective: str,
     usage: dict[str, Any],
 ) -> None:
-    if not isinstance(usage, dict) or usage.get("mode") != "opencode":
+    if not isinstance(usage, dict) or usage.get("mode") not in {"opencode", "deepagents"}:
         return
     execution = usage.get("execution")
     if not isinstance(execution, dict):
@@ -1974,12 +1974,14 @@ def _stream_opencode_execution(
     runtime_options: AgentRuntimeOptions | None = None,
     resume_workspace: str | None = None,
     resume_session_id: str | None = None,
+    runtime_name: str | None = None,
 ) -> Iterator[str]:
     runtime = create_edit_runtime(
-        "opencode",
+        runtime_name,
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
         mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
+        runtime_options=runtime_options,
     )
     stream = runtime.stream(
         EditRuntimeRequest(
@@ -1996,6 +1998,13 @@ def _stream_opencode_execution(
         except StopIteration as stop:
             return stop.value
         yield _sse(event)
+
+
+def _edit_runtime_label(result: OpenCodeExecutionResult) -> str:
+    runtime = str(getattr(result, "runtime", "") or "opencode").strip().lower()
+    if runtime == "deepagents":
+        return "Deep Agents"
+    return "OpenCode"
 
 
 def _opencode_success_response(result: OpenCodeExecutionResult) -> str:
@@ -2016,17 +2025,17 @@ def _opencode_success_response(result: OpenCodeExecutionResult) -> str:
 
     if result.changed_files:
         return (
-            f"OpenCode prepared an ontology edit proposal in `{result.workspace}` "
+            f"{_edit_runtime_label(result)} prepared an ontology edit proposal in `{result.workspace}` "
             f"touching {len(result.changed_files)} file(s)."
         )
 
-    return f"OpenCode finished in `{result.workspace}` without writing any files."
+    return f"{_edit_runtime_label(result)} finished in `{result.workspace}` without writing any files."
 
 
 def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
     if result.blocked:
         detail = str(result.blocked_reason or "unsafe command detected").strip()
-        return f"OpenCode run was stopped by sandbox policy: {detail}."
+        return f"{_edit_runtime_label(result)} run was stopped by sandbox policy: {detail}."
     verification_url = _extract_antigravity_verification_url(result.console_lines)
     if verification_url:
         return (
@@ -2040,10 +2049,10 @@ def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
         return provider_error
     if result.changed_files:
         return (
-            f"OpenCode did not finish cleanly, but it still changed {len(result.changed_files)} file(s) "
+            f"{_edit_runtime_label(result)} did not finish cleanly, but it still changed {len(result.changed_files)} file(s) "
             f"in `{result.workspace}` for review."
         )
-    return "OpenCode could not finish the ontology edit proposal."
+    return f"{_edit_runtime_label(result)} could not finish the ontology edit proposal."
 
 
 def _contains_antigravity_verification_error(lines: list[str]) -> bool:
@@ -2155,7 +2164,7 @@ def _opencode_usage_payload(
         )
     return {
         "model": model,
-        "mode": "opencode",
+        "mode": str(execution.get("mode") or "opencode"),
         "execution": execution,
     }
 
@@ -2193,10 +2202,11 @@ def _stream_opencode_ask_generation(
     retrieval_state: dict[str, Any],
 ) -> Iterator[str]:
     runtime = create_edit_runtime(
-        "opencode",
+        None,
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
         mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
+        runtime_options=runtime_options,
     )
     stream = runtime.stream(
         EditRuntimeRequest(

@@ -85,6 +85,14 @@ class AgentSettings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("ONTOAGENT_EDIT_RUNTIME_DUAL_ENABLED", "EDIT_RUNTIME_DUAL_ENABLED"),
     )
+    deepagents_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_DEEPAGENTS_ENABLED", "DEEPAGENTS_ENABLED"),
+    )
+    deepagents_model: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_DEEPAGENTS_MODEL", "DEEPAGENTS_MODEL"),
+    )
     pi_path: str = Field(
         default="pi",
         validation_alias=AliasChoices("ONTOAGENT_PI_PATH", "PI_PATH"),
