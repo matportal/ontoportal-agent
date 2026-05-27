@@ -735,11 +735,15 @@ def test_skills_endpoint_lists_installed_capabilities_without_secrets(monkeypatc
     assert response.status_code == 200
     body = response.json()
     skill_ids = {item["id"] for item in body["skills"]}
-    assert {"ontology_edit_workflow", "matportal_rag_mcp", "ontoportal_api_mcp", "robot_validation", "artifact_review", "antigravity_search"} <= skill_ids
+    assert {"ontology_edit_workflow", "matportal_rag_mcp", "ontoportal_api_mcp", "robot_validation", "artifact_review", "antigravity_search", "opencode_release_guards"} <= skill_ids
     antigravity_search = next(item for item in body["skills"] if item["id"] == "antigravity_search")
     assert antigravity_search["enabled"] is True
     assert antigravity_search["status"] == "connected"
     assert "antigravity-claude-opus-4-6-thinking" in json.dumps(antigravity_search)
+    release_guards = next(item for item in body["skills"] if item["id"] == "opencode_release_guards")
+    assert release_guards["enabled"] is True
+    assert "Interactive sessions: disabled" in release_guards["details"]
+    assert "Apply/publish actions: disabled" in release_guards["details"]
     assert "access-token" not in json.dumps(body)
     assert "refresh-token" not in json.dumps(body)
 
