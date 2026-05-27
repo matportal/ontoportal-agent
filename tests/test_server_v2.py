@@ -2427,6 +2427,69 @@ def test_me_chat_stream_persists_opencode_session_record(monkeypatch, tmp_path):
     assert other_user.status_code == 404
 
 
+def test_continue_opencode_session_endpoint_reuses_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_INTERACTIVE_SESSIONS_ENABLED", "true")
+    _configure_env(monkeypatch, tmp_path)
+
+    class _RuntimeAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = kwargs.get("runtime_options")
+
+    observed: dict[str, object] = {}
+
+    def _fake_build_chat_model(_runtime_options, model_override=None):
+        return None
+
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options, resume_workspace=None, resume_session_id=None):
+        observed.setdefault("calls", []).append(
+            {
+                "prompt": prompt,
+                "resume_workspace": resume_workspace,
+                "resume_session_id": resume_session_id,
+            }
+        )
+        yield server._sse({"type": "workspace_mode", "content": {"mode": "execution", "run_id": "run-continued"}})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace=str(resume_workspace or "/tmp/ontoportal-agent/opencode-runs/thread-continue"),
+            run_id="run-continued",
+            expires_at="2999-01-01T00:00:00+00:00",
+            session_id=str(resume_session_id or "ses_continue"),
+            model="opencode/big-pickle",
+            final_text="Continued session.",
+            validation_report={"status": "pass"},
+        )
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _RuntimeAgent)
+    monkeypatch.setattr(server, "_build_chat_model", _fake_build_chat_model)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+    thread = client.post("/api/v1/me/threads", json={"title": "Continue"}, headers=headers).json()
+
+    first = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "Draft first artifact.", "thread_id": thread["thread_id"], "mode": "edit"},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    session_list = client.get("/api/v1/me/opencode/sessions", params={"thread_id": thread["thread_id"]}, headers=headers)
+    assert session_list.status_code == 200
+    session_id = session_list.json()["sessions"][0]["session_id"]
+
+    follow_up = client.post(
+        f"/api/v1/me/opencode/sessions/{session_id}/messages",
+        json={"prompt": "Continue from the existing workspace."},
+        headers=headers,
+    )
+    assert follow_up.status_code == 200
+    assert "Continued session." in follow_up.text
+    calls = observed["calls"]
+    assert calls[-1]["resume_workspace"] == "/tmp/ontoportal-agent/opencode-runs/thread-continue"
+    assert calls[-1]["resume_session_id"] == "ses_continue"
+
+
 def test_stream_agent_response_passes_resume_session_to_opencode(monkeypatch):
     initial_agent = SimpleNamespace(
         runtime_options=SimpleNamespace(

@@ -198,6 +198,10 @@ class AntigravityAuthCompleteIn(BaseModel):
     callback_url_or_code: str
 
 
+class OpenCodeSessionMessageIn(BaseModel):
+    prompt: str = Field(..., min_length=1)
+
+
 class ThreadCreateRequest(BaseModel):
     title: Optional[str] = None
     thread_id: Optional[str] = None
@@ -3277,6 +3281,88 @@ def me_get_opencode_session(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OpenCode session was not found.")
     return _serialize_opencode_session(row)
+
+
+@app.post("/api/v1/me/opencode/sessions/{session_id}/messages")
+def me_continue_opencode_session(
+    session_id: str,
+    payload: OpenCodeSessionMessageIn,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> StreamingResponse:
+    settings = get_settings()
+    if not settings.opencode_interactive_sessions_enabled:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Interactive OpenCode sessions are disabled.")
+    prompt = payload.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Prompt cannot be blank")
+    user_context = _resolve_user_context(request)
+    row = get_opencode_session(session, user_id=user_context.user_id, session_id=session_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OpenCode session was not found.")
+    if _session_expired(row.expires_at):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="OpenCode session artifacts have expired.")
+
+    thread = ensure_thread(session, user_id=user_context.user_id, thread_id=row.thread_id)
+    create_message(
+        session,
+        user_id=user_context.user_id,
+        thread_id=thread.thread_id,
+        role="user",
+        content=prompt,
+    )
+    settings_payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=True)
+    runtime_options = _runtime_options_from_settings(settings_payload)
+    log_context = {
+        "trace_id": uuid.uuid4().hex[:12],
+        "user_id": _compact_user_id(user_context.user_id),
+        "username": user_context.username,
+        "thread_id": thread.thread_id,
+        "opencode_session_id": row.session_id,
+        "follow_up": True,
+        "request_id": request.headers.get("x-request-id") or request.headers.get("X-Request-Id"),
+    }
+    opencode_resume = {
+        "workspace": row.workspace,
+        "session_id": row.opencode_session_id or row.session_id,
+    }
+
+    def on_completed(final_state: dict[str, Any], final_response_text: str) -> None:
+        usage_payload = final_state.get("generation_usage") if isinstance(final_state.get("generation_usage"), dict) else {}
+        create_message(
+            session,
+            user_id=user_context.user_id,
+            thread_id=thread.thread_id,
+            role="assistant",
+            content=final_response_text or "No response generated.",
+            reasoning_summary=_persistable_reasoning_summary(final_state),
+            usage_json=usage_payload,
+            citations_json=final_state.get("citations") if isinstance(final_state.get("citations"), list) else [],
+        )
+        _persist_opencode_session_from_usage(
+            session,
+            user_id=user_context.user_id,
+            thread_id=thread.thread_id,
+            objective=prompt,
+            usage=usage_payload,
+        )
+
+    return StreamingResponse(
+        _stream_agent_response(
+            prompt=prompt,
+            thread_id=thread.thread_id,
+            agent_builder=lambda: OntoPortalAgent(runtime_options=runtime_options),
+            requested_mode="edit",
+            on_completed=on_completed,
+            log_context=log_context,
+            opencode_resume=opencode_resume,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.delete("/api/v1/me/threads/{thread_id}")
