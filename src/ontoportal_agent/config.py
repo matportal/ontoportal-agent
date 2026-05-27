@@ -72,10 +72,34 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_ONTOPORTAL_API_KEY", "ONTOPORTAL_API_KEY"),
     )
 
-    # Workspace
+    # Workspace and edit runtime
     ontology_workdir: Path = Field(
         default=Path("/tmp/ontoportal-agent"),
         validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_WORKDIR", "ONTOLOGY_WORKDIR"),
+    )
+    edit_runtime_default: str = Field(
+        default="opencode",
+        validation_alias=AliasChoices("ONTOAGENT_EDIT_RUNTIME_DEFAULT", "EDIT_RUNTIME_DEFAULT"),
+    )
+    edit_runtime_dual_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_EDIT_RUNTIME_DUAL_ENABLED", "EDIT_RUNTIME_DUAL_ENABLED"),
+    )
+    pi_path: str = Field(
+        default="pi",
+        validation_alias=AliasChoices("ONTOAGENT_PI_PATH", "PI_PATH"),
+    )
+    pi_model: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_PI_MODEL", "PI_MODEL"),
+    )
+    pi_session_subdir: str = Field(
+        default=".pi-sessions",
+        validation_alias=AliasChoices("ONTOAGENT_PI_SESSION_SUBDIR", "PI_SESSION_SUBDIR"),
+    )
+    pi_adapter_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_PI_ADAPTER_ENABLED", "PI_ADAPTER_ENABLED"),
     )
     opencode_path: str = Field(
         default="opencode",

@@ -80,9 +80,10 @@ from .db.repositories import (
     upsert_user_settings,
 )
 from .db.user_context import AssistantUserContext, verify_user_context_headers
+from .edit_runtime import EditRuntimeRequest, create_edit_runtime
 from .intent import classify_user_intent
 from .mcp_client import McpClient, McpInvocationError
-from .opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
+from .opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeProviderAuth
 from .rag_client import RagClient
 
 logger = logging.getLogger("uvicorn.error").getChild("ontoportal_agent")
@@ -1974,17 +1975,20 @@ def _stream_opencode_execution(
     resume_workspace: str | None = None,
     resume_session_id: str | None = None,
 ) -> Iterator[str]:
-    executor = OpenCodeExecutor(
+    runtime = create_edit_runtime(
+        "opencode",
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
         mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
     )
-    stream = executor.stream(
-        prompt=prompt,
-        thread_id=thread_id,
-        trace_id=trace_id,
-        resume_workspace=resume_workspace,
-        resume_session_id=resume_session_id,
+    stream = runtime.stream(
+        EditRuntimeRequest(
+            prompt=prompt,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            resume_workspace=resume_workspace,
+            resume_session_id=resume_session_id,
+        )
     )
     while True:
         try:
@@ -2188,18 +2192,21 @@ def _stream_opencode_ask_generation(
     runtime_options: AgentRuntimeOptions | None,
     retrieval_state: dict[str, Any],
 ) -> Iterator[str]:
-    executor = OpenCodeExecutor(
+    runtime = create_edit_runtime(
+        "opencode",
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
         mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
     )
-    stream = executor.stream(
-        prompt=prompt,
-        thread_id=thread_id,
-        trace_id=trace_id,
-        task="ask",
-        retrieved_context=str(retrieval_state.get("rag_result") or ""),
-        citation_labels=list(retrieval_state.get("citation_labels") or []),
+    stream = runtime.stream(
+        EditRuntimeRequest(
+            prompt=prompt,
+            thread_id=thread_id,
+            trace_id=trace_id,
+            task="ask",
+            retrieved_context=str(retrieval_state.get("rag_result") or ""),
+            citation_labels=tuple(str(label) for label in (retrieval_state.get("citation_labels") or [])),
+        )
     )
     while True:
         try:
