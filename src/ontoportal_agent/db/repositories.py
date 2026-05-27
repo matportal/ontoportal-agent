@@ -130,6 +130,21 @@ def get_thread_execution(
     return None
 
 
+def get_latest_thread_execution(
+    session: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+) -> dict[str, Any] | None:
+    messages = list_thread_messages(session, user_id=user_id, thread_id=thread_id)
+    for message in reversed(messages):
+        usage = message.usage_json if isinstance(message.usage_json, dict) else {}
+        execution = usage.get("execution") if isinstance(usage, dict) else None
+        if isinstance(execution, dict):
+            return execution
+    return None
+
+
 def create_message(
     session: Session,
     *,
@@ -192,23 +207,34 @@ def replace_mcp_servers(
     *,
     user_id: str,
     mcp_servers: list[dict[str, Any]],
-    encrypt_api_key: Callable[[str], tuple[str, str]] | None = None,
+    encrypt_secret: Callable[[dict[str, str]], tuple[str, str]] | None = None,
 ) -> list[AssistantMcpServer]:
     session.execute(delete(AssistantMcpServer).where(AssistantMcpServer.user_id == user_id))
     created: list[AssistantMcpServer] = []
     for item in mcp_servers:
+        auth_mode = str(item.get("auth_mode") or "api_key").strip().lower() or "api_key"
+        username = str(item.get("username") or "").strip() or None
         raw_api_key = (item.get("api_key") or "").strip()
+        raw_password = (item.get("password") or "").strip()
         api_key_encrypted = None
         api_key_key_version = None
-        if raw_api_key and encrypt_api_key is not None:
-            api_key_encrypted, api_key_key_version = encrypt_api_key(raw_api_key)
+        if raw_api_key and encrypt_secret is not None:
+            api_key_encrypted, api_key_key_version = encrypt_secret({"api_key": raw_api_key})
+        password_encrypted = None
+        password_key_version = None
+        if raw_password and encrypt_secret is not None:
+            password_encrypted, password_key_version = encrypt_secret({"password": raw_password})
 
         server = AssistantMcpServer(
             user_id=user_id,
             name=(item.get("name") or "").strip() or "MCP",
             url=(item.get("url") or "").strip(),
+            auth_mode=auth_mode,
+            username=username,
             api_key_encrypted=api_key_encrypted,
             api_key_key_version=api_key_key_version,
+            password_encrypted=password_encrypted,
+            password_key_version=password_key_version,
             enabled=bool(item.get("enabled", True)),
             timeout_ms=max(1000, int(item.get("timeout_ms", 30000))),
         )
