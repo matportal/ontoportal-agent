@@ -25,6 +25,7 @@ class McpClient:
             if isinstance(endpoint, dict):
                 url = (endpoint.get("url") or "").rstrip("/")
                 per_endpoint_api_key = endpoint.get("api_key")
+                raw_headers = endpoint.get("headers")
                 timeout_ms = endpoint.get("timeout_ms")
                 if not url:
                     continue
@@ -32,10 +33,21 @@ class McpClient:
                     timeout_ms = int(timeout_ms)
                 except (TypeError, ValueError):
                     timeout_ms = 0
+                headers: Dict[str, str] = {}
+                if isinstance(raw_headers, dict):
+                    for key, value in raw_headers.items():
+                        header_name = str(key or "").strip()
+                        if not header_name:
+                            continue
+                        header_value = str(value or "").strip()
+                        if not header_value:
+                            continue
+                        headers[header_name] = header_value
                 self.endpoint_configs.append(
                     {
                         "url": url,
                         "api_key": per_endpoint_api_key,
+                        "headers": headers,
                         "timeout_ms": max(0, timeout_ms),
                     }
                 )
@@ -44,7 +56,7 @@ class McpClient:
             url = str(endpoint).rstrip("/")
             if not url:
                 continue
-            self.endpoint_configs.append({"url": url, "api_key": None, "timeout_ms": 0})
+            self.endpoint_configs.append({"url": url, "api_key": None, "headers": {}, "timeout_ms": 0})
 
         self.endpoints = [cfg["url"] for cfg in self.endpoint_configs]
         self.api_key = api_key
@@ -71,16 +83,19 @@ class McpClient:
         return timeout_seconds
 
     def _request_headers(self, endpoint: str | None = None) -> Dict[str, str]:
-        headers: Dict[str, str] = {}
-        endpoint_api_key = self._endpoint_config(endpoint).get("api_key")
+        endpoint_config = self._endpoint_config(endpoint)
+        headers: Dict[str, str] = dict(endpoint_config.get("headers") or {})
+        endpoint_api_key = endpoint_config.get("api_key")
         resolved_api_key = endpoint_api_key or self.api_key
-        if resolved_api_key:
+        has_api_key_header = any(str(key).lower() == "x-api-key" for key in headers)
+        if resolved_api_key and not has_api_key_header:
             headers["X-API-Key"] = str(resolved_api_key)
         return headers
 
     def list_tools(self) -> List[tuple[str, McpToolSpec]]:
         if self._tool_cache is None:
             tools: List[tuple[str, McpToolSpec]] = []
+            errors: List[str] = []
             for endpoint in self.endpoints:
                 url = f"{endpoint}/tools"
                 try:
@@ -91,8 +106,9 @@ class McpClient:
                     )
                     response.raise_for_status()
                     payload = response.json()
-                except requests.RequestException as err:
-                    raise McpInvocationError(f"Failed to list tools from '{endpoint}': {err}") from err
+                except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError) as err:
+                    errors.append(f"{endpoint}: {err}")
+                    continue
                 for tool in payload.get("tools", []):
                     tools.append(
                         (
@@ -105,6 +121,8 @@ class McpClient:
                             ),
                         )
                     )
+            if not tools and errors:
+                raise McpInvocationError(f"Failed to list tools from configured MCP endpoints: {'; '.join(errors)}")
             self._tool_cache = tools
         return list(self._tool_cache)
 

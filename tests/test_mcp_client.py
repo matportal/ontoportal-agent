@@ -89,6 +89,25 @@ def test_list_tools_wraps_transport_errors(monkeypatch):
         client.list_tools()
 
 
+def test_list_tools_skips_failing_endpoint_when_another_is_healthy(monkeypatch):
+    def _fake_get(url, headers, timeout):
+        if "broken.internal" in url:
+            raise requests.RequestException("connection refused")
+        return _Response({"tools": [{"name": "rag_query", "description": "", "arguments": {}}]})
+
+    monkeypatch.setattr("ontoportal_agent.mcp_client.requests.get", _fake_get)
+
+    client = McpClient(
+        ["http://broken.internal/mcp", "http://rag.internal/mcp"],
+        api_key="shared-secret",
+    )
+    tools = client.list_tools()
+
+    assert len(tools) == 1
+    assert tools[0][0] == "http://rag.internal/mcp"
+    assert tools[0][1].name == "rag_query"
+
+
 def test_mcp_client_uses_endpoint_specific_key_and_timeout(monkeypatch):
     captured = {}
 
@@ -109,3 +128,52 @@ def test_mcp_client_uses_endpoint_specific_key_and_timeout(monkeypatch):
     assert captured["url"] == "http://rag.internal/mcp/tools"
     assert captured["headers"] == {"X-API-Key": "endpoint-key"}
     assert captured["timeout"] == 45
+
+
+def test_mcp_client_merges_custom_headers_with_shared_api_key(monkeypatch):
+    captured = {}
+
+    def _fake_get(url, headers, timeout):
+        captured["headers"] = headers
+        return _Response({"tools": []})
+
+    monkeypatch.setattr("ontoportal_agent.mcp_client.requests.get", _fake_get)
+
+    client = McpClient(
+        [
+            {
+                "url": "http://rag.internal/mcp",
+                "headers": {"Authorization": "Basic abc123"},
+            }
+        ],
+        api_key="shared-secret",
+    )
+    client.list_tools()
+
+    assert captured["headers"] == {
+        "Authorization": "Basic abc123",
+        "X-API-Key": "shared-secret",
+    }
+
+
+def test_mcp_client_respects_explicit_x_api_key_header(monkeypatch):
+    captured = {}
+
+    def _fake_get(url, headers, timeout):
+        captured["headers"] = headers
+        return _Response({"tools": []})
+
+    monkeypatch.setattr("ontoportal_agent.mcp_client.requests.get", _fake_get)
+
+    client = McpClient(
+        [
+            {
+                "url": "http://rag.internal/mcp",
+                "headers": {"X-API-Key": "header-secret"},
+            }
+        ],
+        api_key="shared-secret",
+    )
+    client.list_tools()
+
+    assert captured["headers"] == {"X-API-Key": "header-secret"}
