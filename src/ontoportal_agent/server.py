@@ -46,6 +46,7 @@ from .antigravity_models import (
 from .artifact_store import (
     ArtifactAccessError,
     artifact_expired,
+    assert_artifact_safe_for_exposure,
     build_artifact_bundle,
     cleanup_expired_workspaces,
     execution_allows_path,
@@ -135,6 +136,42 @@ _GOOGLE_THOUGHT_STREAM_MODEL_PREFIXES = (
 _MAX_STREAM_ATTEMPTS_PER_MODEL = 2
 _STREAM_RETRY_BACKOFF_SECONDS = 1.25
 _GOOGLE_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
+class OpenCodeConcurrencyLimitError(RuntimeError):
+    status_code = 429
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+_opencode_concurrency_lock = Lock()
+_active_opencode_runs: dict[str, tuple[str, str | None]] = {}
+
+
+def _opencode_limit_exceeded(active: int, limit: int) -> bool:
+    return limit > 0 and active >= limit
+
+
+def _try_acquire_opencode_slot(*, trace_id: str, user_id: str | None, thread_id: str | None) -> str:
+    settings = get_settings()
+    normalized_user = str(user_id or "anonymous").strip() or "anonymous"
+    with _opencode_concurrency_lock:
+        if trace_id in _active_opencode_runs:
+            return ""
+        global_active = len(_active_opencode_runs)
+        user_active = sum(1 for active_user, _active_thread in _active_opencode_runs.values() if active_user == normalized_user)
+        if _opencode_limit_exceeded(global_active, int(settings.opencode_global_concurrency_limit)):
+            return "The assistant edit runtime is busy. Please try again after the active workspace run finishes."
+        if _opencode_limit_exceeded(user_active, int(settings.opencode_user_concurrency_limit)):
+            return "You already have an active assistant edit workspace run. Please wait for it to finish."
+        _active_opencode_runs[trace_id] = (normalized_user, thread_id)
+    return ""
+
+
+def _release_opencode_slot(trace_id: str) -> None:
+    with _opencode_concurrency_lock:
+        _active_opencode_runs.pop(trace_id, None)
 
 
 class ChatStreamRequest(BaseModel):
@@ -407,6 +444,8 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 
 
 def _stream_failure_payload(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, OpenCodeConcurrencyLimitError):
+        return ("Assistant edit runtime is busy.", str(exc))
     if _is_rate_limit_error(exc):
         retry_after = _error_retry_after_seconds(exc)
         if retry_after is not None:
@@ -2247,6 +2286,7 @@ def _stream_agent_response(
     on_completed: Callable[[dict[str, Any], str], None] | None = None,
     log_context: dict[str, Any] | None = None,
     opencode_resume: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> Iterator[str]:
     stream_context = dict(log_context or {})
     stream_context.setdefault("thread_id", thread_id)
@@ -2304,13 +2344,35 @@ def _stream_agent_response(
                         stream_kwargs["resume_workspace"] = workspace
                     if session_id:
                         stream_kwargs["resume_session_id"] = session_id
-                opencode_result = yield from _stream_opencode_execution(
-                    prompt=prompt,
-                    thread_id=thread_id,
+                limit_message = _try_acquire_opencode_slot(
                     trace_id=stream_context["trace_id"],
-                    runtime_options=runtime_options,
-                    **stream_kwargs,
+                    user_id=user_id,
+                    thread_id=thread_id,
                 )
+                if limit_message:
+                    error_details = {
+                        "trace_id": stream_context["trace_id"],
+                        "status": "Assistant edit runtime is busy.",
+                        "message": limit_message,
+                        "error_class": "OpenCodeConcurrencyLimitError",
+                        "status_code": 429,
+                    }
+                    logger.warning(_log_event("assistant_stream_opencode_limited", **stream_context, intent=intent))
+                    yield _sse({"type": "status", "message": "Assistant edit runtime is busy."})
+                    yield _sse({"type": "error", "content": error_details})
+                    yield _sse({"type": "delta", "content": limit_message})
+                    yield _sse_done()
+                    return
+                try:
+                    opencode_result = yield from _stream_opencode_execution(
+                        prompt=prompt,
+                        thread_id=thread_id,
+                        trace_id=stream_context["trace_id"],
+                        runtime_options=runtime_options,
+                        **stream_kwargs,
+                    )
+                finally:
+                    _release_opencode_slot(stream_context["trace_id"])
                 resolved_model = str(opencode_result.model or get_settings().opencode_model or resolved_model or "")
                 final_state["generation_backend"] = "opencode"
                 final_state["generation_usage"] = _opencode_usage_payload(opencode_result, runtime_options)
@@ -2371,13 +2433,23 @@ def _stream_agent_response(
                 if _opencode_hybrid_ask_enabled():
                     yield _sse({"type": "status", "message": "Generating answer with OpenCode..."})
                     try:
-                        opencode_ask_result = yield from _stream_opencode_ask_generation(
-                            prompt=prompt,
-                            thread_id=thread_id,
+                        limit_message = _try_acquire_opencode_slot(
                             trace_id=stream_context["trace_id"],
-                            runtime_options=runtime_options,
-                            retrieval_state=final_state,
+                            user_id=user_id,
+                            thread_id=thread_id,
                         )
+                        if limit_message:
+                            raise OpenCodeConcurrencyLimitError(limit_message)
+                        try:
+                            opencode_ask_result = yield from _stream_opencode_ask_generation(
+                                prompt=prompt,
+                                thread_id=thread_id,
+                                trace_id=stream_context["trace_id"],
+                                runtime_options=runtime_options,
+                                retrieval_state=final_state,
+                            )
+                        finally:
+                            _release_opencode_slot(stream_context["trace_id"])
                     except Exception as exc:
                         logger.warning(
                             _log_event(
@@ -2759,6 +2831,7 @@ def me_artifact_download(
     _require_execution_path(execution, path)
     try:
         file_path = resolve_artifact_file(execution["workspace"], path)
+        assert_artifact_safe_for_exposure(file_path)
     except ArtifactAccessError as exc:
         raise _artifact_access_error(exc) from exc
     return FileResponse(
@@ -3356,6 +3429,7 @@ def me_continue_opencode_session(
             on_completed=on_completed,
             log_context=log_context,
             opencode_resume=opencode_resume,
+            user_id=user_context.user_id,
         ),
         media_type="text/event-stream",
         headers={
@@ -3488,20 +3562,21 @@ def me_chat_stream(
         "follow_up": bool(payload.thread_id),
         "request_id": request.headers.get("x-request-id") or request.headers.get("X-Request-Id"),
     }
-    latest_execution = get_latest_thread_execution(
-        session,
-        user_id=user_context.user_id,
-        thread_id=thread.thread_id,
-    )
     opencode_resume: dict[str, Any] | None = None
-    if isinstance(latest_execution, dict) and not artifact_expired(latest_execution):
-        resume_workspace = str(latest_execution.get("workspace") or "").strip()
-        resume_session_id = str(latest_execution.get("session_id") or "").strip()
-        if resume_workspace or resume_session_id:
-            opencode_resume = {
-                "workspace": resume_workspace,
-                "session_id": resume_session_id,
-            }
+    if settings.opencode_interactive_sessions_enabled:
+        latest_execution = get_latest_thread_execution(
+            session,
+            user_id=user_context.user_id,
+            thread_id=thread.thread_id,
+        )
+        if isinstance(latest_execution, dict) and not artifact_expired(latest_execution):
+            resume_workspace = str(latest_execution.get("workspace") or "").strip()
+            resume_session_id = str(latest_execution.get("session_id") or "").strip()
+            if resume_workspace or resume_session_id:
+                opencode_resume = {
+                    "workspace": resume_workspace,
+                    "session_id": resume_session_id,
+                }
 
     def on_completed(final_state: dict[str, Any], final_response_text: str) -> None:
         usage_payload = final_state.get("generation_usage") if isinstance(final_state.get("generation_usage"), dict) else {}
@@ -3532,6 +3607,7 @@ def me_chat_stream(
             on_completed=on_completed,
             log_context=log_context,
             opencode_resume=opencode_resume,
+            user_id=user_context.user_id,
         ),
         media_type="text/event-stream",
         headers={

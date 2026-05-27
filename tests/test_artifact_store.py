@@ -17,6 +17,7 @@ from ontoportal_agent.artifact_store import (
     list_artifact_files,
     read_artifact_text,
     resolve_artifact_file,
+    resolve_safe_workspace,
     sanitize_artifact_path,
 )
 
@@ -25,6 +26,40 @@ from ontoportal_agent.artifact_store import (
 def test_sanitize_artifact_path_rejects_unsafe_paths(path):
     with pytest.raises(ArtifactAccessError):
         sanitize_artifact_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opencode.json",
+        "pi.json",
+        ".git/config",
+        ".opencode-home/auth.json",
+        ".codex-home/auth.json",
+        ".env",
+        "nested/token.json",
+        "private.pem",
+    ],
+)
+def test_sanitize_artifact_path_rejects_runtime_and_secret_files(path):
+    with pytest.raises(ArtifactAccessError):
+        sanitize_artifact_path(path)
+
+
+def test_resolve_safe_workspace_stays_under_runtime_root(tmp_path):
+    root = tmp_path / "opencode-runs"
+    workspace = root / "thread-1"
+    outside = tmp_path / "outside"
+    workspace.mkdir(parents=True)
+    outside.mkdir()
+
+    assert resolve_safe_workspace(root, workspace) == workspace.resolve()
+    with pytest.raises(ArtifactAccessError):
+        resolve_safe_workspace(root, root)
+    with pytest.raises(ArtifactAccessError):
+        resolve_safe_workspace(root, outside)
+    with pytest.raises(ArtifactAccessError):
+        resolve_safe_workspace(root, root / "missing")
 
 
 def test_artifact_store_lists_only_declared_files_and_bundles_available_files(tmp_path):
@@ -57,6 +92,25 @@ def test_artifact_store_lists_only_declared_files_and_bundles_available_files(tm
 
     with zipfile.ZipFile(BytesIO(build_artifact_bundle(workspace, execution))) as archive:
         assert sorted(archive.namelist()) == ["notes.md", "proposal.ttl"]
+
+
+def test_artifact_secret_scanner_blocks_view_and_bundle(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret_artifact = workspace / "proposal.ttl"
+    secret_artifact.write_text(
+        "@prefix ex: <https://example.org/> .\n# api_key = sk-testsecretvalue12345\n",
+        encoding="utf-8",
+    )
+    execution = {
+        "workspace": str(workspace),
+        "changed_files": [{"status": "A", "path": "proposal.ttl", "kind": "ttl"}],
+    }
+
+    with pytest.raises(ArtifactAccessError):
+        read_artifact_text(workspace, "proposal.ttl")
+    with pytest.raises(ArtifactAccessError):
+        build_artifact_bundle(workspace, execution)
 
 
 def test_resolve_artifact_file_blocks_symlink_escape(tmp_path):

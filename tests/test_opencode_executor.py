@@ -10,6 +10,7 @@ from rdflib import Graph
 if importlib.util.find_spec("ontoportal_agent") is None:
     pytest.skip("ontoportal_agent package not available", allow_module_level=True)
 
+from ontoportal_agent.artifact_store import ArtifactAccessError
 from ontoportal_agent.config import get_settings
 from ontoportal_agent.opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
 
@@ -160,6 +161,26 @@ def test_prepare_workspace_reuses_thread_workspace(monkeypatch, tmp_path):
 
     assert workspace1 == workspace2
     assert workspace1.name == "thread-reuse"
+
+
+def test_prepare_workspace_validates_resume_workspace_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-safe-resume")
+    assert executor._prepare_workspace(thread_id="thread-safe-resume", resume_workspace=str(workspace)) == workspace
+
+    outside = tmp_path / "outside-workspace"
+    outside.mkdir()
+    with pytest.raises(ArtifactAccessError):
+        executor._prepare_workspace(thread_id="thread-safe-resume", resume_workspace=str(outside))
+    with pytest.raises(ArtifactAccessError):
+        executor._prepare_workspace(thread_id="thread-safe-resume", resume_workspace=str(tmp_path / "opencode-runs"))
+    with pytest.raises(ArtifactAccessError):
+        executor._prepare_workspace(thread_id="thread-safe-resume", resume_workspace=str(tmp_path / "missing"))
 
 
 def test_prepare_workspace_writes_user_provider_without_literal_secret(monkeypatch, tmp_path):

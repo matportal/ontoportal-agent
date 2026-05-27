@@ -45,6 +45,7 @@ def _configure_env(monkeypatch, tmp_path: Path):
     get_session_factory.cache_clear()
     server._agent_instance = None
     server._account_auth_manager = server.AccountAuthManager()
+    server._active_opencode_runs.clear()
     server.startup()
 
 
@@ -2425,6 +2426,95 @@ def test_me_chat_stream_persists_opencode_session_record(monkeypatch, tmp_path):
         headers=_signed_headers(user_id="user-2", username="bob", email="bob@example.org", include_internal_token=True),
     )
     assert other_user.status_code == 404
+
+
+def test_me_chat_stream_does_not_hidden_resume_when_interactive_sessions_disabled(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+
+    class _RuntimeAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = kwargs.get("runtime_options")
+
+    observed: list[dict[str, object]] = []
+
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options, resume_workspace=None, resume_session_id=None):
+        observed.append({"resume_workspace": resume_workspace, "resume_session_id": resume_session_id})
+        yield server._sse({"type": "workspace_mode", "content": {"mode": "execution", "run_id": f"run-{len(observed)}"}})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-no-hidden-resume",
+            run_id=f"run-{len(observed)}",
+            expires_at="2999-01-01T00:00:00+00:00",
+            session_id="ses_no_hidden_resume",
+            model="opencode/big-pickle",
+            final_text="Workspace run complete.",
+        )
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _RuntimeAgent)
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: None)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+    thread = client.post("/api/v1/me/threads", json={"title": "No hidden resume"}, headers=headers).json()
+
+    first = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "Draft the first artifact.", "thread_id": thread["thread_id"], "mode": "edit"},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    second = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "Start a fresh follow-up artifact.", "thread_id": thread["thread_id"], "mode": "edit"},
+        headers=headers,
+    )
+    assert second.status_code == 200
+
+    assert len(observed) == 2
+    assert observed[0] == {"resume_workspace": None, "resume_session_id": None}
+    assert observed[1] == {"resume_workspace": None, "resume_session_id": None}
+
+
+def test_stream_agent_response_rejects_when_opencode_concurrency_limit_is_reached(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    runtime_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="openai_compatible",
+            llm_model="gpt-5.2",
+            openai_api_key="test-key",
+            openai_api_base="https://api.openai.com/v1",
+            mcp_endpoints=[],
+        )
+    )
+    called = False
+
+    def _unexpected_opencode_stream(**_kwargs):
+        nonlocal called
+        called = True
+        yield server._sse({"type": "workspace_mode", "content": {"mode": "execution"}})
+        return OpenCodeExecutionResult(ok=True, workspace="/tmp/unused", run_id="unused")
+
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: None)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _unexpected_opencode_stream)
+    server._active_opencode_runs["busy-run"] = ("other-user", "other-thread")
+    try:
+        events = "".join(
+            server._stream_agent_response(
+                prompt="Draft a proposal.",
+                thread_id="thread-limited",
+                agent_builder=lambda: runtime_agent,
+                requested_mode="edit",
+                log_context={"trace_id": "limited-run"},
+                user_id="user-1",
+            )
+        )
+    finally:
+        server._active_opencode_runs.clear()
+
+    assert called is False
+    assert '"status_code": 429' in events
+    assert "Assistant edit runtime is busy" in events
 
 
 def test_continue_opencode_session_endpoint_reuses_workspace(monkeypatch, tmp_path):

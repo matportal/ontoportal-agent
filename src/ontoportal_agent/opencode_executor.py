@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 from rdflib import Graph
 
 from .antigravity_models import antigravity_opencode_provider_config, normalize_antigravity_model_ref
+from .artifact_store import resolve_safe_workspace
 from .config import AgentSettings, get_settings
 
 _ONTOLOGY_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
@@ -273,12 +274,12 @@ class OpenCodeExecutor:
         run_id: str | None = None,
         resume_workspace: str | None = None,
     ) -> Path:
-        root = self.settings.ontology_workdir / self.settings.opencode_workspace_subdir
+        root = (self.settings.ontology_workdir / self.settings.opencode_workspace_subdir).resolve()
         root.mkdir(parents=True, exist_ok=True)
         self._chmod_private(root, 0o700)
         workspace: Path
         if resume_workspace:
-            workspace = Path(resume_workspace)
+            workspace = resolve_safe_workspace(root, resume_workspace)
         elif thread_id:
             token = str(thread_id).replace("/", "-")
             workspace = root / token

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import mimetypes
+import re
 import subprocess
 import zipfile
 from datetime import datetime, timezone
@@ -11,6 +12,40 @@ from typing import Any
 
 TEXT_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
 MAX_TEXT_VIEW_BYTES = 2_000_000
+_SENSITIVE_ARTIFACT_DIRS = {
+    ".git",
+    ".opencode-home",
+    ".opencode-state",
+    ".opencode-cache",
+    ".opencode",
+    ".codex-home",
+    ".codex",
+    ".pi",
+    ".cache",
+    ".config",
+    ".local",
+}
+_SENSITIVE_ARTIFACT_FILES = {
+    ".env",
+    "auth.json",
+    "opencode.json",
+    "pi.json",
+    "credentials",
+    "credentials.json",
+    "secrets.json",
+    "secret.json",
+    "token",
+    "token.json",
+}
+_SENSITIVE_ARTIFACT_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".pkcs12"}
+_SECRET_SCAN_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)authorization\s*:\s*(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{10,}"),
+    re.compile(
+        r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)"
+        r"\s*[=:]\s*[\"']?[A-Za-z0-9_./+=:-]{12,}"
+    ),
+)
 
 
 class ArtifactAccessError(ValueError):
@@ -39,6 +74,23 @@ def artifact_expired(execution: dict[str, Any], *, now: datetime | None = None) 
     return (now or datetime.now(timezone.utc)) > expires_at
 
 
+def _sensitive_artifact_reason(parts: tuple[str, ...]) -> str:
+    for part in parts:
+        name = str(part or "")
+        lower = name.lower()
+        if lower in _SENSITIVE_ARTIFACT_DIRS:
+            return f"Runtime directory '{name}' is not available as an artifact."
+        if lower in _SENSITIVE_ARTIFACT_FILES:
+            return f"Runtime credential file '{name}' is not available as an artifact."
+        if Path(lower).suffix in _SENSITIVE_ARTIFACT_SUFFIXES:
+            return f"Sensitive key material '{name}' is not available as an artifact."
+        if lower.startswith(".env"):
+            return f"Environment file '{name}' is not available as an artifact."
+        if any(marker in lower for marker in ("token", "secret", "credential")):
+            return f"Sensitive token or credential file '{name}' is not available as an artifact."
+    return ""
+
+
 def sanitize_artifact_path(raw_path: str) -> Path:
     raw = str(raw_path or "").strip().replace("\\", "/")
     if not raw:
@@ -52,6 +104,9 @@ def sanitize_artifact_path(raw_path: str) -> Path:
     parts = pure.parts
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ArtifactAccessError("Unsafe artifact path.")
+    reason = _sensitive_artifact_reason(parts)
+    if reason:
+        raise ArtifactAccessError(reason)
     return Path(*parts)
 
 
@@ -63,6 +118,26 @@ def resolve_workspace(workspace: str | Path) -> Path:
     if not root.is_dir():
         raise ArtifactAccessError("Artifact workspace is no longer available.")
     return root
+
+
+def resolve_safe_workspace(root: str | Path, workspace: str | Path) -> Path:
+    try:
+        allowed_root = Path(root).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ArtifactAccessError("Workspace root is not available.") from exc
+    try:
+        candidate = Path(workspace).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ArtifactAccessError("Workspace is no longer available.") from exc
+    if not allowed_root.is_dir() or not candidate.is_dir():
+        raise ArtifactAccessError("Workspace is no longer available.")
+    try:
+        candidate.relative_to(allowed_root)
+    except ValueError as exc:
+        raise ArtifactAccessError("Workspace path escapes the assistant workspace root.") from exc
+    if candidate == allowed_root:
+        raise ArtifactAccessError("Assistant workspace root cannot be resumed directly.")
+    return candidate
 
 
 def resolve_artifact_file(workspace: str | Path, raw_path: str) -> Path:
@@ -79,6 +154,20 @@ def resolve_artifact_file(workspace: str | Path, raw_path: str) -> Path:
     if not candidate.is_file():
         raise ArtifactAccessError("Artifact path is not a file.")
     return candidate
+
+
+def _scan_text_for_secret(content: str) -> bool:
+    return any(pattern.search(content) for pattern in _SECRET_SCAN_PATTERNS)
+
+
+def assert_artifact_safe_for_exposure(file_path: str | Path) -> None:
+    path = Path(file_path)
+    try:
+        sample = path.read_bytes()[:MAX_TEXT_VIEW_BYTES]
+    except OSError as exc:
+        raise ArtifactAccessError("Artifact file is no longer available.") from exc
+    if _scan_text_for_secret(sample.decode("utf-8", errors="replace")):
+        raise ArtifactAccessError("Artifact appears to contain credentials or tokens and cannot be exposed.")
 
 
 def text_language(path: str) -> str:
@@ -174,13 +263,17 @@ def read_artifact_text(workspace: str | Path, path: str) -> dict[str, Any]:
     if not is_text_artifact(safe_path):
         raise ArtifactAccessError("Artifact file type is not viewable as text.")
     file_path = resolve_artifact_file(workspace, safe_path)
+    assert_artifact_safe_for_exposure(file_path)
     size = file_path.stat().st_size
     if size > MAX_TEXT_VIEW_BYTES:
         raise ArtifactAccessError("Artifact file is too large to view inline.")
+    content = file_path.read_text(encoding="utf-8", errors="replace")
+    if _scan_text_for_secret(content):
+        raise ArtifactAccessError("Artifact appears to contain credentials or tokens and cannot be exposed.")
     return {
         "path": safe_path,
         "language": text_language(safe_path),
-        "content": file_path.read_text(encoding="utf-8", errors="replace"),
+        "content": content,
         "size": size,
         "content_type": mimetypes.guess_type(file_path.name)[0] or "text/plain",
     }
@@ -197,6 +290,8 @@ def read_artifact_diff(workspace: str | Path, path: str, *, max_chars: int = 120
         check=False,
     )
     diff = completed.stdout or completed.stderr or ""
+    if _scan_text_for_secret(diff):
+        raise ArtifactAccessError("Artifact diff appears to contain credentials or tokens and cannot be exposed.")
     truncated = len(diff) > max_chars
     return {
         "path": safe_path,
@@ -215,6 +310,7 @@ def build_artifact_bundle(workspace: str | Path, execution: dict[str, Any]) -> b
         for item in files:
             safe_path = item["path"]
             file_path = resolve_artifact_file(workspace, safe_path)
+            assert_artifact_safe_for_exposure(file_path)
             archive.write(file_path, arcname=safe_path)
     return buffer.getvalue()
 
