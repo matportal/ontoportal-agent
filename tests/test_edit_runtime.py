@@ -9,7 +9,7 @@ if importlib.util.find_spec("ontoportal_agent") is None:
     pytest.skip("ontoportal_agent package not available", allow_module_level=True)
 
 from ontoportal_agent.config import get_settings
-from ontoportal_agent.edit_runtime import DeepAgentsEditRuntime, OpenCodeEditRuntime, create_edit_runtime, normalize_edit_runtime_name
+from ontoportal_agent.edit_runtime import DeepAgentsEditRuntime, OpenCodeEditRuntime, PiEditRuntime, create_edit_runtime, normalize_edit_runtime_name
 from ontoportal_agent.edit_runtime.base import EditRuntimeRequest
 from ontoportal_agent.opencode_executor import OpenCodeAccountAuth
 
@@ -42,14 +42,109 @@ def test_create_edit_runtime_defaults_to_opencode(monkeypatch, tmp_path):
     assert runtime.capabilities.supports_mcp is True
 
 
-def test_create_edit_runtime_rejects_pi_until_adapter_exists(monkeypatch, tmp_path):
+def test_create_edit_runtime_gates_pi(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
     monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
     get_settings.cache_clear()
 
-    with pytest.raises(ValueError, match="Pi edit runtime is not available"):
+    with pytest.raises(ValueError, match="Pi edit runtime is disabled"):
         create_edit_runtime("pi")
+
+    monkeypatch.setenv("ONTOAGENT_PI_ADAPTER_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_PI_MODEL", "antigravity/gemini-3.5-flash")
+    get_settings.cache_clear()
+    runtime = create_edit_runtime("pi")
+
+    assert isinstance(runtime, PiEditRuntime)
+    assert runtime.capabilities.runtime == "pi"
+    assert runtime.capabilities.supports_artifacts is True
+
+
+def test_pi_runtime_writes_structured_artifacts(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_PI_ADAPTER_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_PI_PATH", "/usr/bin/true")
+    monkeypatch.setenv("ONTOAGENT_PI_MODEL", "antigravity/gemini-3.5-flash")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_ROBOT_ENABLED", "false")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_KEEP_WORKSPACE", "false")
+    get_settings.cache_clear()
+
+    import ontoportal_agent.edit_runtime.pi as pi_runtime_module
+
+    captured: dict[str, object] = {}
+    real_run = pi_runtime_module.subprocess.run
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+        @property
+        def stdout(self):
+            payload = {
+                "summary": "Pi prepared proposal artifacts.",
+                "artifacts": [
+                    {
+                        "path": "proposal.ttl",
+                        "content": "@prefix ex: <https://example.org/> .\nex:PiMaterial a ex:Class .\n",
+                    },
+                    {"path": "validation-summary.json", "content": '{"status":"passed"}\n'},
+                ],
+            }
+            return "\n".join(
+                [
+                    '{"type":"session","version":3}',
+                    json_line(
+                        {
+                            "type": "agent_end",
+                            "messages": [
+                                {"role": "assistant", "content": [{"type": "text", "text": json_dumps(payload)}]}
+                            ],
+                        }
+                    ),
+                ]
+            )
+
+    def json_dumps(value):
+        import json
+
+        return json.dumps(value)
+
+    def json_line(value):
+        import json
+
+        return json.dumps(value)
+
+    def _fake_run(command, **kwargs):
+        if command and command[0] == "/usr/bin/true":
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return _Completed()
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(pi_runtime_module.subprocess, "run", _fake_run)
+
+    runtime = create_edit_runtime("pi")
+    events = list(
+        runtime.stream(
+            EditRuntimeRequest(
+                prompt="Draft a tiny Pi ontology artifact.",
+                thread_id="thread-pi",
+                trace_id="trace-pi",
+            )
+        )
+    )
+
+    assert captured["command"][:5] == ["/usr/bin/true", "--mode", "json", "--print", "--no-tools"]
+    assert "--no-session" in captured["command"]
+    assert any(event["type"] == "workspace_mode" and event["content"].get("runtime") == "pi" for event in events)
+    changed = next(event["content"] for event in events if event["type"] == "changed_files")
+    changed_paths = {item["path"] for item in changed}
+    assert changed_paths >= {"proposal.ttl", "validation-summary.json"}
+    validation_event = next(event["content"] for event in events if event["type"] == "validation_report")
+    assert validation_event["ok"] is True
 
 
 def test_create_edit_runtime_gates_deepagents(monkeypatch, tmp_path):
@@ -82,6 +177,25 @@ def test_deepagents_runtime_preserves_opencode_codex_account_auth_users(monkeypa
         account_auth=OpenCodeAccountAuth(
             kind="codex",
             opencode_auth_json='{"provider":"antigravity","refresh":"rotated-refresh"}',
+            codex_auth_json='{"tokens":{"access_token":"codex-token"}}',
+        ),
+    )
+
+    assert isinstance(runtime, OpenCodeEditRuntime)
+    assert runtime.capabilities.runtime == "opencode"
+
+
+def test_pi_runtime_preserves_opencode_account_auth_users(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_PI_ADAPTER_ENABLED", "true")
+    get_settings.cache_clear()
+
+    runtime = create_edit_runtime(
+        "pi",
+        account_auth=OpenCodeAccountAuth(
+            kind="codex",
             codex_auth_json='{"tokens":{"access_token":"codex-token"}}',
         ),
     )

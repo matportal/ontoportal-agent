@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git nodejs npm curl default-jre-headless \
-    && npm install -g @openai/codex opencode-ai \
+    && npm install -g @openai/codex opencode-ai @earendil-works/pi-coding-agent \
     && mkdir -p /opt/robot \
     && curl -fsSL -o /opt/robot/robot.jar https://github.com/ontodev/robot/releases/latest/download/robot.jar \
     && npm cache clean --force \

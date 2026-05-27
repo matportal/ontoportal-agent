@@ -2004,6 +2004,8 @@ def _edit_runtime_label(result: OpenCodeExecutionResult) -> str:
     runtime = str(getattr(result, "runtime", "") or "opencode").strip().lower()
     if runtime == "deepagents":
         return "Deep Agents"
+    if runtime == "pi":
+        return "Pi"
     return "OpenCode"
 
 

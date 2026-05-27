@@ -8,6 +8,7 @@ from ..opencode_executor import OpenCodeAccountAuth, OpenCodeProviderAuth
 from .base import EditRuntime
 from .deepagents import DeepAgentsEditRuntime
 from .opencode import OpenCodeEditRuntime
+from .pi import PiEditRuntime
 
 _OPENCODE_ALIASES = {"", "opencode", "open-code", "workspace"}
 _DEEPAGENTS_ALIASES = {"deepagents", "deep-agents", "langchain-deepagents", "langchain_deepagents"}
@@ -68,4 +69,19 @@ def create_edit_runtime(
             account_auth=account_auth,
             model=model,
         )
-    raise ValueError("Pi edit runtime is not available until ONTOAGENT_PI_ADAPTER_ENABLED is backed by an adapter.")
+    if runtime == "pi":
+        if not settings.pi_adapter_enabled:
+            raise ValueError("Pi edit runtime is disabled by ONTOAGENT_PI_ADAPTER_ENABLED.")
+        if account_auth is not None:
+            # Pi has its own auth/config home. Do not translate or inject OpenCode/Codex
+            # account-auth JSON into Pi; preserve those users on the mature runtime.
+            return OpenCodeEditRuntime(
+                provider_auth=provider_auth,
+                account_auth=account_auth,
+                mcp_servers=mcp_servers,
+            )
+        return PiEditRuntime(
+            runtime_options=runtime_options,
+            model=settings.pi_model,
+        )
+    raise ValueError("Unsupported assistant edit runtime.")
