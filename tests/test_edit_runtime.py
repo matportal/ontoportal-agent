@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 from types import ModuleType
 
@@ -145,6 +146,28 @@ def test_pi_runtime_writes_structured_artifacts(monkeypatch, tmp_path):
     assert changed_paths >= {"proposal.ttl", "validation-summary.json"}
     validation_event = next(event["content"] for event in events if event["type"] == "validation_report")
     assert validation_event["ok"] is True
+
+
+def test_pi_runtime_extracts_fenced_json_with_nested_artifact_fences(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    payload = {
+        "summary": "Nested JSON artifact content is preserved.",
+        "artifacts": [
+            {
+                "path": "operator-report.md",
+                "content": "# Report\n\n```json\n{\n  \"status\": \"passed\"\n}\n```\n",
+            },
+            {"path": "validation-summary.json", "content": '{"status":"passed"}\n'},
+        ],
+    }
+
+    parsed = PiEditRuntime()._extract_json_object(f"```json\n{json.dumps(payload)}\n```")
+
+    assert parsed == payload
 
 
 def test_create_edit_runtime_gates_deepagents(monkeypatch, tmp_path):

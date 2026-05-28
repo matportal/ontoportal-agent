@@ -248,13 +248,11 @@ class PiEditRuntime:
 
     def _extract_json_object(self, text: str) -> dict[str, Any]:
         clean = str(text or "").strip()
-        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean, flags=re.IGNORECASE | re.DOTALL)
-        if fence:
-            clean = fence.group(1).strip()
         try:
             payload = json.loads(clean)
         except JSONDecodeError:
             decoder = json.JSONDecoder()
+            first_object: Any | None = None
             payload = None
             for index, char in enumerate(clean):
                 if char != "{":
@@ -263,8 +261,13 @@ class PiEditRuntime:
                     candidate, _ = decoder.raw_decode(clean[index:])
                 except JSONDecodeError:
                     continue
-                payload = candidate
-                break
+                if not isinstance(candidate, dict):
+                    continue
+                first_object = first_object or candidate
+                if any(key in candidate for key in ("artifacts", "summary", "final_text")):
+                    payload = candidate
+                    break
+            payload = payload or first_object
             if payload is None:
                 raise PiRuntimeError("Pi response did not contain a valid JSON artifact bundle.")
         if not isinstance(payload, dict):
