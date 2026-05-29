@@ -625,6 +625,15 @@ def test_validation_report_adds_non_blocking_workflow_warnings(monkeypatch, tmp_
     assert "edit-plan.json" in warning_text
     assert "evidence-ledger.json" in warning_text
     assert "ontology artifact" not in warning_text
+    workflow = report["workflow"]
+    assert workflow["strict"] is False
+    assert workflow["ok"] is False
+    assert workflow["ontology_artifact"]["present"] is True
+    assert "proposal.ttl" in workflow["ontology_artifact"]["paths"]
+    by_name = {item["name"]: item for item in workflow["required_artifacts"]}
+    assert by_name["operator-report.md"]["present"] is True
+    assert by_name["edit-plan.json"]["present"] is False
+    assert "edit-plan.json" in workflow["missing"]
 
 
 def test_validation_report_fails_missing_workflow_when_strict(monkeypatch, tmp_path):
@@ -649,6 +658,9 @@ def test_validation_report_fails_missing_workflow_when_strict(monkeypatch, tmp_p
     assert report["status"] == "failed"
     assert "edit-plan.json" in error_text
     assert "ontology artifact" in error_text
+    assert report["workflow"]["strict"] is True
+    assert report["workflow"]["ontology_artifact"]["present"] is False
+    assert "ontology-artifact" in report["workflow"]["missing"]
 
 
 def test_validation_report_rejects_symlink_escape(monkeypatch, tmp_path):

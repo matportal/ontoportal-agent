@@ -1231,7 +1231,7 @@ class OpenCodeExecutor:
             if isinstance(robot_check, dict) and robot_check.get("status") in {"skipped", "unavailable"}:
                 warnings.append({"path": path_text, "message": str(robot_check.get("message") or "ROBOT validation unavailable.")})
 
-        workflow_warnings, workflow_errors = self._workflow_completeness_findings(
+        workflow_report, workflow_warnings, workflow_errors = self._workflow_completeness_findings(
             workspace=workspace,
             changed_files=changed_files,
         )
@@ -1254,6 +1254,7 @@ class OpenCodeExecutor:
             "checked_files": checked_files,
             "errors": errors,
             "warnings": warnings,
+            "workflow": workflow_report,
             "summary": f"{passed} passed, {failed} failed, {skipped} skipped",
         }
 
@@ -1262,7 +1263,7 @@ class OpenCodeExecutor:
         *,
         workspace: Path,
         changed_files: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    ) -> tuple[dict[str, Any], list[dict[str, str]], list[dict[str, str]]]:
         present_paths = {
             str(item.get("path") or "").strip()
             for item in changed_files
@@ -1281,8 +1282,28 @@ class OpenCodeExecutor:
             pass
 
         present_names = {Path(path).name for path in present_paths}
-        missing = [artifact for artifact in _WORKFLOW_REQUIRED_ARTIFACTS if artifact not in present_names]
-        has_ontology_artifact = any(Path(path).suffix.lower() in _WORKFLOW_ONTOLOGY_SUFFIXES for path in present_paths)
+        artifact_items = [
+            {
+                "name": artifact,
+                "present": artifact in present_names,
+                "path": next((path for path in sorted(present_paths) if Path(path).name == artifact), ""),
+            }
+            for artifact in _WORKFLOW_REQUIRED_ARTIFACTS
+        ]
+        missing = [item["name"] for item in artifact_items if not item["present"]]
+        ontology_paths = sorted(path for path in present_paths if Path(path).suffix.lower() in _WORKFLOW_ONTOLOGY_SUFFIXES)
+        has_ontology_artifact = bool(ontology_paths)
+        workflow_report: dict[str, Any] = {
+            "strict": bool(self.settings.opencode_strict_workflow_enabled),
+            "required_artifacts": artifact_items,
+            "ontology_artifact": {
+                "present": has_ontology_artifact,
+                "paths": ontology_paths,
+                "suffixes": sorted(_WORKFLOW_ONTOLOGY_SUFFIXES),
+            },
+            "missing": missing + ([] if has_ontology_artifact else ["ontology-artifact"]),
+            "ok": not missing and has_ontology_artifact,
+        }
         findings: list[dict[str, str]] = [
             {
                 "path": artifact,
@@ -1298,10 +1319,10 @@ class OpenCodeExecutor:
                 }
             )
         if not findings:
-            return [], []
+            return workflow_report, [], []
         if self.settings.opencode_strict_workflow_enabled:
-            return [], findings
-        return findings, []
+            return workflow_report, [], findings
+        return workflow_report, findings, []
 
     def _workspace_file_path(self, workspace: Path, path_text: str) -> Path | None:
         relative = Path(path_text)
