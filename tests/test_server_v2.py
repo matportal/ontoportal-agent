@@ -2190,6 +2190,35 @@ def test_me_routes_reject_bad_signature(monkeypatch, tmp_path):
     assert response.status_code == 401
 
 
+def test_bootstrap_exposes_default_off_ontology_copilot_flags(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+
+    response = client.get("/api/v1/me/bootstrap", headers=_signed_headers())
+
+    assert response.status_code == 200
+    features = response.json()["features"]
+    assert features["ontology_copilot"] is False
+    assert features["ontology_ui_panels"] is False
+    assert features["ontology_reasoner"] is False
+    assert features["ontology_build_profiles"] is False
+
+
+def test_skills_include_gated_ontology_copilot_capabilities(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+
+    response = client.get("/api/v1/me/skills", headers=_signed_headers())
+
+    assert response.status_code == 200
+    skills = {item["id"]: item for item in response.json()["skills"]}
+    assert skills["structured_ontology_proposals"]["enabled"] is False
+    assert skills["structured_ontology_proposals"]["status"] == "disabled"
+    assert skills["reuse_before_create"]["enabled"] is False
+    assert skills["async_reasoner_checks"]["status"] == "blocked"
+    assert skills["build_profiles"]["status"] == "blocked"
+
+
 def test_stream_agent_response_keeps_markdown_queries_in_retrieve_mode(monkeypatch):
     observed = {"graph_called": False}
 

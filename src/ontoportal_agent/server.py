@@ -1438,6 +1438,55 @@ def _assistant_installed_skills(settings_payload: dict[str, Any]) -> list[dict[s
             ],
         },
         {
+            "id": "structured_ontology_proposals",
+            "name": "Structured ontology proposals",
+            "category": "Ontology Copilot",
+            "enabled": bool(settings.ontology_copilot_enabled),
+            "status": "enabled" if settings.ontology_copilot_enabled else "disabled",
+            "description": "Validates schema-versioned ontology proposal, competency-question, reuse-candidate, and validation-summary artifacts.",
+            "details": [
+                "Schema version: ontology-copilot/v1",
+                "Proposal-only: no live ontology mutation or publishing.",
+                "Required before future reasoner/build/apply workflows are enabled.",
+            ],
+        },
+        {
+            "id": "competency_question_guidance",
+            "name": "Competency question guidance",
+            "category": "Ontology Copilot",
+            "enabled": bool(settings.ontology_method_panel_enabled),
+            "status": "enabled" if settings.ontology_method_panel_enabled else "disabled",
+            "description": "Captures goals, scope, assumptions, and competency questions for guided ontology design.",
+            "details": ["Default-off methodology panel; quick-edit flows remain available."],
+        },
+        {
+            "id": "reuse_before_create",
+            "name": "Reuse before create",
+            "category": "Ontology Copilot",
+            "enabled": bool(settings.ontology_reuse_enabled),
+            "status": "enabled" if settings.ontology_reuse_enabled else "disabled",
+            "description": "Prompts and validates reuse-candidate artifacts before minting new classes or properties.",
+            "details": ["Prefer SKOS mappings by default; owl:equivalent* remains human-review only."],
+        },
+        {
+            "id": "async_reasoner_checks",
+            "name": "Async reasoner checks",
+            "category": "Validation",
+            "enabled": bool(settings.ontology_reasoner_enabled),
+            "status": "blocked" if not settings.ontology_reasoner_enabled else "enabled",
+            "description": "Reserved for future queued OWL consistency/classification jobs; never runs in the request path.",
+            "details": ["Default-off until async job tracking and packaging are complete."],
+        },
+        {
+            "id": "build_profiles",
+            "name": "Build profiles",
+            "category": "Build",
+            "enabled": bool(settings.ontology_build_profiles_enabled),
+            "status": "blocked" if not settings.ontology_build_profiles_enabled else "enabled",
+            "description": "Reserved for future dry-run/release artifact builds with whitelisted steps only.",
+            "details": ["No arbitrary shell commands; no publish/apply without a separate approval contract."],
+        },
+        {
             "id": "matportal_rag_mcp",
             "name": "MatPortal RAG MCP",
             "category": "MCP",
@@ -2894,6 +2943,7 @@ def me_bootstrap(
     user_context = _resolve_user_context(request)
     _cleanup_old_history(session, user_id=user_context.user_id)
     settings_payload = _load_effective_settings(session, user_id=user_context.user_id, include_secrets=False)
+    settings = get_settings()
     return {
         "user": {
             "id": user_context.user_id,
@@ -2904,6 +2954,14 @@ def me_bootstrap(
             "settings": True,
             "history": True,
             "mcp": True,
+            "ontology_copilot": bool(settings.ontology_copilot_enabled),
+            "ontology_ui_panels": bool(settings.ontology_ui_panels_enabled),
+            "ontology_method_panel": bool(settings.ontology_method_panel_enabled),
+            "ontology_reuse": bool(settings.ontology_reuse_enabled),
+            "ontology_advanced_validation": bool(settings.ontology_advanced_validation_enabled),
+            "ontology_reasoner": bool(settings.ontology_reasoner_enabled),
+            "ontology_shacl": bool(settings.ontology_shacl_enabled),
+            "ontology_build_profiles": bool(settings.ontology_build_profiles_enabled),
         },
         "settings": _serialize_settings_for_output(settings_payload),
         "threads": [_serialize_thread(item) for item in list_threads(session, user_id=user_context.user_id)],

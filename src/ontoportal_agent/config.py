@@ -277,6 +277,43 @@ class AgentSettings(BaseSettings):
         ),
     )
 
+    # Ontology copilot feature gates. Keep all risky behavior default-off.
+    ontology_copilot_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "ONTOLOGY_COPILOT_ENABLED"),
+    )
+    ontology_ui_panels_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_UI_PANELS_ENABLED", "ONTOLOGY_UI_PANELS_ENABLED"),
+    )
+    ontology_method_panel_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_METHOD_PANEL_ENABLED", "ONTOLOGY_METHOD_PANEL_ENABLED"),
+    )
+    ontology_reuse_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_REUSE_ENABLED", "ONTOLOGY_REUSE_ENABLED"),
+    )
+    ontology_advanced_validation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ONTOAGENT_ONTOLOGY_ADVANCED_VALIDATION_ENABLED",
+            "ONTOLOGY_ADVANCED_VALIDATION_ENABLED",
+        ),
+    )
+    ontology_reasoner_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_REASONER_ENABLED", "ONTOLOGY_REASONER_ENABLED"),
+    )
+    ontology_shacl_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_SHACL_ENABLED", "ONTOLOGY_SHACL_ENABLED"),
+    )
+    ontology_build_profiles_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ONTOAGENT_ONTOLOGY_BUILD_PROFILES_ENABLED", "ONTOLOGY_BUILD_PROFILES_ENABLED"),
+    )
+
     # Approval gate
     require_manual_approval: bool = Field(
         default=True,

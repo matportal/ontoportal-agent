@@ -276,7 +276,24 @@ def test_opencode_edit_prompt_references_ontology_toolkit(monkeypatch, tmp_path)
     assert "Use the ontoportal_api MCP server" in prompt
     assert "matportal-ontology-toolkit/" in prompt
     assert "Copy toolkit templates into new proposal files" in prompt
+    assert "ontology-proposal.json" not in prompt
     assert "User request:\nDraft a Turtle proposal for aluminium alloys." in prompt
+
+
+def test_opencode_edit_prompt_adds_schema_guidance_when_ontology_copilot_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    prompt = executor._opencode_prompt("Draft a structured proposal.", task="edit")
+
+    assert "ontology-proposal.json" in prompt
+    assert "competency-questions.json" in prompt
+    assert "reuse-candidates.json" in prompt
+    assert "schema_version ontology-copilot/v1" in prompt
 
 
 def test_opencode_edit_prompt_describes_full_ontology_workflow(monkeypatch, tmp_path):
@@ -593,7 +610,212 @@ def test_validation_report_checks_rdf_json_and_text_artifacts(monkeypatch, tmp_p
     assert by_path["proposal.ttl"]["triples"] == 1
     assert by_path["broken.json"]["status"] == "failed"
     assert by_path["notes.md"]["status"] == "skipped"
+    assert report["diagnostic_summary"]["total"] >= 3
+    assert any(item["path"] == "broken.json" and item["status"] == "failed" for item in report["diagnostics"])
     assert str(workspace) not in json.dumps(report)
+
+
+def test_validation_report_uses_legacy_json_parse_when_ontology_copilot_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "false")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-copilot-disabled-json")
+    (workspace / "ontology-proposal.json").write_text(json.dumps({"ordinary": "json"}), encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "ontology-proposal.json", "kind": "json"}],
+    )
+
+    entry = report["checked_files"][0]
+    assert entry["status"] == "passed"
+    assert "schema" not in entry
+
+
+def test_validation_report_validates_structured_ontology_proposal(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-structured-proposal")
+    (workspace / "proposal.ttl").write_text(
+        "@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n",
+        encoding="utf-8",
+    )
+    (workspace / "ontology-proposal.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "title": "Add processing method term",
+                "summary": "Draft proposal only.",
+                "goals": ["Represent processing methods."],
+                "scope": "Review-only proposal.",
+                "competency_questions": [
+                    {
+                        "id": "CQ1",
+                        "question": "Which materials use the method?",
+                        "expected_answer": "Materials can be queried by method.",
+                    }
+                ],
+                "reuse_candidates": [
+                    {
+                        "label": "Sintering",
+                        "iri": "https://example.org/Sintering",
+                        "source_ontology": "EX",
+                        "confidence": 0.8,
+                        "recommended_action": "reuse",
+                        "rationale": "Existing candidate found.",
+                    }
+                ],
+                "operations": [
+                    {
+                        "operation": "create_class",
+                        "entity_type": "class",
+                        "iri": "https://example.org/ProcessingMethod",
+                        "label": "Processing method",
+                        "rationale": "Needed for the competency question.",
+                        "evidence": [{"source": "matportal_rag", "citation": "chunk-1"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[
+            {"status": "A", "path": "proposal.ttl", "kind": "ttl"},
+            {"status": "A", "path": "ontology-proposal.json", "kind": "json"},
+        ],
+    )
+
+    by_path = {item["path"]: item for item in report["checked_files"]}
+    assert by_path["ontology-proposal.json"]["status"] == "passed"
+    assert by_path["ontology-proposal.json"]["schema"]["schema"] == "OntologyProposal"
+    structured = {item["name"]: item for item in report["workflow"]["structured_artifacts"]}
+    assert structured["ontology-proposal.json"]["present"] is True
+
+
+def test_validation_report_rejects_invalid_structured_ontology_proposal(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-invalid-structured-proposal")
+    (workspace / "ontology-proposal.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "title": "Invalid proposal",
+                "summary": "Contains /tmp/private.txt and should be rejected.",
+                "competency_questions": [],
+                "operations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "ontology-proposal.json", "kind": "json"}],
+    )
+
+    entry = report["checked_files"][0]
+    assert report["ok"] is False
+    assert entry["status"] == "failed"
+    assert entry["schema"]["status"] == "failed"
+    assert "absolute local filesystem paths" in entry["message"]
+
+
+def test_structured_ontology_schema_requires_version_and_rejects_extra_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-schema-version-extra")
+    (workspace / "ontology-proposal.json").write_text(
+        json.dumps(
+            {
+                "title": "Missing version",
+                "competency_questions": [{"id": "CQ1", "question": "What is proposed?"}],
+                "operations": [
+                    {
+                        "operation": "create_class",
+                        "entity_type": "class",
+                        "iri": "https://example.org/Thing",
+                        "label": "Thing",
+                        "rationale": "Needed for review.",
+                        "publish": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    missing_version = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "ontology-proposal.json", "kind": "json"}],
+    )
+    assert missing_version["checked_files"][0]["status"] == "failed"
+    assert "schema_version" in missing_version["checked_files"][0]["message"]
+
+    payload = json.loads((workspace / "ontology-proposal.json").read_text(encoding="utf-8"))
+    payload["schema_version"] = "ontology-copilot/v1"
+    (workspace / "ontology-proposal.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    extra_field = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "ontology-proposal.json", "kind": "json"}],
+    )
+    assert extra_field["checked_files"][0]["status"] == "failed"
+    assert "operations.0.publish" in extra_field["checked_files"][0]["message"]
+
+
+def test_validation_summary_schema_scans_nested_diagnostics(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-validation-summary-diagnostics")
+    (workspace / "validation-summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "status": "warning",
+                "summary": "Validation completed with diagnostics.",
+                "diagnostics": [{"message": "Parser referenced /tmp/private.ttl"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "validation-summary.json", "kind": "json"}],
+    )
+
+    entry = report["checked_files"][0]
+    assert entry["status"] == "failed"
+    assert "diagnostics.0.message" in entry["message"]
+    assert "absolute local filesystem paths" in entry["message"]
 
 
 def test_validation_report_adds_non_blocking_workflow_warnings(monkeypatch, tmp_path):
@@ -634,6 +856,71 @@ def test_validation_report_adds_non_blocking_workflow_warnings(monkeypatch, tmp_
     assert by_name["operator-report.md"]["present"] is True
     assert by_name["edit-plan.json"]["present"] is False
     assert "edit-plan.json" in workflow["missing"]
+
+
+def test_ontology_copilot_enabled_requires_structured_workflow_artifacts(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_STRICT_WORKFLOW_ENABLED", "false")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-copilot-workflow-warnings")
+    for name in ["edit-plan.json", "evidence-ledger.json", "validation-summary.json"]:
+        (workspace / name).write_text('{"schema_version":"ontology-copilot/v1","status":"skipped"}', encoding="utf-8")
+    (workspace / "operator-report.md").write_text("Operator report", encoding="utf-8")
+    (workspace / "draft-submission.md").write_text("Draft submission", encoding="utf-8")
+    (workspace / "proposal.ttl").write_text("@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n", encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[
+            {"status": "A", "path": "edit-plan.json", "kind": "json"},
+            {"status": "A", "path": "evidence-ledger.json", "kind": "json"},
+            {"status": "A", "path": "validation-summary.json", "kind": "json"},
+            {"status": "A", "path": "operator-report.md", "kind": "md"},
+            {"status": "A", "path": "draft-submission.md", "kind": "md"},
+            {"status": "A", "path": "proposal.ttl", "kind": "ttl"},
+        ],
+    )
+
+    warning_text = "\n".join(item["message"] for item in report["warnings"])
+    assert report["ok"] is True
+    assert report["workflow"]["ok"] is False
+    assert "ontology-proposal.json" in warning_text
+    assert "competency-questions.json" in report["workflow"]["missing"]
+    assert "validation-summary.json" not in report["workflow"]["missing"]
+
+
+def test_ontology_copilot_structured_workflow_artifacts_are_strict_errors(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_STRICT_WORKFLOW_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = tmp_path / "copilot-workflow-strict-workspace"
+    workspace.mkdir()
+    for name in ["edit-plan.json", "evidence-ledger.json", "validation-summary.json"]:
+        (workspace / name).write_text('{"schema_version":"ontology-copilot/v1","status":"skipped"}', encoding="utf-8")
+    (workspace / "operator-report.md").write_text("Operator report", encoding="utf-8")
+    (workspace / "draft-submission.md").write_text("Draft submission", encoding="utf-8")
+    (workspace / "proposal.ttl").write_text("@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n", encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "proposal.ttl", "kind": "ttl"}],
+    )
+
+    error_text = "\n".join(item["message"] for item in report["errors"])
+    assert report["ok"] is False
+    assert report["status"] == "failed"
+    assert "ontology-proposal.json" in error_text
+    assert "reuse-candidates.json" in report["workflow"]["missing"]
 
 
 def test_validation_report_fails_missing_workflow_when_strict(monkeypatch, tmp_path):

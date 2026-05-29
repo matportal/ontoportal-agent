@@ -21,6 +21,8 @@ from rdflib import Graph
 from .antigravity_models import antigravity_opencode_provider_config, normalize_antigravity_model_ref
 from .artifact_store import resolve_safe_workspace
 from .config import AgentSettings, get_settings
+from .ontology.diagnostics import normalize_validation_report
+from .ontology.proposals import STRUCTURED_ONTOLOGY_ARTIFACTS, validate_ontology_proposal_payload
 
 _ONTOLOGY_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
 _WORKFLOW_REQUIRED_ARTIFACTS = (
@@ -387,6 +389,10 @@ class OpenCodeExecutor:
         files = {
             "README.md": self._ontology_toolkit_readme(),
             "proposal-template.ttl": self._ontology_turtle_template(),
+            "ontology-proposal-template.json": self._ontology_proposal_template(),
+            "competency-questions-template.json": self._competency_questions_template(),
+            "reuse-candidates-template.json": self._reuse_candidates_template(),
+            "validation-summary-template.json": self._validation_summary_template(),
             "operator-report-template.md": self._operator_report_template(),
             "review-checklist.json": self._review_checklist_template(),
             "draft-submission-template.md": self._draft_submission_template(),
@@ -407,9 +413,10 @@ class OpenCodeExecutor:
                 "3. Use provider web search only when needed for domain modeling; with Antigravity, prefer `google_search` and cite sources.",
                 "4. Write an edit plan before drafting, then inspect the ontology again after drafting or validation feedback.",
                 "5. Copy `proposal-template.ttl` into a new `.ttl` file for RDF/Turtle proposals.",
-                "6. Copy `operator-report-template.md` and `draft-submission-template.md` for review notes and a draft submission package.",
-                "7. Keep generated artifacts at the workspace root or in a purpose-named subdirectory.",
-                "8. Finish with a short summary naming changed files, validation status, search/provenance, and assumptions.",
+                "6. When ontology copilot schema mode is requested, copy the JSON templates to workspace-root files named `ontology-proposal.json`, `competency-questions.json`, `reuse-candidates.json`, and `validation-summary.json`.",
+                "7. Copy `operator-report-template.md` and `draft-submission-template.md` for review notes and a draft submission package.",
+                "8. Keep generated artifacts at the workspace root or in a purpose-named subdirectory.",
+                "9. Finish with a short summary naming changed files, validation status, search/provenance, and assumptions.",
                 "",
                 "Do not put credentials, API keys, or absolute local paths into generated artifacts.",
                 "Do not edit toolkit files unless the user explicitly asks for a toolkit change.",
@@ -437,6 +444,99 @@ class OpenCodeExecutor:
                 "",
             ]
         )
+
+    def _ontology_proposal_template(self) -> str:
+        return json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "proposal_id": "draft-proposal-1",
+                "title": "Replace with proposal title",
+                "summary": "Short operator-facing summary of the proposed ontology change.",
+                "ontology_acronym": "",
+                "goals": ["Replace with the goal this edit supports."],
+                "scope": "Describe in-scope and out-of-scope modeling boundaries.",
+                "competency_questions": [
+                    {
+                        "id": "CQ1",
+                        "question": "What question should the ontology answer after this edit?",
+                        "expected_answer": "Describe the expected answer or inference.",
+                        "status": "draft",
+                    }
+                ],
+                "reuse_candidates": [
+                    {
+                        "label": "Candidate existing term",
+                        "iri": "",
+                        "source_ontology": "",
+                        "confidence": 0.0,
+                        "recommended_action": "needs_review",
+                        "rationale": "Explain whether to reuse, map, extend, or reject.",
+                    }
+                ],
+                "operations": [
+                    {
+                        "operation": "create_class",
+                        "entity_type": "class",
+                        "iri": "https://example.org/replace-me",
+                        "label": "Replace me",
+                        "parent_iri": "",
+                        "target_iri": "",
+                        "mapping_relation": None,
+                        "turtle": "",
+                        "rationale": "Explain why this operation is needed.",
+                        "evidence": [{"source": "RAG/API inspection", "citation": "", "url": "", "quote": ""}],
+                    }
+                ],
+                "assumptions": [],
+                "risks": [],
+            },
+            indent=2,
+        ) + "\n"
+
+    def _competency_questions_template(self) -> str:
+        return json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "questions": [
+                    {
+                        "id": "CQ1",
+                        "question": "What question should the ontology answer?",
+                        "expected_answer": "Describe the expected answer or inference.",
+                        "status": "draft",
+                    }
+                ],
+            },
+            indent=2,
+        ) + "\n"
+
+    def _reuse_candidates_template(self) -> str:
+        return json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "candidates": [
+                    {
+                        "label": "Candidate existing term",
+                        "iri": "",
+                        "source_ontology": "",
+                        "confidence": 0.0,
+                        "recommended_action": "needs_review",
+                        "rationale": "Explain whether to reuse, map, extend, or reject.",
+                    }
+                ],
+            },
+            indent=2,
+        ) + "\n"
+
+    def _validation_summary_template(self) -> str:
+        return json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "status": "skipped",
+                "summary": "Validation has not run yet.",
+                "diagnostics": [],
+            },
+            indent=2,
+        ) + "\n"
 
     def _operator_report_template(self) -> str:
         return "\n".join(
@@ -912,6 +1012,11 @@ class OpenCodeExecutor:
             if self._uses_antigravity_account_auth()
             else "- Do not assume provider-native web search is available; if no explicit search tool is present, continue with RAG/API evidence and note the limitation.\n"
         )
+        structured_guidance = (
+            "- Ontology copilot schema mode is enabled: also write ontology-proposal.json, competency-questions.json, reuse-candidates.json, and validation-summary.json using schema_version ontology-copilot/v1.\n"
+            if self.settings.ontology_copilot_enabled
+            else ""
+        )
         return (
             "You are preparing an ontology-edit proposal for MatPortal.\n"
             "Mandatory rules:\n"
@@ -925,6 +1030,7 @@ class OpenCodeExecutor:
             "- Copy toolkit templates into new proposal files; do not edit toolkit files unless the user explicitly asks.\n"
             "- Do not commit, push, or access git remotes.\n"
             "- Write proposed artifacts, operator notes, provenance, and a draft submission package into files in this workspace.\n"
+            f"{structured_guidance}"
             "- Prefer Turtle (.ttl) unless the user explicitly requests another format.\n"
             "- Finish with a concise operator-facing summary of proposed changes, validation status, sources used, and remaining assumptions.\n\n"
             f"User request:\n{prompt.strip()}"
@@ -1247,7 +1353,7 @@ class OpenCodeExecutor:
             status_text = "passed"
         else:
             status_text = "skipped"
-        return {
+        report = {
             "ok": failed == 0,
             "status": status_text,
             "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -1257,6 +1363,7 @@ class OpenCodeExecutor:
             "workflow": workflow_report,
             "summary": f"{passed} passed, {failed} failed, {skipped} skipped",
         }
+        return normalize_validation_report(report)
 
     def _workflow_completeness_findings(
         self,
@@ -1292,17 +1399,40 @@ class OpenCodeExecutor:
         ]
         missing = [item["name"] for item in artifact_items if not item["present"]]
         ontology_paths = sorted(path for path in present_paths if Path(path).suffix.lower() in _WORKFLOW_ONTOLOGY_SUFFIXES)
+        structured_items = [
+            {
+                "name": artifact,
+                "present": artifact in present_names,
+                "path": next((path for path in sorted(present_paths) if Path(path).name == artifact), ""),
+            }
+            for artifact in sorted(STRUCTURED_ONTOLOGY_ARTIFACTS)
+        ]
+        structured_missing = [item["name"] for item in structured_items if not item["present"]]
         has_ontology_artifact = bool(ontology_paths)
+        effective_missing = missing + (structured_missing if self.settings.ontology_copilot_enabled else [])
+        workflow_missing = effective_missing + ([] if has_ontology_artifact else ["ontology-artifact"])
+        workflow_ok = not effective_missing and has_ontology_artifact
         workflow_report: dict[str, Any] = {
             "strict": bool(self.settings.opencode_strict_workflow_enabled),
+            "ontology_copilot": {
+                "enabled": bool(self.settings.ontology_copilot_enabled),
+                "ui_panels_enabled": bool(self.settings.ontology_ui_panels_enabled),
+                "method_panel_enabled": bool(self.settings.ontology_method_panel_enabled),
+                "reuse_enabled": bool(self.settings.ontology_reuse_enabled),
+                "advanced_validation_enabled": bool(self.settings.ontology_advanced_validation_enabled),
+                "reasoner_enabled": bool(self.settings.ontology_reasoner_enabled),
+                "shacl_enabled": bool(self.settings.ontology_shacl_enabled),
+                "build_profiles_enabled": bool(self.settings.ontology_build_profiles_enabled),
+            },
             "required_artifacts": artifact_items,
+            "structured_artifacts": structured_items,
             "ontology_artifact": {
                 "present": has_ontology_artifact,
                 "paths": ontology_paths,
                 "suffixes": sorted(_WORKFLOW_ONTOLOGY_SUFFIXES),
             },
-            "missing": missing + ([] if has_ontology_artifact else ["ontology-artifact"]),
-            "ok": not missing and has_ontology_artifact,
+            "missing": workflow_missing,
+            "ok": workflow_ok,
         }
         findings: list[dict[str, str]] = [
             {
@@ -1311,6 +1441,14 @@ class OpenCodeExecutor:
             }
             for artifact in missing
         ]
+        if self.settings.ontology_copilot_enabled:
+            findings.extend(
+                {
+                    "path": artifact,
+                    "message": f"Structured ontology-copilot artifact is missing: {artifact}.",
+                }
+                for artifact in structured_missing
+            )
         if not has_ontology_artifact:
             findings.append(
                 {
@@ -1475,8 +1613,15 @@ class OpenCodeExecutor:
 
     def _validate_json_file(self, *, path: Path, display_path: str) -> dict[str, Any]:
         try:
-            json.loads(path.read_text(encoding="utf-8"))
-            return {"path": display_path, "kind": "json", "status": "passed", "parser": "json"}
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            entry: dict[str, Any] = {"path": display_path, "kind": "json", "status": "passed", "parser": "json"}
+            if self.settings.ontology_copilot_enabled and path.name in STRUCTURED_ONTOLOGY_ARTIFACTS:
+                schema_check = validate_ontology_proposal_payload(payload, artifact_name=path.name)
+                entry["schema"] = schema_check
+                if schema_check.get("status") == "failed":
+                    entry["status"] = "failed"
+                    entry["message"] = str(schema_check.get("message") or "Ontology proposal schema validation failed.")
+            return entry
         except Exception as exc:
             return {
                 "path": display_path,
