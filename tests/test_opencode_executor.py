@@ -923,6 +923,85 @@ def test_ontology_copilot_structured_workflow_artifacts_are_strict_errors(monkey
     assert "reuse-candidates.json" in report["workflow"]["missing"]
 
 
+def test_validation_report_scores_workflow_evidence_and_review_readiness(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-evidence-ready")
+    (workspace / "edit-plan.json").write_text('{"plan":[{"step":"inspect","task":"query API"}]}', encoding="utf-8")
+    (workspace / "evidence-ledger.json").write_text(
+        '{"rag":[{"source":"chunk","citation":"c1"}],"api":[{"endpoint":"/ontologies","ontology":"EX"}]}',
+        encoding="utf-8",
+    )
+    (workspace / "validation-summary.json").write_text(
+        '{"schema_version":"ontology-copilot/v1","status":"passed","summary":"ok","diagnostics":[]}',
+        encoding="utf-8",
+    )
+    (workspace / "operator-report.md").write_text(
+        "## Inspected Context\n- context inspected\n## Provenance\n- provenance\n## Assumptions\n- assumption\n## Validation\n- validation passed\n",
+        encoding="utf-8",
+    )
+    (workspace / "draft-submission.md").write_text("Draft submission", encoding="utf-8")
+    (workspace / "proposal.ttl").write_text("@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n", encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[
+            {"status": "A", "path": "edit-plan.json", "kind": "json"},
+            {"status": "A", "path": "evidence-ledger.json", "kind": "json"},
+            {"status": "A", "path": "validation-summary.json", "kind": "json"},
+            {"status": "A", "path": "operator-report.md", "kind": "md"},
+            {"status": "A", "path": "draft-submission.md", "kind": "md"},
+            {"status": "A", "path": "proposal.ttl", "kind": "ttl"},
+        ],
+    )
+
+    checks = {item["id"]: item for item in report["workflow"]["evidence_checks"]}
+    assert report["workflow"]["ok"] is True
+    assert report["review"]["ready"] is True
+    assert checks["edit_plan"]["status"] == "passed"
+    assert checks["evidence_ledger"]["status"] == "passed"
+    assert checks["operator_report"]["status"] == "passed"
+
+
+def test_validation_report_warns_on_weak_workflow_evidence(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-weak-evidence")
+    (workspace / "edit-plan.json").write_text('{"todo":[]}', encoding="utf-8")
+    (workspace / "evidence-ledger.json").write_text('{"items":[]}', encoding="utf-8")
+    (workspace / "validation-summary.json").write_text('{"status":"skipped"}', encoding="utf-8")
+    (workspace / "operator-report.md").write_text("Operator report", encoding="utf-8")
+    (workspace / "draft-submission.md").write_text("Draft submission", encoding="utf-8")
+    (workspace / "proposal.ttl").write_text("@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n", encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[
+            {"status": "A", "path": "edit-plan.json", "kind": "json"},
+            {"status": "A", "path": "evidence-ledger.json", "kind": "json"},
+            {"status": "A", "path": "validation-summary.json", "kind": "json"},
+            {"status": "A", "path": "operator-report.md", "kind": "md"},
+            {"status": "A", "path": "draft-submission.md", "kind": "md"},
+            {"status": "A", "path": "proposal.ttl", "kind": "ttl"},
+        ],
+    )
+
+    warning_text = "\n".join(item["message"] for item in report["warnings"])
+    checks = {item["id"]: item for item in report["workflow"]["evidence_checks"]}
+    assert report["workflow"]["ok"] is False
+    assert report["review"]["ready"] is False
+    assert checks["evidence_ledger"]["status"] == "warning"
+    assert "Evidence ledger may be missing evidence fields" in warning_text
+
+
 def test_validation_report_fails_missing_workflow_when_strict(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")

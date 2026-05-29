@@ -1358,6 +1358,7 @@ class OpenCodeExecutor:
             status_text = "passed"
         else:
             status_text = "skipped"
+        ready_for_review = failed == 0 and bool(workflow_report.get("ok"))
         report = {
             "ok": failed == 0,
             "status": status_text,
@@ -1366,6 +1367,11 @@ class OpenCodeExecutor:
             "errors": errors,
             "warnings": warnings,
             "workflow": workflow_report,
+            "review": {
+                "ready": ready_for_review,
+                "status": "ready" if ready_for_review else "needs_review",
+                "message": "Ready for human review." if ready_for_review else "Needs evidence, required artifacts, or validation before human review.",
+            },
             "summary": f"{passed} passed, {failed} failed, {skipped} skipped",
         }
         return normalize_validation_report(report)
@@ -1414,9 +1420,11 @@ class OpenCodeExecutor:
         ]
         structured_missing = [item["name"] for item in structured_items if not item["present"]]
         has_ontology_artifact = bool(ontology_paths)
+        evidence_checks = self._workflow_evidence_checks(workspace=workspace, present_paths=present_paths)
+        weak_evidence = [item for item in evidence_checks if item.get("present") and item.get("status") != "passed"]
         effective_missing = missing + (structured_missing if self.settings.ontology_copilot_enabled else [])
         workflow_missing = effective_missing + ([] if has_ontology_artifact else ["ontology-artifact"])
-        workflow_ok = not effective_missing and has_ontology_artifact
+        workflow_ok = not effective_missing and has_ontology_artifact and not weak_evidence
         workflow_report: dict[str, Any] = {
             "strict": bool(self.settings.opencode_strict_workflow_enabled),
             "ontology_copilot": {
@@ -1436,6 +1444,7 @@ class OpenCodeExecutor:
                 "paths": ontology_paths,
                 "suffixes": sorted(_WORKFLOW_ONTOLOGY_SUFFIXES),
             },
+            "evidence_checks": evidence_checks,
             "missing": workflow_missing,
             "ok": workflow_ok,
         }
@@ -1461,11 +1470,71 @@ class OpenCodeExecutor:
                     "message": "Workflow artifact is missing: at least one ontology artifact (.ttl, .rdf, or .owl).",
                 }
             )
+        findings.extend(
+            {
+                "path": str(item.get("path") or item.get("id") or "workflow-evidence"),
+                "message": str(item.get("message") or "Workflow evidence is incomplete."),
+            }
+            for item in weak_evidence
+        )
         if not findings:
             return workflow_report, [], []
         if self.settings.opencode_strict_workflow_enabled:
             return workflow_report, [], findings
         return workflow_report, findings, []
+
+    def _workflow_evidence_checks(self, *, workspace: Path, present_paths: set[str]) -> list[dict[str, Any]]:
+        def path_for(filename: str) -> str:
+            return next((path for path in sorted(present_paths) if Path(path).name == filename), "")
+
+        checks: list[dict[str, Any]] = []
+        checks.append(self._json_evidence_check(workspace=workspace, path_text=path_for("edit-plan.json"), check_id="edit_plan", label="Edit plan", keywords=("plan", "step", "task")))
+        checks.append(self._json_evidence_check(workspace=workspace, path_text=path_for("evidence-ledger.json"), check_id="evidence_ledger", label="Evidence ledger", keywords=("rag", "api", "ontology", "source", "citation", "endpoint")))
+        checks.append(self._json_evidence_check(workspace=workspace, path_text=path_for("validation-summary.json"), check_id="validation_summary", label="Validation summary", keywords=("schema_version", "status", "diagnostic", "summary")))
+        checks.append(self._markdown_evidence_check(workspace=workspace, path_text=path_for("operator-report.md"), check_id="operator_report", label="Operator report", keywords=("inspected", "context", "assumption", "provenance", "validation")))
+        if self.settings.ontology_copilot_enabled:
+            checks.append(self._json_evidence_check(workspace=workspace, path_text=path_for("ontology-proposal.json"), check_id="ontology_proposal", label="Ontology proposal", keywords=("schema_version", "operations", "competency_questions", "reuse_candidates")))
+        return checks
+
+    def _json_evidence_check(self, *, workspace: Path, path_text: str, check_id: str, label: str, keywords: tuple[str, ...]) -> dict[str, Any]:
+        if not path_text:
+            return {"id": check_id, "label": label, "path": "", "present": False, "status": "missing", "message": f"{label} is missing."}
+        path = self._workspace_file_path(workspace, path_text)
+        if path is None or not path.exists():
+            return {"id": check_id, "label": label, "path": path_text, "present": False, "status": "missing", "message": f"{label} is missing."}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {"id": check_id, "label": label, "path": path_text, "present": True, "status": "failed", "message": f"{label} is not valid JSON: {self._format_validation_error(exc, workspace=path.parent)}"}
+        text = json.dumps(payload, sort_keys=True).lower()
+        missing = [keyword for keyword in keywords if keyword.lower() not in text]
+        status = "passed" if not missing else "warning"
+        return {
+            "id": check_id,
+            "label": label,
+            "path": path_text,
+            "present": True,
+            "status": status,
+            "message": f"{label} evidence looks complete." if status == "passed" else f"{label} may be missing evidence fields: {', '.join(missing)}.",
+        }
+
+    def _markdown_evidence_check(self, *, workspace: Path, path_text: str, check_id: str, label: str, keywords: tuple[str, ...]) -> dict[str, Any]:
+        if not path_text:
+            return {"id": check_id, "label": label, "path": "", "present": False, "status": "missing", "message": f"{label} is missing."}
+        path = self._workspace_file_path(workspace, path_text)
+        if path is None or not path.exists():
+            return {"id": check_id, "label": label, "path": path_text, "present": False, "status": "missing", "message": f"{label} is missing."}
+        text = path.read_text(encoding="utf-8", errors="replace").lower()
+        missing = [keyword for keyword in keywords if keyword.lower() not in text]
+        status = "passed" if not missing else "warning"
+        return {
+            "id": check_id,
+            "label": label,
+            "path": path_text,
+            "present": True,
+            "status": status,
+            "message": f"{label} evidence looks complete." if status == "passed" else f"{label} may be missing sections or evidence: {', '.join(missing)}.",
+        }
 
     def _workspace_file_path(self, workspace: Path, path_text: str) -> Path | None:
         relative = Path(path_text)
