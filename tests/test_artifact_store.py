@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import time
 import zipfile
@@ -15,6 +16,7 @@ from ontoportal_agent.artifact_store import (
     cleanup_expired_workspaces,
     execution_allows_path,
     list_artifact_files,
+    ontology_artifact_summary,
     read_artifact_text,
     resolve_artifact_file,
     resolve_safe_workspace,
@@ -92,6 +94,106 @@ def test_artifact_store_lists_only_declared_files_and_bundles_available_files(tm
 
     with zipfile.ZipFile(BytesIO(build_artifact_bundle(workspace, execution))) as archive:
         assert sorted(archive.namelist()) == ["notes.md", "proposal.ttl"]
+
+
+def test_ontology_artifact_summary_extracts_safe_structured_metadata(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "ontology-proposal.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "title": "Add processing method",
+                "summary": "Draft proposal only.",
+                "goals": ["Represent processing methods."],
+                "scope": "Review-only scope.",
+                "competency_questions": [{"id": "CQ1", "question": "Which materials use the method?"}],
+                "reuse_candidates": [
+                    {
+                        "label": "Sintering",
+                        "iri": "https://example.org/Sintering",
+                        "source_ontology": "EX",
+                        "confidence": 0.9,
+                        "recommended_action": "reuse",
+                        "rationale": "Existing candidate found.",
+                    }
+                ],
+                "operations": [
+                    {
+                        "operation": "create_class",
+                        "entity_type": "class",
+                        "iri": "https://example.org/ProcessingMethod",
+                        "label": "Processing method",
+                        "rationale": "Needed for review.",
+                    }
+                ],
+                "assumptions": ["Operator review required."],
+                "risks": ["IRI policy needs review."],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "validation-summary.json").write_text(
+        json.dumps({"schema_version": "ontology-copilot/v1", "status": "warning", "summary": "Review warnings."}),
+        encoding="utf-8",
+    )
+    execution = {
+        "workspace": str(workspace),
+        "changed_files": [
+            {"status": "A", "path": "ontology-proposal.json", "kind": "json"},
+            {"status": "A", "path": "validation-summary.json", "kind": "json"},
+        ],
+        "validation_report": {
+            "diagnostics": [{"status": "warning", "path": "ontology-proposal.json", "message": "Review needed."}],
+            "diagnostic_summary": {"warnings": 1, "failed": 0},
+        },
+    }
+
+    summary = ontology_artifact_summary(execution)
+
+    assert summary["available"] is True
+    assert summary["proposal"]["title"] == "Add processing method"
+    assert summary["proposal"]["operations_count"] == 1
+    assert summary["workspace"]["competency_questions_count"] == 1
+    assert summary["reuse"]["candidates"][0]["recommended_action"] == "reuse"
+    assert summary["validation"]["status"] == "warning"
+    assert summary["validation"]["diagnostic_summary"]["warnings"] == 1
+    assert "content" not in json.dumps(summary)
+
+
+def test_ontology_artifact_summary_rejects_unsafe_structured_metadata(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "ontology-proposal.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "title": "Unsafe proposal",
+                "summary": "References /tmp/private.ttl",
+                "competency_questions": [{"id": "CQ1", "question": "What is proposed?"}],
+                "operations": [
+                    {
+                        "operation": "create_class",
+                        "entity_type": "class",
+                        "iri": "https://example.org/Thing",
+                        "label": "Thing",
+                        "rationale": "Needed for review.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    execution = {
+        "workspace": str(workspace),
+        "changed_files": [{"status": "A", "path": "ontology-proposal.json", "kind": "json"}],
+    }
+
+    summary = ontology_artifact_summary(execution)
+
+    assert summary["available"] is False
+    assert summary["proposal"] == {}
+    assert summary["errors"] == [{"path": "ontology-proposal.json", "message": "Artifact schema validation failed."}]
 
 
 def test_artifact_secret_scanner_blocks_view_and_bundle(tmp_path):

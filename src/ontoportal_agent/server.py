@@ -52,6 +52,7 @@ from .artifact_store import (
     execution_allows_path,
     file_metadata,
     list_artifact_files,
+    ontology_artifact_summary,
     read_artifact_diff,
     read_artifact_text,
     resolve_artifact_file,
@@ -2843,6 +2844,7 @@ def me_artifact_files(
         "expires_at": execution.get("expires_at"),
         "workspace": execution.get("workspace"),
         "files": list_artifact_files(execution),
+        "ontology_summary": ontology_artifact_summary(execution),
         "bundle_url": f"/assistant/artifacts/{thread_id}/{run_id}/bundle.zip",
     }
 

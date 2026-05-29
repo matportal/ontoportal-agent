@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import mimetypes
 import re
 import subprocess
@@ -8,6 +9,14 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from .ontology.proposals import (
+    CompetencyQuestionsArtifact,
+    OntologyProposal,
+    ReuseCandidatesArtifact,
+    ValidationSummaryArtifact,
+    validate_ontology_proposal_payload,
+)
 
 
 TEXT_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
@@ -277,6 +286,195 @@ def read_artifact_text(workspace: str | Path, path: str) -> dict[str, Any]:
         "size": size,
         "content_type": mimetypes.guess_type(file_path.name)[0] or "text/plain",
     }
+
+
+def _first_declared_artifact_path(execution: dict[str, Any], filename: str) -> str:
+    for item in normalize_execution_files(execution):
+        path = str(item.get("path") or "")
+        if Path(path).name == filename:
+            return path
+    return ""
+
+
+def _load_structured_json_artifact(
+    execution: dict[str, Any],
+    filename: str,
+    model: type,
+) -> tuple[Any | None, str, str]:
+    workspace = execution.get("workspace")
+    path = _first_declared_artifact_path(execution, filename)
+    if not workspace or not path:
+        return None, "", ""
+    if not execution_allows_path(execution, path):
+        return None, path, "Artifact path is not declared for this execution."
+    try:
+        payload = read_artifact_text(workspace, path)
+        raw = json.loads(str(payload.get("content") or ""))
+    except (ArtifactAccessError, json.JSONDecodeError) as exc:
+        return None, path, str(exc)
+
+    schema_check = validate_ontology_proposal_payload(raw, artifact_name=filename)
+    if schema_check.get("status") != "passed":
+        return None, path, "Artifact schema validation failed."
+    try:
+        return model.model_validate(raw), path, ""
+    except Exception:
+        return None, path, "Artifact schema validation failed."
+
+
+def _compact_text_list(values: list[str], *, limit: int = 8) -> list[str]:
+    return [str(item or "").strip() for item in values[:limit] if str(item or "").strip()]
+
+
+def ontology_artifact_summary(execution: dict[str, Any]) -> dict[str, Any]:
+    """Return a safe, UI-ready summary of structured ontology proposal artifacts."""
+
+    files = {
+        name: _first_declared_artifact_path(execution, name)
+        for name in [
+            "ontology-proposal.json",
+            "competency-questions.json",
+            "reuse-candidates.json",
+            "validation-summary.json",
+        ]
+    }
+    summary: dict[str, Any] = {
+        "available": False,
+        "files": files,
+        "proposal": {},
+        "workspace": {},
+        "reuse": {"candidates": []},
+        "validation": {},
+        "errors": [],
+    }
+
+    proposal, proposal_path, proposal_error = _load_structured_json_artifact(
+        execution,
+        "ontology-proposal.json",
+        OntologyProposal,
+    )
+    if isinstance(proposal, OntologyProposal):
+        summary["available"] = True
+        summary["proposal"] = {
+            "path": proposal_path,
+            "title": proposal.title,
+            "summary": proposal.summary,
+            "ontology_acronym": proposal.ontology_acronym,
+            "operations_count": len(proposal.operations),
+            "operations": [
+                {
+                    "operation": item.operation,
+                    "entity_type": item.entity_type,
+                    "iri": item.iri,
+                    "label": item.label,
+                    "parent_iri": item.parent_iri,
+                    "target_iri": item.target_iri,
+                    "mapping_relation": item.mapping_relation,
+                    "rationale": item.rationale,
+                }
+                for item in proposal.operations[:20]
+            ],
+            "assumptions": _compact_text_list(proposal.assumptions),
+            "risks": _compact_text_list(proposal.risks),
+        }
+        summary["workspace"] = {
+            "goals": _compact_text_list(proposal.goals),
+            "scope": proposal.scope,
+            "competency_questions_count": len(proposal.competency_questions),
+            "competency_questions": [
+                {
+                    "id": item.id,
+                    "question": item.question,
+                    "expected_answer": item.expected_answer,
+                    "status": item.status,
+                }
+                for item in proposal.competency_questions[:20]
+            ],
+        }
+        summary["reuse"] = {
+            "candidates_count": len(proposal.reuse_candidates),
+            "candidates": [
+                {
+                    "label": item.label,
+                    "iri": item.iri,
+                    "source_ontology": item.source_ontology,
+                    "confidence": item.confidence,
+                    "recommended_action": item.recommended_action,
+                    "rationale": item.rationale,
+                }
+                for item in proposal.reuse_candidates[:20]
+            ],
+        }
+    elif proposal_error:
+        summary["errors"].append({"path": proposal_path or "ontology-proposal.json", "message": proposal_error})
+
+    questions, questions_path, questions_error = _load_structured_json_artifact(
+        execution,
+        "competency-questions.json",
+        CompetencyQuestionsArtifact,
+    )
+    if isinstance(questions, CompetencyQuestionsArtifact):
+        summary["available"] = True
+        summary.setdefault("workspace", {})["competency_questions_count"] = len(questions.questions)
+        summary.setdefault("workspace", {})["competency_questions"] = [
+            {
+                "id": item.id,
+                "question": item.question,
+                "expected_answer": item.expected_answer,
+                "status": item.status,
+            }
+            for item in questions.questions[:20]
+        ]
+    elif questions_error:
+        summary["errors"].append({"path": questions_path or "competency-questions.json", "message": questions_error})
+
+    reuse, reuse_path, reuse_error = _load_structured_json_artifact(
+        execution,
+        "reuse-candidates.json",
+        ReuseCandidatesArtifact,
+    )
+    if isinstance(reuse, ReuseCandidatesArtifact):
+        summary["available"] = True
+        summary["reuse"] = {
+            "candidates_count": len(reuse.candidates),
+            "candidates": [
+                {
+                    "label": item.label,
+                    "iri": item.iri,
+                    "source_ontology": item.source_ontology,
+                    "confidence": item.confidence,
+                    "recommended_action": item.recommended_action,
+                    "rationale": item.rationale,
+                }
+                for item in reuse.candidates[:20]
+            ],
+        }
+    elif reuse_error:
+        summary["errors"].append({"path": reuse_path or "reuse-candidates.json", "message": reuse_error})
+
+    validation, validation_path, validation_error = _load_structured_json_artifact(
+        execution,
+        "validation-summary.json",
+        ValidationSummaryArtifact,
+    )
+    if isinstance(validation, ValidationSummaryArtifact):
+        summary["available"] = True
+        summary["validation"] = {
+            "path": validation_path,
+            "status": validation.status,
+            "summary": validation.summary,
+        }
+    elif validation_error:
+        summary["errors"].append({"path": validation_path or "validation-summary.json", "message": validation_error})
+
+    validation_report = execution.get("validation_report") if isinstance(execution.get("validation_report"), dict) else {}
+    diagnostics = validation_report.get("diagnostics") if isinstance(validation_report.get("diagnostics"), list) else []
+    diagnostic_summary = validation_report.get("diagnostic_summary") if isinstance(validation_report.get("diagnostic_summary"), dict) else {}
+    summary["validation"]["diagnostics"] = diagnostics[:20]
+    summary["validation"]["diagnostic_summary"] = diagnostic_summary
+    if diagnostics:
+        summary["available"] = True
+    return summary
 
 
 def read_artifact_diff(workspace: str | Path, path: str, *, max_chars: int = 120_000) -> dict[str, Any]:

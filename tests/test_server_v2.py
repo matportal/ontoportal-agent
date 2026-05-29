@@ -1383,8 +1383,10 @@ def test_artifact_endpoints_list_view_download_and_bundle(monkeypatch, tmp_path)
 
     files_resp = client.get(f"/api/v1/me/artifacts/{thread_id}/{run_id}/files", headers=headers)
     assert files_resp.status_code == 200
-    files = files_resp.json()["files"]
+    files_payload = files_resp.json()
+    files = files_payload["files"]
     assert [item["path"] for item in files] == ["proposal.ttl", "notes.md"]
+    assert files_payload["ontology_summary"]["available"] is False
     assert files[0]["viewable"] is True
     assert "absolute_path" not in files[0]
 
