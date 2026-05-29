@@ -596,6 +596,61 @@ def test_validation_report_checks_rdf_json_and_text_artifacts(monkeypatch, tmp_p
     assert str(workspace) not in json.dumps(report)
 
 
+def test_validation_report_adds_non_blocking_workflow_warnings(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_STRICT_WORKFLOW_ENABLED", "false")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-workflow-warnings")
+    (workspace / "operator-report.md").write_text("Operator report", encoding="utf-8")
+    (workspace / "proposal.ttl").write_text(
+        "@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n",
+        encoding="utf-8",
+    )
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[
+            {"status": "A", "path": "operator-report.md", "kind": "md"},
+            {"status": "A", "path": "proposal.ttl", "kind": "ttl"},
+        ],
+    )
+
+    warning_text = "\n".join(item["message"] for item in report["warnings"])
+    assert report["ok"] is True
+    assert report["status"] == "passed"
+    assert "edit-plan.json" in warning_text
+    assert "evidence-ledger.json" in warning_text
+    assert "ontology artifact" not in warning_text
+
+
+def test_validation_report_fails_missing_workflow_when_strict(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_STRICT_WORKFLOW_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = tmp_path / "workflow-strict-workspace"
+    workspace.mkdir()
+    (workspace / "operator-report.md").write_text("Operator report", encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "operator-report.md", "kind": "md"}],
+    )
+
+    error_text = "\n".join(item["message"] for item in report["errors"])
+    assert report["ok"] is False
+    assert report["status"] == "failed"
+    assert "edit-plan.json" in error_text
+    assert "ontology artifact" in error_text
+
+
 def test_validation_report_rejects_symlink_escape(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")

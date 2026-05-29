@@ -23,6 +23,14 @@ from .artifact_store import resolve_safe_workspace
 from .config import AgentSettings, get_settings
 
 _ONTOLOGY_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
+_WORKFLOW_REQUIRED_ARTIFACTS = (
+    "edit-plan.json",
+    "evidence-ledger.json",
+    "operator-report.md",
+    "validation-summary.json",
+    "draft-submission.md",
+)
+_WORKFLOW_ONTOLOGY_SUFFIXES = {".ttl", ".rdf", ".owl"}
 _RDF_FORMAT_CANDIDATES = {
     ".ttl": ("turtle",),
     ".rdf": ("xml", "turtle", "n3"),
@@ -1223,8 +1231,15 @@ class OpenCodeExecutor:
             if isinstance(robot_check, dict) and robot_check.get("status") in {"skipped", "unavailable"}:
                 warnings.append({"path": path_text, "message": str(robot_check.get("message") or "ROBOT validation unavailable.")})
 
+        workflow_warnings, workflow_errors = self._workflow_completeness_findings(
+            workspace=workspace,
+            changed_files=changed_files,
+        )
+        warnings.extend(workflow_warnings)
+        errors.extend(workflow_errors)
+
         passed = sum(1 for item in checked_files if item.get("status") == "passed")
-        failed = sum(1 for item in checked_files if item.get("status") == "failed")
+        failed = sum(1 for item in checked_files if item.get("status") == "failed") + len(workflow_errors)
         skipped = sum(1 for item in checked_files if item.get("status") == "skipped")
         if failed:
             status_text = "failed"
@@ -1241,6 +1256,52 @@ class OpenCodeExecutor:
             "warnings": warnings,
             "summary": f"{passed} passed, {failed} failed, {skipped} skipped",
         }
+
+    def _workflow_completeness_findings(
+        self,
+        *,
+        workspace: Path,
+        changed_files: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        present_paths = {
+            str(item.get("path") or "").strip()
+            for item in changed_files
+            if str(item.get("status") or "").upper() != "D" and str(item.get("path") or "").strip()
+        }
+        try:
+            root = workspace.resolve()
+            for path in root.rglob("*"):
+                if not path.is_file() or ".git" in path.parts:
+                    continue
+                try:
+                    present_paths.add(path.resolve().relative_to(root).as_posix())
+                except ValueError:
+                    continue
+        except OSError:
+            pass
+
+        present_names = {Path(path).name for path in present_paths}
+        missing = [artifact for artifact in _WORKFLOW_REQUIRED_ARTIFACTS if artifact not in present_names]
+        has_ontology_artifact = any(Path(path).suffix.lower() in _WORKFLOW_ONTOLOGY_SUFFIXES for path in present_paths)
+        findings: list[dict[str, str]] = [
+            {
+                "path": artifact,
+                "message": f"Workflow artifact is missing: {artifact}.",
+            }
+            for artifact in missing
+        ]
+        if not has_ontology_artifact:
+            findings.append(
+                {
+                    "path": "ontology-artifact",
+                    "message": "Workflow artifact is missing: at least one ontology artifact (.ttl, .rdf, or .owl).",
+                }
+            )
+        if not findings:
+            return [], []
+        if self.settings.opencode_strict_workflow_enabled:
+            return [], findings
+        return findings, []
 
     def _workspace_file_path(self, workspace: Path, path_text: str) -> Path | None:
         relative = Path(path_text)
