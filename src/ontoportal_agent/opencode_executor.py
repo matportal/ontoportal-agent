@@ -23,6 +23,7 @@ from .artifact_store import resolve_safe_workspace
 from .config import AgentSettings, get_settings
 from .ontology.diagnostics import normalize_validation_report
 from .ontology.proposals import STRUCTURED_ONTOLOGY_ARTIFACTS, validate_ontology_proposal_payload
+from .ontology.tools import RobotAdapter
 
 _ONTOLOGY_ARTIFACT_SUFFIXES = {".ttl", ".rdf", ".owl", ".json", ".yaml", ".yml", ".md", ".txt"}
 _WORKFLOW_REQUIRED_ARTIFACTS = (
@@ -1513,107 +1514,16 @@ class OpenCodeExecutor:
         }
 
     def _validate_robot_file(self, *, path: Path, display_path: str) -> dict[str, Any]:
-        command = self._robot_command("verify", path)
-        if command is None:
-            return {
-                "status": "unavailable",
-                "message": "ROBOT is not configured in this runtime.",
-            }
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(path.parent),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "failed",
-                "tool": command[0],
-                "command": self._redacted_command(command, workspace=path.parent),
-                "message": "ROBOT verify timed out after 60 seconds.",
-            }
-        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
-        message = self._truncate_console_line(output, max_chars=400) if output else ""
-        if completed.returncode == 0:
-            result = {
-                "status": "passed",
-                "tool": command[0],
-                "command": self._redacted_command(command, workspace=path.parent),
-                "message": message or "ROBOT verify passed.",
-            }
-            report_result = self._build_robot_report(path=path)
-            if report_result:
-                result["report"] = report_result
-            return result
-        return {
-            "status": "failed",
-            "tool": command[0],
-            "command": self._redacted_command(command, workspace=path.parent),
-            "message": message or f"ROBOT verify failed for {display_path}.",
-        }
+        return dict(self._robot_adapter().verify(path=path, display_path=display_path))
 
-    def _build_robot_report(self, *, path: Path) -> dict[str, Any] | None:
-        output_path = path.with_name(f"{path.name}.robot-report.tsv")
-        command = self._robot_command("report", path, output_path=output_path)
-        if command is None:
-            return None
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(path.parent),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "failed",
-                "path": output_path.name,
-                "message": "ROBOT report timed out after 60 seconds.",
-            }
-        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
-        message = self._truncate_console_line(output, max_chars=400) if output else ""
-        if completed.returncode == 0:
-            return {
-                "status": "passed",
-                "path": output_path.name,
-                "message": message or "ROBOT report generated.",
-            }
-        return {
-            "status": "failed",
-            "path": output_path.name,
-            "message": message or "ROBOT report failed.",
-        }
-
-    def _robot_command(self, action: str, path: Path, *, output_path: Path | None = None) -> list[str] | None:
-        if not bool(self.settings.opencode_robot_enabled):
-            return None
-        action = str(action or "").strip()
-        if action not in {"verify", "report"}:
-            return None
-        args = [action, "--input", str(path)]
-        if output_path is not None:
-            args.extend(["--output", str(output_path)])
-        robot_jar = self.settings.opencode_robot_jar_path
-        if robot_jar and robot_jar.exists():
-            return [
-                self.settings.opencode_robot_java_path,
-                "-jar",
-                str(robot_jar),
-                *args,
-            ]
-        robot_path = shutil.which("robot")
-        if robot_path:
-            return [robot_path, *args]
-        return None
-
-    def _redacted_command(self, command: list[str], *, workspace: Path) -> list[str]:
-        workspace_text = str(workspace)
-        return [str(item).replace(workspace_text, "<workspace>") for item in command]
+    def _robot_adapter(self) -> RobotAdapter:
+        return RobotAdapter(
+            enabled=bool(self.settings.opencode_robot_enabled),
+            java_path=self.settings.opencode_robot_java_path,
+            robot_jar_path=self.settings.opencode_robot_jar_path,
+            timeout_seconds=60,
+            truncate=lambda value, max_chars: self._truncate_console_line(value, max_chars=max_chars),
+        )
 
     def _validate_json_file(self, *, path: Path, display_path: str) -> dict[str, Any]:
         try:
