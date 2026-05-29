@@ -1421,6 +1421,136 @@ def test_artifact_endpoints_list_view_download_and_bundle(monkeypatch, tmp_path)
         assert sorted(archive.namelist()) == ["notes.md", "proposal.ttl"]
 
 
+def test_artifact_files_endpoint_includes_ontology_summary(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    thread_resp = client.post("/api/v1/me/threads", json={"title": "Ontology summary"}, headers=headers)
+    assert thread_resp.status_code == 200
+    thread_id = thread_resp.json()["thread_id"]
+
+    workspace = tmp_path / "ontology-summary-workspace"
+    workspace.mkdir()
+    (workspace / "ontology-proposal.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "title": "Add process class",
+                "summary": "Proposal-only structured edit.",
+                "goals": ["Answer process competency questions."],
+                "scope": "Review-only ontology edit.",
+                "competency_questions": [{"id": "CQ1", "question": "Which processes are represented?"}],
+                "reuse_candidates": [
+                    {
+                        "label": "Processing method",
+                        "iri": "https://example.org/ProcessingMethod",
+                        "source_ontology": "EX",
+                        "confidence": 0.6,
+                        "recommended_action": "extend",
+                        "rationale": "Candidate parent term.",
+                    }
+                ],
+                "operations": [
+                    {
+                        "operation": "create_class",
+                        "entity_type": "class",
+                        "iri": "https://example.org/CopilotProcess",
+                        "label": "Copilot process",
+                        "parent_iri": "https://example.org/ProcessingMethod",
+                        "rationale": "Needed for CQ1.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "competency-questions.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "questions": [{"id": "CQ1", "question": "Which processes are represented?"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "reuse-candidates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ontology-copilot/v1",
+                "candidates": [
+                    {
+                        "label": "Processing method",
+                        "iri": "https://example.org/ProcessingMethod",
+                        "source_ontology": "EX",
+                        "confidence": 0.6,
+                        "recommended_action": "extend",
+                        "rationale": "Candidate parent term.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "validation-summary.json").write_text(
+        json.dumps({"schema_version": "ontology-copilot/v1", "status": "passed", "summary": "Schema checks passed."}),
+        encoding="utf-8",
+    )
+
+    run_id = "run-ontology-summary-1"
+    usage = {
+        "mode": "opencode",
+        "execution": {
+            "mode": "opencode",
+            "ok": True,
+            "run_id": run_id,
+            "workspace": str(workspace),
+            "changed_files": [
+                {"status": "A", "path": "ontology-proposal.json", "kind": "json"},
+                {"status": "A", "path": "competency-questions.json", "kind": "json"},
+                {"status": "A", "path": "reuse-candidates.json", "kind": "json"},
+                {"status": "A", "path": "validation-summary.json", "kind": "json"},
+            ],
+            "artifact_candidates": [
+                {"status": "A", "path": "ontology-proposal.json", "kind": "json"},
+                {"status": "A", "path": "competency-questions.json", "kind": "json"},
+                {"status": "A", "path": "reuse-candidates.json", "kind": "json"},
+                {"status": "A", "path": "validation-summary.json", "kind": "json"},
+            ],
+            "validation_report": {
+                "diagnostics": [{"status": "passed", "path": "ontology-proposal.json", "message": "Schema valid."}],
+                "diagnostic_summary": {"passed": 1, "failed": 0},
+            },
+            "expires_at": "2999-01-01T00:00:00+00:00",
+        },
+    }
+    with get_session_factory()() as session:
+        create_message(
+            session,
+            user_id="user-1",
+            thread_id=thread_id,
+            role="assistant",
+            content="OpenCode finished.",
+            usage_json=usage,
+            citations_json=[],
+        )
+
+    response = client.get(f"/api/v1/me/artifacts/{thread_id}/{run_id}/files", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    summary = payload["ontology_summary"]
+    assert summary["available"] is True
+    assert summary["proposal"]["title"] == "Add process class"
+    assert summary["proposal"]["operations_count"] == 1
+    assert summary["workspace"]["competency_questions_count"] == 1
+    assert summary["reuse"]["candidates_count"] == 1
+    assert summary["validation"]["status"] == "passed"
+    assert summary["validation"]["diagnostic_summary"]["passed"] == 1
+    assert "content" not in json.dumps(summary)
+    assert str(workspace) not in json.dumps(summary)
+
+
 def test_artifact_endpoints_enforce_owner_and_safe_paths(monkeypatch, tmp_path):
     _configure_env(monkeypatch, tmp_path)
     client = TestClient(server.app)

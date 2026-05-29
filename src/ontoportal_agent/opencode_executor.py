@@ -414,9 +414,11 @@ class OpenCodeExecutor:
                 "4. Write an edit plan before drafting, then inspect the ontology again after drafting or validation feedback.",
                 "5. Copy `proposal-template.ttl` into a new `.ttl` file for RDF/Turtle proposals.",
                 "6. When ontology copilot schema mode is requested, copy the JSON templates to workspace-root files named `ontology-proposal.json`, `competency-questions.json`, `reuse-candidates.json`, and `validation-summary.json`.",
-                "7. Copy `operator-report-template.md` and `draft-submission-template.md` for review notes and a draft submission package.",
-                "8. Keep generated artifacts at the workspace root or in a purpose-named subdirectory.",
-                "9. Finish with a short summary naming changed files, validation status, search/provenance, and assumptions.",
+                "7. Treat reuse as mandatory evidence: record candidate terms, why they were reused/mapped/extended/rejected, and cite RAG/API/web evidence.",
+                "8. Prefer SKOS mapping relations for external alignments; do not propose `owl:equivalentClass` or `owl:equivalentProperty` unless the operator explicitly requests and reviews it.",
+                "9. Copy `operator-report-template.md` and `draft-submission-template.md` for review notes and a draft submission package.",
+                "10. Keep generated artifacts at the workspace root or in a purpose-named subdirectory.",
+                "11. Finish with a short summary naming changed files, validation status, search/provenance, and assumptions.",
                 "",
                 "Do not put credentials, API keys, or absolute local paths into generated artifacts.",
                 "Do not edit toolkit files unless the user explicitly asks for a toolkit change.",
@@ -450,45 +452,45 @@ class OpenCodeExecutor:
             {
                 "schema_version": "ontology-copilot/v1",
                 "proposal_id": "draft-proposal-1",
-                "title": "Replace with proposal title",
-                "summary": "Short operator-facing summary of the proposed ontology change.",
-                "ontology_acronym": "",
-                "goals": ["Replace with the goal this edit supports."],
-                "scope": "Describe in-scope and out-of-scope modeling boundaries.",
+                "title": "Add reviewable processing-method term",
+                "summary": "Proposal-only ontology edit for operator review; no live apply or publish action is requested.",
+                "ontology_acronym": "TARGET",
+                "goals": ["Answer the competency question without duplicating reusable existing terms."],
+                "scope": "In scope: one candidate class and review notes. Out of scope: publishing, imports, inferred hierarchy changes, or unreviewed equivalence axioms.",
                 "competency_questions": [
                     {
                         "id": "CQ1",
-                        "question": "What question should the ontology answer after this edit?",
-                        "expected_answer": "Describe the expected answer or inference.",
+                        "question": "Which materials or processes are instances/subclasses of the proposed concept?",
+                        "expected_answer": "The ontology can retrieve the proposed class, its label, definition/evidence, and parent relation after review.",
                         "status": "draft",
                     }
                 ],
                 "reuse_candidates": [
                     {
-                        "label": "Candidate existing term",
-                        "iri": "",
-                        "source_ontology": "",
-                        "confidence": 0.0,
+                        "label": "Existing processing method candidate",
+                        "iri": "https://example.org/existing-processing-method",
+                        "source_ontology": "MatPortal/OntoPortal inspection",
+                        "confidence": 0.4,
                         "recommended_action": "needs_review",
-                        "rationale": "Explain whether to reuse, map, extend, or reject.",
+                        "rationale": "Record whether to reuse, map with SKOS, extend as a subclass, or reject as out of scope.",
                     }
                 ],
                 "operations": [
                     {
                         "operation": "create_class",
                         "entity_type": "class",
-                        "iri": "https://example.org/replace-me",
-                        "label": "Replace me",
-                        "parent_iri": "",
+                        "iri": "https://example.org/target/ProposedProcessingMethod",
+                        "label": "Proposed processing method",
+                        "parent_iri": "https://example.org/target/ProcessingMethod",
                         "target_iri": "",
                         "mapping_relation": None,
                         "turtle": "",
-                        "rationale": "Explain why this operation is needed.",
-                        "evidence": [{"source": "RAG/API inspection", "citation": "", "url": "", "quote": ""}],
+                        "rationale": "Needed to answer CQ1 after reuse candidates were checked and no exact reusable term was selected.",
+                        "evidence": [{"source": "RAG/API inspection", "citation": "chunk-or-endpoint-id", "url": "", "quote": "Short non-secret evidence quote."}],
                     }
                 ],
-                "assumptions": [],
-                "risks": [],
+                "assumptions": ["Operator will confirm namespace and parent class before apply/publish work exists."],
+                "risks": ["A better reuse candidate may exist; prefer reuse or SKOS mapping if confirmed."],
             },
             indent=2,
         ) + "\n"
@@ -1014,6 +1016,8 @@ class OpenCodeExecutor:
         )
         structured_guidance = (
             "- Ontology copilot schema mode is enabled: also write ontology-proposal.json, competency-questions.json, reuse-candidates.json, and validation-summary.json using schema_version ontology-copilot/v1.\n"
+            "- In structured artifacts, include competency questions, reuse candidates, operations, evidence, assumptions, risks, and validation status; keep all changes proposal-only.\n"
+            "- Prefer reuse or SKOS mappings before minting terms; require explicit human review before any owl:equivalentClass/owl:equivalentProperty claim.\n"
             if self.settings.ontology_copilot_enabled
             else ""
         )
