@@ -498,6 +498,28 @@ def test_opencode_account_auth_uses_selected_antigravity_model(monkeypatch, tmp_
     assert executor._opencode_model_ref() == "google/antigravity-claude-opus-4-6-thinking"
 
 
+def test_opencode_account_auth_prefers_cli_for_non_antigravity_google_models(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "deployment-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "ontoportal-secret")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor(
+        account_auth=OpenCodeAccountAuth(
+            kind="gemini_antigravity",
+            opencode_auth_json='{"google":{"type":"oauth","refresh":"refresh-token"}}',
+            model_ref="google/gemini-2.5-pro",
+        )
+    )
+    workspace = executor._prepare_workspace(thread_id="cli-first")
+    executor._opencode_environment(workspace)
+
+    config_path = workspace / ".opencode" / "antigravity.json"
+    assert executor._opencode_model_ref() == "google/gemini-2.5-pro"
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {"cli_first": True}
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
 def test_opencode_exa_websearch_can_be_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "deployment-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "ontoportal-secret")

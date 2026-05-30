@@ -647,6 +647,7 @@ class OpenCodeExecutor:
         env["XDG_CACHE_HOME"] = str(cache_home)
         if self.account_auth:
             self._write_account_auth(workspace, home, data_home)
+            self._write_antigravity_runtime_config(workspace)
             codex_home = workspace / ".codex-home"
             codex_home.mkdir(parents=True, exist_ok=True)
             self._chmod_private(codex_home, 0o700)
@@ -674,6 +675,19 @@ class OpenCodeExecutor:
         if self.account_auth.codex_auth_json:
             codex_home = workspace / ".codex-home"
             self._write_private_json_file(codex_home / "auth.json", self.account_auth.codex_auth_json)
+
+    def _write_antigravity_runtime_config(self, workspace: Path) -> None:
+        if not self._uses_antigravity_account_auth():
+            return
+        model_ref = self._opencode_model_ref()
+        model_id = model_ref.split("/", 1)[1] if model_ref.startswith("google/") else model_ref
+        if model_id.startswith("antigravity-"):
+            return
+        config_path = workspace / ".opencode" / "antigravity.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        self._chmod_private(config_path.parent, 0o700)
+        config_path.write_text(json.dumps({"cli_first": True}, indent=2), encoding="utf-8")
+        self._chmod_private(config_path, 0o600)
 
     def _stream_process_output(
         self,
