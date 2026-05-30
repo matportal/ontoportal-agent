@@ -967,6 +967,32 @@ def test_validation_report_scores_workflow_evidence_and_review_readiness(monkeyp
     assert checks["operator_report"]["status"] == "passed"
 
 
+def test_validation_report_exposes_ontology_capability_checks(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_REUSE_ENABLED", "true")
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="thread-capability-checks")
+    (workspace / "proposal.ttl").write_text("@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n", encoding="utf-8")
+
+    report = executor._build_validation_report(
+        workspace=workspace,
+        changed_files=[{"status": "A", "path": "proposal.ttl", "kind": "ttl"}],
+    )
+
+    checks = {item["id"]: item for item in report["workflow"]["capability_checks"]}
+    assert checks["ontology_copilot"]["status"] == "enabled"
+    assert checks["reuse_before_create"]["status"] == "enabled"
+    assert checks["async_reasoner_checks"]["status"] == "blocked"
+    assert checks["shacl_validation"]["status"] == "blocked"
+    assert checks["build_profiles"]["status"] == "blocked"
+    assert "not run in the request path" in checks["shacl_validation"]["message"]
+
+
 def test_validation_report_warns_on_weak_workflow_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")

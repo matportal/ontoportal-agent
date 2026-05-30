@@ -1476,7 +1476,22 @@ def _assistant_installed_skills(settings_payload: dict[str, Any]) -> list[dict[s
             "enabled": bool(settings.ontology_reasoner_enabled),
             "status": "blocked" if not settings.ontology_reasoner_enabled else "enabled",
             "description": "Reserved for future queued OWL consistency/classification jobs; never runs in the request path.",
-            "details": ["Default-off until async job tracking and packaging are complete."],
+            "details": [
+                "Default-off until async job tracking and packaging are complete.",
+                "No ontology mutation, apply, or publish action is performed by this skill.",
+            ],
+        },
+        {
+            "id": "shacl_validation",
+            "name": "SHACL validation",
+            "category": "Validation",
+            "enabled": bool(settings.ontology_shacl_enabled),
+            "status": "blocked" if not settings.ontology_shacl_enabled else "enabled",
+            "description": "Reserved for optional SHACL shape checks on generated proposal artifacts.",
+            "details": [
+                "Default-off until shape selection, dependency packaging, and async job tracking are complete.",
+                "When disabled, proposal validation remains limited to schema, RDF parsing, ROBOT, and review evidence.",
+            ],
         },
         {
             "id": "build_profiles",
@@ -1485,7 +1500,10 @@ def _assistant_installed_skills(settings_payload: dict[str, Any]) -> list[dict[s
             "enabled": bool(settings.ontology_build_profiles_enabled),
             "status": "blocked" if not settings.ontology_build_profiles_enabled else "enabled",
             "description": "Reserved for future dry-run/release artifact builds with whitelisted steps only.",
-            "details": ["No arbitrary shell commands; no publish/apply without a separate approval contract."],
+            "details": [
+                "No arbitrary shell commands; no publish/apply without a separate approval contract.",
+                "Default-off until build jobs are isolated from the request path.",
+            ],
         },
         {
             "id": "matportal_rag_mcp",

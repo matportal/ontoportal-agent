@@ -2348,6 +2348,40 @@ def test_skills_include_gated_ontology_copilot_capabilities(monkeypatch, tmp_pat
     assert skills["structured_ontology_proposals"]["status"] == "disabled"
     assert skills["reuse_before_create"]["enabled"] is False
     assert skills["async_reasoner_checks"]["status"] == "blocked"
+    assert skills["shacl_validation"]["status"] == "blocked"
+    assert skills["build_profiles"]["status"] == "blocked"
+
+
+def test_bootstrap_and_skills_reflect_enabled_safe_ontology_flags(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_COPILOT_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_UI_PANELS_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_METHOD_PANEL_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_REUSE_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_ADVANCED_VALIDATION_ENABLED", "true")
+    server.get_settings.cache_clear()
+    client = TestClient(server.app)
+
+    bootstrap = client.get("/api/v1/me/bootstrap", headers=_signed_headers())
+    assert bootstrap.status_code == 200
+    features = bootstrap.json()["features"]
+    assert features["ontology_copilot"] is True
+    assert features["ontology_ui_panels"] is True
+    assert features["ontology_method_panel"] is True
+    assert features["ontology_reuse"] is True
+    assert features["ontology_advanced_validation"] is True
+    assert features["ontology_reasoner"] is False
+    assert features["ontology_shacl"] is False
+    assert features["ontology_build_profiles"] is False
+
+    response = client.get("/api/v1/me/skills", headers=_signed_headers())
+    assert response.status_code == 200
+    skills = {item["id"]: item for item in response.json()["skills"]}
+    assert skills["structured_ontology_proposals"]["status"] == "enabled"
+    assert skills["competency_question_guidance"]["status"] == "enabled"
+    assert skills["reuse_before_create"]["status"] == "enabled"
+    assert skills["async_reasoner_checks"]["status"] == "blocked"
+    assert skills["shacl_validation"]["status"] == "blocked"
     assert skills["build_profiles"]["status"] == "blocked"
 
 

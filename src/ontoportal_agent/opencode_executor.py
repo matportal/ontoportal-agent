@@ -1445,6 +1445,7 @@ class OpenCodeExecutor:
                 "suffixes": sorted(_WORKFLOW_ONTOLOGY_SUFFIXES),
             },
             "evidence_checks": evidence_checks,
+            "capability_checks": self._workflow_capability_checks(),
             "missing": workflow_missing,
             "ok": workflow_ok,
         }
@@ -1482,6 +1483,45 @@ class OpenCodeExecutor:
         if self.settings.opencode_strict_workflow_enabled:
             return workflow_report, [], findings
         return workflow_report, findings, []
+
+    def _workflow_capability_checks(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "ontology_copilot",
+                "label": "Structured ontology proposals",
+                "enabled": bool(self.settings.ontology_copilot_enabled),
+                "status": "enabled" if self.settings.ontology_copilot_enabled else "disabled",
+                "message": "Schema-versioned ontology proposal artifacts are required." if self.settings.ontology_copilot_enabled else "Structured ontology proposal artifacts are optional in this run.",
+            },
+            {
+                "id": "reuse_before_create",
+                "label": "Reuse before create",
+                "enabled": bool(self.settings.ontology_reuse_enabled),
+                "status": "enabled" if self.settings.ontology_reuse_enabled else "disabled",
+                "message": "Reuse-candidate evidence is expected before minting new terms." if self.settings.ontology_reuse_enabled else "Reuse-candidate guidance is disabled for this run.",
+            },
+            {
+                "id": "async_reasoner_checks",
+                "label": "Async reasoner checks",
+                "enabled": bool(self.settings.ontology_reasoner_enabled),
+                "status": "reserved" if self.settings.ontology_reasoner_enabled else "blocked",
+                "message": "Reasoner execution is reserved for queued jobs and is not run in the request path.",
+            },
+            {
+                "id": "shacl_validation",
+                "label": "SHACL validation",
+                "enabled": bool(self.settings.ontology_shacl_enabled),
+                "status": "reserved" if self.settings.ontology_shacl_enabled else "blocked",
+                "message": "SHACL execution is reserved for future isolated validation jobs and is not run in the request path.",
+            },
+            {
+                "id": "build_profiles",
+                "label": "Build profiles",
+                "enabled": bool(self.settings.ontology_build_profiles_enabled),
+                "status": "reserved" if self.settings.ontology_build_profiles_enabled else "blocked",
+                "message": "Build profiles are reserved for future dry-run jobs; no apply or publish action is performed.",
+            },
+        ]
 
     def _workflow_evidence_checks(self, *, workspace: Path, present_paths: set[str]) -> list[dict[str, Any]]:
         def path_for(filename: str) -> str:
