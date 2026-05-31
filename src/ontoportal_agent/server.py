@@ -2490,7 +2490,7 @@ def _stream_agent_response(
                         "trace_id": stream_context["trace_id"],
                         "status": f"{runtime_label} workspace failed.",
                         "message": final_response_text,
-                        "error_class": "OpenCodeProviderError" if provider_blocked else f"{runtime_error_prefix}ExecutionError",
+                        "error_class": f"{runtime_error_prefix}ProviderError" if provider_blocked else f"{runtime_error_prefix}ExecutionError",
                         "status_code": 500,
                     }
                     final_state["generation_usage"]["error"] = error_details
