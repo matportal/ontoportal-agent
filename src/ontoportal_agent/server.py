@@ -2995,6 +2995,8 @@ def me_bootstrap(
             "ontology_reasoner": bool(settings.ontology_reasoner_enabled),
             "ontology_shacl": bool(settings.ontology_shacl_enabled),
             "ontology_build_profiles": bool(settings.ontology_build_profiles_enabled),
+            "deepagents_canary": bool(settings.deepagents_enabled) and str(settings.edit_runtime_default or "").strip().lower() != "deepagents",
+            "edit_runtime_default": str(settings.edit_runtime_default or "opencode"),
         },
         "settings": _serialize_settings_for_output(settings_payload),
         "threads": [_serialize_thread(item) for item in list_threads(session, user_id=user_context.user_id)],
