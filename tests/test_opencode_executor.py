@@ -687,6 +687,7 @@ def test_opencode_stream_rejects_edit_mode_noop(monkeypatch, tmp_path):
     assert "without producing changed files" in result.failure_reason
     assert result.changed_files == []
     assert result.validation_report["review"]["ready"] is False
+    assert result.validation_report["workflow"]["ontology_artifact"]["present"] is False
 
 
 def test_opencode_stream_allows_ask_mode_without_artifacts(monkeypatch, tmp_path):

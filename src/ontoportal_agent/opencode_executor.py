@@ -1491,12 +1491,14 @@ class OpenCodeExecutor:
         present_paths = {
             str(item.get("path") or "").strip()
             for item in changed_files
-            if str(item.get("status") or "").upper() != "D" and str(item.get("path") or "").strip()
+            if str(item.get("status") or "").upper() != "D"
+            and str(item.get("path") or "").strip()
+            and _ONTOLOGY_TOOLKIT_DIR not in Path(str(item.get("path") or "").strip()).parts
         }
         try:
             root = workspace.resolve()
             for path in root.rglob("*"):
-                if not path.is_file() or ".git" in path.parts:
+                if not path.is_file() or ".git" in path.parts or _ONTOLOGY_TOOLKIT_DIR in path.parts:
                     continue
                 try:
                     present_paths.add(path.resolve().relative_to(root).as_posix())
