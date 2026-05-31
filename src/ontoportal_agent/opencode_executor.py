@@ -54,6 +54,28 @@ _BLOCKED_BASH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(^|\s)(shutdown|reboot|poweroff|halt)(\s|$)", re.IGNORECASE), "host power control is blocked"),
     (re.compile(r"(^|\s)(mkfs|fdisk|parted)(\s|$)", re.IGNORECASE), "disk formatting commands are blocked"),
 )
+_PROVIDER_FAILURE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"antigravity\s+is\s+no\s+longer\s+supported|version\s+of\s+antigravity\s+is\s+no\s+longer\s+supported", re.IGNORECASE),
+        "Gemini Antigravity rejected the plugin/client version as unsupported. Pin or upgrade to a compatible Antigravity route, then retry.",
+    ),
+    (
+        re.compile(r"verify\s+your\s+account\s+to\s+continue|accounts\.google\.com/signin/continue", re.IGNORECASE),
+        "Gemini Antigravity blocked this run pending Google account verification. Complete verification and retry.",
+    ),
+    (
+        re.compile(r"cloudaicompanion\.companions\.generateChat|IAM_PERMISSION_DENIED|missing\s+Gemini\s+Code\s+Assist\s+permission", re.IGNORECASE),
+        "The Google Code Assist fallback route lacks Gemini Code Assist permission for the plugin-selected project. Use the real Antigravity route or reconnect an account with Code Assist access, then retry.",
+    ),
+    (
+        re.compile(r"rate\s*limit|ratelimit|quota\s+(exceeded|limit)|resource_exhausted", re.IGNORECASE),
+        "The selected provider rejected the run because quota or rate limit was exhausted. Retry later or choose another configured provider.",
+    ),
+    (
+        re.compile(r"invalid_grant|invalid\s+credential|expired\s+(token|credential)|unauthorized", re.IGNORECASE),
+        "The selected provider account credentials are invalid or expired. Reconnect account auth and retry.",
+    ),
+)
 _USER_PROVIDER_ID = "matportal-user"
 _USER_PROVIDER_API_KEY_ENV = "MATPORTAL_OPENCODE_API_KEY"
 _OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible"
@@ -118,6 +140,8 @@ class OpenCodeExecutionResult:
     timed_out: bool = False
     blocked: bool = False
     blocked_reason: str = ""
+    failure_kind: str = ""
+    failure_reason: str = ""
     console_lines: list[str] = field(default_factory=list)
     changed_files: list[dict[str, Any]] = field(default_factory=list)
     diff_summary: dict[str, Any] = field(default_factory=dict)
@@ -136,6 +160,8 @@ class OpenCodeExecutionResult:
             "timed_out": self.timed_out,
             "blocked": self.blocked,
             "blocked_reason": self.blocked_reason,
+            "failure_kind": self.failure_kind,
+            "failure_reason": self.failure_reason,
             "logs": self.console_lines,
             "changed_files": self.changed_files,
             "diff_summary": self.diff_summary,
@@ -237,6 +263,10 @@ class OpenCodeExecutor:
 
         result.exit_code = -9 if result.timed_out else int(process.returncode or 0)
         self._finalize_workspace(workspace=workspace, result=result)
+        self._classify_execution_result(result=result, task=task)
+        if result.failure_reason:
+            self._append_console_line(result, f"OpenCode result rejected: {result.failure_reason}")
+            yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
 
         yield {
             "type": "changed_files",
@@ -255,8 +285,7 @@ class OpenCodeExecutor:
             "content": result.validation_report,
         }
 
-        if result.exit_code == 0:
-            result.ok = True
+        if result.ok:
             yield {
                 "type": "opencode_phase",
                 "content": {
@@ -265,8 +294,9 @@ class OpenCodeExecutor:
                 },
             }
         else:
-            self._append_console_line(result, f"OpenCode exited with code {result.exit_code}.")
-            yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+            if result.exit_code != 0 and not result.failure_reason:
+                self._append_console_line(result, f"OpenCode exited with code {result.exit_code}.")
+                yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
             yield {
                 "type": "opencode_phase",
                 "content": {
@@ -274,6 +304,7 @@ class OpenCodeExecutor:
                     "workspace": str(workspace),
                     "exit_code": result.exit_code,
                     "timed_out": result.timed_out,
+                    "failure_kind": result.failure_kind,
                 },
             }
 
@@ -1304,6 +1335,67 @@ class OpenCodeExecutor:
 
         if not self.settings.opencode_keep_workspace:
             shutil.rmtree(workspace, ignore_errors=True)
+
+    def _classify_execution_result(self, *, result: OpenCodeExecutionResult, task: str) -> None:
+        result.ok = False
+        result.failure_kind = ""
+        result.failure_reason = ""
+
+        provider_failure = self._provider_failure_reason(result)
+        task_kind = str(task or "edit").strip().lower()
+        if result.blocked:
+            result.failure_kind = "blocked"
+            result.failure_reason = str(result.blocked_reason or "OpenCode run was stopped by sandbox policy.").strip()
+        elif result.timed_out:
+            result.failure_kind = "timeout"
+            result.failure_reason = "OpenCode timed out before completing the workspace run."
+        elif provider_failure:
+            result.failure_kind = "provider_error"
+            result.failure_reason = provider_failure
+        elif result.exit_code != 0:
+            result.failure_kind = "execution_error"
+            result.failure_reason = f"OpenCode exited with code {result.exit_code}."
+        elif task_kind == "edit" and not result.changed_files and not result.artifact_candidates:
+            result.failure_kind = "no_changes"
+            result.failure_reason = "Edit mode completed without producing changed files or downloadable artifacts."
+        elif result.validation_report and result.validation_report.get("ok") is False:
+            result.failure_kind = "validation_failed"
+            result.failure_reason = "Workspace artifacts failed validation."
+        else:
+            result.ok = True
+            return
+
+        self._annotate_runtime_validation_failure(result)
+
+    def _provider_failure_reason(self, result: OpenCodeExecutionResult) -> str:
+        text = "\n".join([str(result.final_text or ""), *[str(line or "") for line in result.console_lines]])
+        if not text.strip():
+            return ""
+        for pattern, message in _PROVIDER_FAILURE_PATTERNS:
+            if pattern.search(text):
+                return message
+        return ""
+
+    def _annotate_runtime_validation_failure(self, result: OpenCodeExecutionResult) -> None:
+        reason = str(result.failure_reason or "OpenCode runtime failed.").strip()
+        kind = str(result.failure_kind or "runtime_error").strip()
+        report = dict(result.validation_report or {})
+        errors = [item for item in (report.get("errors") or []) if isinstance(item, dict)]
+        errors.append({"path": "runtime", "status": "failed", "code": kind, "message": reason})
+        report["ok"] = False
+        report["status"] = "failed"
+        report["errors"] = errors
+        report["runtime"] = {"ok": False, "status": "failed", "kind": kind, "message": reason}
+        review = dict(report.get("review") or {})
+        review.update(
+            {
+                "ready": False,
+                "status": "failed",
+                "message": "Runtime failed before the workspace was ready for human review.",
+            }
+        )
+        report["review"] = review
+        result.validation_report = normalize_validation_report(report)
 
     def _build_validation_report(self, *, workspace: Path, changed_files: list[dict[str, Any]]) -> dict[str, Any]:
         checked_files: list[dict[str, Any]] = []

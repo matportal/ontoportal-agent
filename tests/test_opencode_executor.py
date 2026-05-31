@@ -15,6 +15,26 @@ from ontoportal_agent.config import get_settings
 from ontoportal_agent.opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
 
 
+def _write_fake_opencode(tmp_path: Path, events: list[dict], *, exit_code: int = 0) -> Path:
+    fake_opencode = tmp_path / "fake-opencode"
+    event_lines = [json.dumps(event) for event in events]
+    fake_opencode.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                f"events = {event_lines!r}",
+                "for event in events:",
+                "    print(event, flush=True)",
+                f"sys.exit({int(exit_code)})",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_opencode.chmod(0o755)
+    return fake_opencode
+
+
 def test_prepare_workspace_writes_opencode_mcp_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
@@ -598,6 +618,109 @@ def test_opencode_stream_times_out_and_terminates_process_group(monkeypatch, tmp
     assert result.exit_code == -9
     assert any("timed out after 1 seconds" in str(event) for event in events)
     assert any((event.get("content") or {}).get("timed_out") is True for event in events)
+
+
+def test_opencode_stream_rejects_provider_failure_even_with_zero_exit(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    fake_opencode = _write_fake_opencode(
+        tmp_path,
+        [
+            {"type": "step_start"},
+            {
+                "type": "text",
+                "part": {
+                    "text": "This version of Antigravity is no longer supported. Please upgrade to receive the latest features."
+                },
+            },
+            {"type": "step_finish", "part": {"reason": "unknown", "tokens": {"total": 0, "reasoning": 0}}},
+        ],
+    )
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_PATH", str(fake_opencode))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    stream = executor.stream(prompt="Create a smoke artifact", thread_id="thread-provider-failure")
+    events = []
+    try:
+        while True:
+            events.append(next(stream))
+    except StopIteration as stop:
+        result = stop.value
+
+    assert result.exit_code == 0
+    assert result.ok is False
+    assert result.failure_kind == "provider_error"
+    assert "unsupported" in result.failure_reason
+    assert result.validation_report["ok"] is False
+    assert result.validation_report["runtime"]["kind"] == "provider_error"
+    assert any((event.get("content") or {}).get("label") == "Workspace failed" for event in events)
+
+
+def test_opencode_stream_rejects_edit_mode_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    fake_opencode = _write_fake_opencode(
+        tmp_path,
+        [
+            {"type": "step_start"},
+            {"type": "text", "part": {"text": "Done."}},
+            {"type": "step_finish", "part": {"reason": "stop"}},
+        ],
+    )
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_PATH", str(fake_opencode))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    stream = executor.stream(prompt="Create an artifact", thread_id="thread-edit-noop", task="edit")
+    try:
+        while True:
+            next(stream)
+    except StopIteration as stop:
+        result = stop.value
+
+    assert result.exit_code == 0
+    assert result.ok is False
+    assert result.failure_kind == "no_changes"
+    assert "without producing changed files" in result.failure_reason
+    assert result.changed_files == []
+    assert result.validation_report["review"]["ready"] is False
+
+
+def test_opencode_stream_allows_ask_mode_without_artifacts(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    fake_opencode = _write_fake_opencode(
+        tmp_path,
+        [
+            {"type": "step_start"},
+            {"type": "text", "part": {"text": "Use MATONTO for materials terms."}},
+            {"type": "step_finish", "part": {"reason": "stop"}},
+        ],
+    )
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_PATH", str(fake_opencode))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    stream = executor.stream(
+        prompt="Which ontology should I use?",
+        thread_id="thread-ask-noop",
+        task="ask",
+        retrieved_context="Use MATONTO for materials terms.",
+    )
+    try:
+        while True:
+            next(stream)
+    except StopIteration as stop:
+        result = stop.value
+
+    assert result.ok is True
+    assert result.failure_kind == ""
+    assert result.changed_files == []
+    assert result.final_text == "Use MATONTO for materials terms."
 
 
 def test_validation_report_checks_rdf_json_and_text_artifacts(monkeypatch, tmp_path):

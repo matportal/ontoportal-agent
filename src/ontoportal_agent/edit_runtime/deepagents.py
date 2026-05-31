@@ -128,12 +128,15 @@ class DeepAgentsEditRuntime:
             yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
 
         self._workspace_manager._finalize_workspace(workspace=workspace, result=result)
+        self._workspace_manager._classify_execution_result(result=result, task=request.task)
+        if result.failure_reason:
+            self._append_console_line(result, f"Deep Agents result rejected: {result.failure_reason}")
+            yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
         yield {"type": "changed_files", "content": result.changed_files}
         yield {"type": "diff_summary", "content": result.diff_summary}
         yield {"type": "artifact_candidates", "content": result.artifact_candidates}
         yield {"type": "validation_report", "content": result.validation_report}
 
-        result.ok = result.exit_code == 0 and bool(result.validation_report.get("ok", True))
         if result.ok:
             yield {"type": "opencode_phase", "content": {"label": "Deep Agents workspace complete", "workspace": str(workspace), "runtime": self.runtime}}
         else:
@@ -144,6 +147,7 @@ class DeepAgentsEditRuntime:
                     "workspace": str(workspace),
                     "runtime": self.runtime,
                     "exit_code": result.exit_code,
+                    "failure_kind": result.failure_kind,
                 },
             }
         return result

@@ -2103,8 +2103,10 @@ def _opencode_success_response(result: OpenCodeExecutionResult) -> str:
 
 
 def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
+    if result.failure_reason and not result.blocked:
+        return str(result.failure_reason).strip()
     if result.blocked:
-        detail = str(result.blocked_reason or "unsafe command detected").strip()
+        detail = str(result.blocked_reason or result.failure_reason or "unsafe command detected").strip()
         return f"{_edit_runtime_label(result)} run was stopped by sandbox policy: {detail}."
     verification_url = _extract_antigravity_verification_url(result.console_lines)
     if verification_url:
@@ -2178,11 +2180,13 @@ def _contains_antigravity_tool_schema_error(lines: list[str]) -> bool:
 
 
 def _contains_antigravity_provider_error(lines: list[str]) -> bool:
+    text = _joined_console_text(lines)
     return bool(
         _extract_antigravity_verification_url(lines)
         or _contains_antigravity_verification_error(lines)
         or _contains_antigravity_iam_error(lines)
         or _contains_antigravity_tool_schema_error(lines)
+        or re.search(r"antigravity\s+is\s+no\s+longer\s+supported|version\s+of\s+antigravity\s+is\s+no\s+longer\s+supported", text, re.IGNORECASE)
     )
 
 
@@ -2465,7 +2469,8 @@ def _stream_agent_response(
                 final_state["generation_usage"] = _opencode_usage_payload(opencode_result, runtime_options)
                 final_state["citations"] = []
                 yield _sse({"type": "usage", "content": final_state["generation_usage"]})
-                provider_blocked = _contains_antigravity_provider_error(opencode_result.console_lines)
+                provider_lines = [*opencode_result.console_lines, str(opencode_result.final_text or "")]
+                provider_blocked = opencode_result.failure_kind == "provider_error" or _contains_antigravity_provider_error(provider_lines)
                 if opencode_result.ok and not provider_blocked:
                     final_response_text = _opencode_success_response(opencode_result)
                     final_state["final_response"] = final_response_text
