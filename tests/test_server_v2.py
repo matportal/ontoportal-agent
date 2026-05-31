@@ -2501,6 +2501,9 @@ def test_stream_agent_response_routes_edit_prompts_to_opencode_workspace(monkeyp
 
 
 def test_stream_agent_response_respects_requested_edit_mode(monkeypatch):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    server.get_settings.cache_clear()
     initial_agent = SimpleNamespace(
         runtime_options=SimpleNamespace(
             generation_provider="vertex_gemini",
@@ -2555,6 +2558,66 @@ def test_stream_agent_response_respects_requested_edit_mode(monkeypatch):
     assert "Starting OpenCode workspace..." in events
     assert "Ran the request in the OpenCode workspace." in events
     assert '"run_id": "run-forced-edit"' in events
+
+
+def test_stream_agent_response_passes_requested_deepagents_runtime(monkeypatch):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    server.get_settings.cache_clear()
+    initial_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="gemini_api",
+            llm_model="gemini-2.5-pro",
+            openai_api_key="test-key",
+            openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+    )
+
+    def _unexpected_classifier(_llm, _prompt):
+        raise AssertionError("explicit edit mode should not call the classifier")
+
+    def _fake_opencode_stream(*, prompt, thread_id, trace_id, runtime_options, runtime_name):
+        assert runtime_name == "deepagents"
+        yield server._sse(
+            {
+                "type": "workspace_mode",
+                "content": {
+                    "mode": "execution",
+                    "runtime": "deepagents",
+                    "run_id": "run-deepagents-canary",
+                    "workspace": "/tmp/ontoportal-agent/opencode-runs/thread-deepagents-canary",
+                },
+            }
+        )
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-deepagents-canary",
+            run_id="run-deepagents-canary",
+            expires_at="2999-01-01T00:00:00+00:00",
+            model="deepagents/gemini-2.5-pro",
+            runtime="deepagents",
+            final_text="Deep Agents canary prepared a proposal.",
+            changed_files=[{"status": "A", "path": "operator-report.md"}],
+            artifact_candidates=[{"path": "operator-report.md"}],
+        )
+
+    monkeypatch.setattr(server, "_classify_intent", _unexpected_classifier)
+    monkeypatch.setattr(server, "_stream_opencode_execution", _fake_opencode_stream)
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Draft a canary proposal.",
+            thread_id="thread-deepagents-canary",
+            agent_builder=lambda: initial_agent,
+            requested_mode="edit",
+            edit_runtime_name="deepagents",
+        )
+    )
+
+    assert "Starting Deep Agents workspace..." in events
+    assert "Deep Agents canary prepared a proposal." in events
+    assert '"runtime": "deepagents"' in events
+    assert '"generation_backend": "deepagents"' not in events
 
 
 def test_me_chat_stream_persists_opencode_session_record(monkeypatch, tmp_path):

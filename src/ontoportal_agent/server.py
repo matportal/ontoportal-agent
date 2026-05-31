@@ -181,6 +181,7 @@ class ChatStreamRequest(BaseModel):
     thread_id: Optional[str] = None
     thread_title: Optional[str] = None
     mode: Optional[str] = None
+    edit_runtime: Optional[str] = None
 
 
 class ProviderConfigIn(BaseModel):
@@ -2378,6 +2379,7 @@ def _stream_agent_response(
     log_context: dict[str, Any] | None = None,
     opencode_resume: dict[str, Any] | None = None,
     user_id: str | None = None,
+    edit_runtime_name: str | None = None,
 ) -> Iterator[str]:
     stream_context = dict(log_context or {})
     stream_context.setdefault("thread_id", thread_id)
@@ -2426,8 +2428,12 @@ def _stream_agent_response(
                 intent = _classify_intent(llm, prompt)
                 logger.info(_log_event("assistant_stream_intent", **stream_context, intent=intent, model=resolved_model))
             if intent == "EDIT":
-                yield _sse({"type": "status", "message": "Starting OpenCode workspace..."})
+                requested_runtime = str(edit_runtime_name or get_settings().edit_runtime_default or "opencode").strip() or "opencode"
+                runtime_status_label = "Deep Agents" if requested_runtime.lower() in {"deepagents", "deep-agents", "langchain-deepagents", "langchain_deepagents"} else "OpenCode"
+                yield _sse({"type": "status", "message": f"Starting {runtime_status_label} workspace..."})
                 stream_kwargs: dict[str, Any] = {}
+                if edit_runtime_name:
+                    stream_kwargs["runtime_name"] = edit_runtime_name
                 if isinstance(opencode_resume, dict):
                     workspace = str(opencode_resume.get("workspace") or "").strip()
                     session_id = str(opencode_resume.get("session_id") or "").strip()
@@ -2465,7 +2471,7 @@ def _stream_agent_response(
                 finally:
                     _release_opencode_slot(stream_context["trace_id"])
                 resolved_model = str(opencode_result.model or get_settings().opencode_model or resolved_model or "")
-                final_state["generation_backend"] = "opencode"
+                final_state["generation_backend"] = str(getattr(opencode_result, "runtime", "opencode") or "opencode")
                 final_state["generation_usage"] = _opencode_usage_payload(opencode_result, runtime_options)
                 final_state["citations"] = []
                 yield _sse({"type": "usage", "content": final_state["generation_usage"]})
@@ -2478,11 +2484,13 @@ def _stream_agent_response(
                         yield _sse({"type": "delta", "content": chunk})
                 else:
                     final_response_text = _opencode_failure_response(opencode_result)
+                    runtime_label = _edit_runtime_label(opencode_result)
+                    runtime_error_prefix = re.sub(r"[^A-Za-z0-9]", "", runtime_label) or "EditRuntime"
                     error_details = {
                         "trace_id": stream_context["trace_id"],
-                        "status": "OpenCode workspace failed.",
+                        "status": f"{runtime_label} workspace failed.",
                         "message": final_response_text,
-                        "error_class": "OpenCodeProviderError" if provider_blocked else "OpenCodeExecutionError",
+                        "error_class": "OpenCodeProviderError" if provider_blocked else f"{runtime_error_prefix}ExecutionError",
                         "status_code": 500,
                     }
                     final_state["generation_usage"]["error"] = error_details
@@ -2498,7 +2506,7 @@ def _stream_agent_response(
                             changed_files=len(opencode_result.changed_files),
                         )
                     )
-                    yield _sse({"type": "status", "message": "OpenCode workspace failed."})
+                    yield _sse({"type": "status", "message": error_details["status"]})
                     yield _sse({"type": "error", "content": error_details})
                     for chunk in _iter_text_chunks(final_response_text):
                         yield _sse({"type": "delta", "content": chunk})
@@ -3710,6 +3718,7 @@ def me_chat_stream(
             log_context=log_context,
             opencode_resume=opencode_resume,
             user_id=user_context.user_id,
+            edit_runtime_name=payload.edit_runtime,
         ),
         media_type="text/event-stream",
         headers={
@@ -3745,6 +3754,7 @@ def chat_stream(
             thread_id=request.thread_id,
             agent_builder=lambda: _get_agent(),
             requested_mode=request.mode,
+            edit_runtime_name=request.edit_runtime,
             log_context={
                 "trace_id": uuid.uuid4().hex[:12],
                 "thread_id": request.thread_id,
