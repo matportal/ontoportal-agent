@@ -3158,6 +3158,8 @@ def test_stream_agent_response_hybrid_ask_can_use_deepagents_runtime(monkeypatch
     monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
     monkeypatch.setattr(server, "_opencode_hybrid_ask_enabled", lambda: True)
     monkeypatch.setattr(server, "_ask_runtime_name", lambda: "deepagents")
+    monkeypatch.setattr(server, "_try_acquire_opencode_slot", lambda **_kwargs: "")
+    monkeypatch.setattr(server, "_release_opencode_slot", lambda _trace_id: None)
     monkeypatch.setattr(server, "_stream_opencode_ask_generation", _fake_ask_stream)
     monkeypatch.setattr(
         server,
@@ -3189,3 +3191,59 @@ def test_stream_agent_response_hybrid_ask_can_use_deepagents_runtime(monkeypatch
     assert "Generating fast answer with Deep Agents" in events
     assert "Deep Agents generated a fast Ask answer." in events
     assert '"mode": "deepagents_hybrid_ask"' in events
+
+
+def test_stream_opencode_ask_generation_retries_deepagents_without_account_auth_when_bridge_unavailable(monkeypatch):
+    runtime_options = SimpleNamespace(
+        mcp_endpoints=[],
+        opencode_auth_source="account_auth",
+        opencode_auth_kind="gemini_antigravity",
+        opencode_auth_json='{"google":{}}',
+        codex_auth_json="",
+        opencode_antigravity_model="google/antigravity-gemini-3.1-pro",
+        generation_api_key_configured=False,
+    )
+    observed_account_auth: list[bool] = []
+
+    class _Runtime:
+        def __init__(self, *, ok: bool, text: str):
+            self.ok = ok
+            self.text = text
+
+        def stream(self, request):
+            yield {"type": "opencode_phase", "content": {"label": "Preparing Deep Agents workspace"}}
+            return OpenCodeExecutionResult(
+                ok=self.ok,
+                workspace="/tmp/ask-runtime",
+                run_id="ask-runtime",
+                expires_at="2999-01-01T00:00:00+00:00",
+                runtime="deepagents",
+                model="deepagents/test",
+                final_text=self.text,
+                exit_code=0 if self.ok else 1,
+                failure_kind="" if self.ok else "execution_error",
+                failure_reason="" if self.ok else "OpenCode exited with code 1.",
+                console_lines=[] if self.ok else ["Deep Agents failed: Connection error."],
+            )
+
+    def _fake_create_edit_runtime(runtime_name, *, provider_auth=None, account_auth=None, **kwargs):
+        observed_account_auth.append(account_auth is not None)
+        if account_auth is not None:
+            return _Runtime(ok=False, text="Connection error.")
+        return _Runtime(ok=True, text="Fallback fast answer.")
+
+    monkeypatch.setattr(server, "create_edit_runtime", _fake_create_edit_runtime)
+
+    events = "".join(
+        server._stream_opencode_ask_generation(
+            prompt="What is MATONTO?",
+            thread_id="thread-ask-fallback",
+            trace_id="trace-ask-fallback",
+            runtime_options=runtime_options,
+            retrieval_state={"rag_result": "MATONTO context", "citation_labels": ["MATONTO"]},
+            runtime_name="deepagents",
+        )
+    )
+
+    assert observed_account_auth == [True, False]
+    assert "account-auth bridge unavailable" in events

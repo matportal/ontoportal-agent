@@ -2289,32 +2289,8 @@ def _opencode_hybrid_ask_usage_payload(
     }
 
 
-def _stream_opencode_ask_generation(
-    *,
-    prompt: str,
-    thread_id: str | None,
-    trace_id: str,
-    runtime_options: AgentRuntimeOptions | None,
-    retrieval_state: dict[str, Any],
-    runtime_name: str | None = None,
-) -> Iterator[str]:
-    runtime = create_edit_runtime(
-        runtime_name,
-        provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
-        account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
-        mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
-        runtime_options=runtime_options,
-    )
-    stream = runtime.stream(
-        EditRuntimeRequest(
-            prompt=prompt,
-            thread_id=thread_id,
-            trace_id=trace_id,
-            task="ask",
-            retrieved_context=str(retrieval_state.get("rag_result") or ""),
-            citation_labels=tuple(str(label) for label in (retrieval_state.get("citation_labels") or [])),
-        )
-    )
+def _stream_edit_runtime_ask_events(runtime: Any, request: EditRuntimeRequest) -> Iterator[str]:
+    stream = runtime.stream(request)
     while True:
         try:
             event = next(stream)
@@ -2327,6 +2303,57 @@ def _stream_opencode_ask_generation(
                 yield _sse({"type": "status", "message": label})
         elif event_type == "terminal_log":
             continue
+
+
+def _ask_account_auth_unavailable(result: OpenCodeExecutionResult) -> bool:
+    text = "\n".join([str(result.final_text or ""), str(result.failure_reason or ""), *[str(line) for line in result.console_lines]])
+    lower = text.lower()
+    return "connection error" in lower or "failed to connect" in lower or "connection refused" in lower
+
+
+def _stream_opencode_ask_generation(
+    *,
+    prompt: str,
+    thread_id: str | None,
+    trace_id: str,
+    runtime_options: AgentRuntimeOptions | None,
+    retrieval_state: dict[str, Any],
+    runtime_name: str | None = None,
+) -> Iterator[str]:
+    provider_auth = _opencode_provider_auth_from_runtime_options(runtime_options)
+    account_auth = _opencode_account_auth_from_runtime_options(runtime_options)
+    request = EditRuntimeRequest(
+        prompt=prompt,
+        thread_id=thread_id,
+        trace_id=trace_id,
+        task="ask",
+        retrieved_context=str(retrieval_state.get("rag_result") or ""),
+        citation_labels=tuple(str(label) for label in (retrieval_state.get("citation_labels") or [])),
+    )
+    runtime = create_edit_runtime(
+        runtime_name,
+        provider_auth=provider_auth,
+        account_auth=account_auth,
+        mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
+        runtime_options=runtime_options,
+    )
+    result = yield from _stream_edit_runtime_ask_events(runtime, request)
+    if (
+        str(runtime_name or "").strip().lower() == "deepagents"
+        and account_auth is not None
+        and (not result.ok)
+        and _ask_account_auth_unavailable(result)
+    ):
+        yield _sse({"type": "status", "message": "Deep Agents account-auth bridge unavailable; retrying fast answer with the configured provider key."})
+        fallback_runtime = create_edit_runtime(
+            runtime_name,
+            provider_auth=provider_auth,
+            account_auth=None,
+            mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
+            runtime_options=runtime_options,
+        )
+        return (yield from _stream_edit_runtime_ask_events(fallback_runtime, request))
+    return result
 
 
 def _artifact_execution_for_user(
