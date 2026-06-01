@@ -2273,6 +2273,10 @@ def _opencode_hybrid_ask_usage_payload(
     model = str(result.model or get_settings().opencode_model or "opencode")
     runtime = str(getattr(result, "runtime", "") or "opencode").strip().lower() or "opencode"
     mode = "deepagents_hybrid_ask" if runtime == "deepagents" else "opencode_hybrid_ask"
+    auth_source = _opencode_auth_source_from_runtime_options(runtime_options)
+    auth_kind = str(getattr(runtime_options, "opencode_auth_kind", "") or "")
+    if runtime == "deepagents" and auth_source == "account_auth" and "antigravity" not in str(result.model or "").lower():
+        auth_source = "configured_provider_key_fallback"
     return {
         "model": model,
         "mode": mode,
@@ -2283,8 +2287,8 @@ def _opencode_hybrid_ask_usage_payload(
             "model": result.model,
             "exit_code": result.exit_code,
             "log_lines": len(result.console_lines),
-            "auth_source": _opencode_auth_source_from_runtime_options(runtime_options),
-            "auth_kind": str(getattr(runtime_options, "opencode_auth_kind", "") or ""),
+            "auth_source": auth_source,
+            "auth_kind": auth_kind,
         },
     }
 
