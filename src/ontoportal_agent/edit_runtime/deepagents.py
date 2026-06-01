@@ -118,8 +118,11 @@ class DeepAgentsEditRuntime:
         yield {"type": "opencode_phase", "content": {"label": "Preparing Deep Agents workspace", "run_id": run_id, "workspace": str(workspace), "runtime": self.runtime}}
 
         try:
-            final_text = yield from self._run_deep_agent(request=request, workspace=workspace, result=result)
-            result.final_text = final_text.strip() or "Deep Agents completed the ontology edit workspace."
+            if str(request.task or "").strip().lower() == "ask":
+                final_text = yield from self._run_fast_ask(request=request, result=result)
+            else:
+                final_text = yield from self._run_deep_agent(request=request, workspace=workspace, result=result)
+            result.final_text = final_text.strip() or "Deep Agents completed the request."
             result.exit_code = 0
         except Exception as exc:  # noqa: BLE001 - convert runtime failures to the established result contract.
             result.exit_code = int(getattr(exc, "status_code", 1) or 1)
@@ -152,6 +155,37 @@ class DeepAgentsEditRuntime:
             }
         return result
 
+    def _run_fast_ask(self, *, request: EditRuntimeRequest, result: OpenCodeExecutionResult) -> Iterator[str]:
+        model = self._build_fast_ask_model()
+        citations = "\n".join(
+            f"- {str(label).strip()}" for label in request.citation_labels if str(label or "").strip()
+        )
+        prompt = "\n".join(
+            [
+                "You are answering a MatPortal assistant Ask request.",
+                "Answer fast. Do not deliberate at length. Do not use tools. Do not create files.",
+                "Use only the retrieved context below; if it is weak or missing, say what is missing.",
+                "Keep the answer concise, direct, and operator-facing.",
+                "",
+                "User question:",
+                request.prompt.strip(),
+                "",
+                "Retrieved context:",
+                str(request.retrieved_context or "").strip() or "(none)",
+                "",
+                "Citations:",
+                citations or "- none",
+                "",
+                "Return only the answer text.",
+            ]
+        )
+        self._append_console_line(result, "Deep Agents fast Ask generation started.")
+        yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+        reply = model.invoke([HumanMessage(content=prompt)])
+        self._append_console_line(result, "Deep Agents fast Ask generation finished.")
+        yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+        return self._stringify_content(getattr(reply, "content", reply))
+
     def _run_deep_agent(self, *, request: EditRuntimeRequest, workspace: Path, result: OpenCodeExecutionResult) -> Iterator[str]:
         try:
             from deepagents import create_deep_agent
@@ -182,12 +216,20 @@ class DeepAgentsEditRuntime:
         return final_text
 
     def _build_model(self) -> ChatOpenAI:
+        return self._build_chat_model(model_override=self.settings.deepagents_model)
+
+    def _build_fast_ask_model(self) -> ChatOpenAI:
+        if self.model is not None:
+            return self.model
+        return self._build_chat_model(model_override=self.settings.ask_runtime_model or self.settings.deepagents_model)
+
+    def _build_chat_model(self, *, model_override: str | None = None) -> ChatOpenAI:
         options = self.runtime_options
         if self._uses_antigravity_account_auth():
-            return self._build_antigravity_account_model()
+            return self._build_antigravity_account_model(model_override=model_override)
         api_key = str(getattr(options, "openai_api_key", "") or self.settings.openai_api_key or "")
         base_url = str(getattr(options, "openai_api_base", "") or self.settings.openai_api_base or "") or None
-        model = str(self.settings.deepagents_model or getattr(options, "llm_model", "") or self.settings.llm_model or "").strip()
+        model = str(model_override or getattr(options, "llm_model", "") or self.settings.llm_model or "").strip()
         if not base_url and model.lower().startswith("gemini"):
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
         if not api_key:
@@ -199,8 +241,8 @@ class DeepAgentsEditRuntime:
     def _uses_antigravity_account_auth(self) -> bool:
         return bool(self.account_auth and str(self.account_auth.kind or "").strip().lower() == "gemini_antigravity")
 
-    def _build_antigravity_account_model(self) -> ChatOpenAI:
-        model = self._antigravity_proxy_model_id()
+    def _build_antigravity_account_model(self, *, model_override: str | None = None) -> ChatOpenAI:
+        model = self._antigravity_proxy_model_id(model_override=model_override)
         return ChatOpenAI(
             api_key=str(self.settings.deepagents_antigravity_api_key or "proxy-managed"),
             base_url=str(self.settings.deepagents_antigravity_base_url or "http://localhost:51200/v1"),
@@ -208,8 +250,8 @@ class DeepAgentsEditRuntime:
             temperature=0.0,
         )
 
-    def _antigravity_proxy_model_id(self) -> str:
-        configured = str(self.settings.deepagents_model or "").strip()
+    def _antigravity_proxy_model_id(self, *, model_override: str | None = None) -> str:
+        configured = str(model_override or "").strip()
         if configured:
             return configured.split("/", 1)[-1].replace("antigravity-", "")
         raw = str(getattr(self.account_auth, "model_ref", "") or "").strip()
@@ -221,7 +263,7 @@ class DeepAgentsEditRuntime:
 
     def _model_label(self) -> str:
         if self._uses_antigravity_account_auth():
-            return f"deepagents/antigravity/{self._antigravity_proxy_model_id()}"
+            return f"deepagents/antigravity/{self._antigravity_proxy_model_id(model_override=self.settings.deepagents_model)}"
         configured = str(self.settings.deepagents_model or getattr(self.runtime_options, "llm_model", "") or self.settings.llm_model or "").strip()
         return f"deepagents/{configured or 'default'}"
 

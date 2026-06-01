@@ -85,6 +85,14 @@ class AgentSettings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("ONTOAGENT_EDIT_RUNTIME_DUAL_ENABLED", "EDIT_RUNTIME_DUAL_ENABLED"),
     )
+    ask_runtime_default: str = Field(
+        default="standard",
+        validation_alias=AliasChoices("ONTOAGENT_ASK_RUNTIME_DEFAULT", "ASK_RUNTIME_DEFAULT"),
+    )
+    ask_runtime_model: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_ASK_RUNTIME_MODEL", "ASK_RUNTIME_MODEL"),
+    )
     deepagents_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("ONTOAGENT_DEEPAGENTS_ENABLED", "DEEPAGENTS_ENABLED"),

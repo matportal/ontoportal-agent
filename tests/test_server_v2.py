@@ -2902,12 +2902,13 @@ def test_stream_agent_response_hybrid_ask_uses_opencode_after_backend_retrieval(
     )
     observed: dict[str, object] = {}
 
-    def _fake_opencode_ask_stream(*, prompt, thread_id, trace_id, runtime_options, retrieval_state):
+    def _fake_opencode_ask_stream(*, prompt, thread_id, trace_id, runtime_options, retrieval_state, runtime_name=None):
         observed["prompt"] = prompt
         observed["thread_id"] = thread_id
         observed["trace_id"] = trace_id
         observed["runtime_options"] = runtime_options
         observed["retrieval_state"] = retrieval_state
+        observed["runtime_name"] = runtime_name
         yield server._sse({"type": "status", "message": "OpenCode ask generation running."})
         return OpenCodeExecutionResult(
             ok=True,
@@ -2951,6 +2952,7 @@ def test_stream_agent_response_hybrid_ask_uses_opencode_after_backend_retrieval(
     assert observed["thread_id"] == "thread-hybrid-ask"
     assert observed["runtime_options"] is runtime_agent.runtime_options
     assert observed["retrieval_state"]["rag_result"] == "MATONTO covers materials terminology."
+    assert observed["runtime_name"] is None
     assert "OpenCode ask generation running." in events
     assert "OpenCode generated the answer from MATONTO context." in events
     assert '"type": "citations"' in events
@@ -3120,3 +3122,70 @@ def test_thread_title_rename_is_user_scoped(monkeypatch, tmp_path):
 
     forbidden = client.patch(f"/api/v1/me/threads/{thread_id}", json={"title": "Other rename"}, headers=other_headers)
     assert forbidden.status_code == 404
+
+
+def test_stream_agent_response_hybrid_ask_can_use_deepagents_runtime(monkeypatch):
+    runtime_agent = SimpleNamespace(
+        runtime_options=SimpleNamespace(
+            generation_provider="openai_compatible",
+            llm_model="gpt-5.2",
+            openai_api_key="test-key",
+            openai_api_base="https://api.openai.com/v1",
+            rag_top_k=12,
+            rag_base_url="http://rag.internal",
+            rag_query_path="/api/v1/query",
+            mcp_endpoints=[],
+            mcp_api_key=None,
+            mcp_rag_tool_name="rag_query",
+        )
+    )
+    observed: dict[str, object] = {}
+
+    def _fake_ask_stream(*, prompt, thread_id, trace_id, runtime_options, retrieval_state, runtime_name=None):
+        observed["runtime_name"] = runtime_name
+        yield server._sse({"type": "status", "message": "Deep Agents ask generation running."})
+        return OpenCodeExecutionResult(
+            ok=True,
+            workspace="/tmp/ontoportal-agent/opencode-runs/thread-deepagents-ask",
+            run_id="run-deepagents-ask",
+            expires_at="2999-01-01T00:00:00+00:00",
+            model="deepagents/antigravity/gemini-3-flash",
+            runtime="deepagents",
+            final_text="Deep Agents generated a fast Ask answer.",
+        )
+
+    monkeypatch.setattr(server, "_build_chat_model", lambda _runtime_options, model_override=None: SimpleNamespace())
+    monkeypatch.setattr(server, "_classify_intent", lambda _llm, _prompt: "RETRIEVE")
+    monkeypatch.setattr(server, "_opencode_hybrid_ask_enabled", lambda: True)
+    monkeypatch.setattr(server, "_ask_runtime_name", lambda: "deepagents")
+    monkeypatch.setattr(server, "_stream_opencode_ask_generation", _fake_ask_stream)
+    monkeypatch.setattr(
+        server,
+        "_retrieve_runtime_state",
+        lambda prompt, runtime_options: {
+            "rag_result": "MATONTO covers materials terminology.",
+            "citations": [{"document_label": "MATONTO v2.0", "rank": 1}],
+            "citation_labels": ["MATONTO v2.0"],
+            "retrieval_backend": "rag-http",
+            "retrieval_error": "",
+            "retrieval_chunk_count": 12,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_stream_openai_compatible_events",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("standard LLM path should not run")),
+    )
+
+    events = "".join(
+        server._stream_agent_response(
+            prompt="Which ontology should I use for aluminium?",
+            thread_id="thread-deepagents-ask",
+            agent_builder=lambda: runtime_agent,
+        )
+    )
+
+    assert observed["runtime_name"] == "deepagents"
+    assert "Generating fast answer with Deep Agents" in events
+    assert "Deep Agents generated a fast Ask answer." in events
+    assert '"mode": "deepagents_hybrid_ask"' in events

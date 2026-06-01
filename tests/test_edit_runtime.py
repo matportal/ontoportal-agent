@@ -326,3 +326,41 @@ def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, 
     assert validation_event["ok"] is True
     assert any(item["path"] == "proposal.ttl" and item["status"] == "passed" for item in validation_event["checked_files"])
     assert captured["kwargs"]["name"] == "matportal-deepagents-edit"
+
+
+def test_deepagents_runtime_ask_uses_fast_direct_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_DEEPAGENTS_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_KEEP_WORKSPACE", "false")
+    get_settings.cache_clear()
+
+    captured: dict[str, object] = {}
+
+    class _FastModel:
+        def invoke(self, messages):
+            captured["messages"] = messages
+            return AIMessage(content="Fast answer from retrieved context.")
+
+    runtime = DeepAgentsEditRuntime(model=_FastModel())
+    events = list(
+        runtime.stream(
+            EditRuntimeRequest(
+                prompt="What is MATONTO?",
+                thread_id="thread-deepagents-ask",
+                trace_id="trace-deepagents-ask",
+                task="ask",
+                retrieved_context="MATONTO covers materials ontology terminology.",
+                citation_labels=("MATONTO v2",),
+            )
+        )
+    )
+
+    assert any(event["type"] == "terminal_log" and "fast Ask generation" in event["content"]["line"] for event in events)
+    prompt_text = captured["messages"][0].content
+    assert "Answer fast" in prompt_text
+    assert "Do not use tools" in prompt_text
+    assert "MATONTO covers materials ontology terminology." in prompt_text
+    validation_event = next(event["content"] for event in events if event["type"] == "validation_report")
+    assert validation_event.get("runtime", {}).get("status", "passed") == "passed"

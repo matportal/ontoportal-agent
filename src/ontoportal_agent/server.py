@@ -2252,14 +2252,31 @@ def _opencode_hybrid_ask_enabled() -> bool:
     return bool(getattr(get_settings(), "opencode_hybrid_ask_enabled", False))
 
 
+def _ask_runtime_name() -> str:
+    clean = str(getattr(get_settings(), "ask_runtime_default", "standard") or "standard").strip().lower()
+    if clean in {"", "standard", "llm", "model", "default"}:
+        return ""
+    if clean in {"deepagents", "deep-agents", "langchain-deepagents", "langchain_deepagents"}:
+        return "deepagents"
+    return "opencode"
+
+
+def _ask_runtime_label(runtime_name: str | None) -> str:
+    clean = str(runtime_name or _ask_runtime_name() or "opencode").strip().lower()
+    return "Deep Agents" if clean == "deepagents" else "OpenCode"
+
+
 def _opencode_hybrid_ask_usage_payload(
     result: OpenCodeExecutionResult,
     runtime_options: AgentRuntimeOptions | None = None,
 ) -> dict[str, Any]:
     model = str(result.model or get_settings().opencode_model or "opencode")
+    runtime = str(getattr(result, "runtime", "") or "opencode").strip().lower() or "opencode"
+    mode = "deepagents_hybrid_ask" if runtime == "deepagents" else "opencode_hybrid_ask"
     return {
         "model": model,
-        "mode": "opencode_hybrid_ask",
+        "mode": mode,
+        "ask_runtime": runtime,
         "opencode": {
             "ok": result.ok,
             "run_id": result.run_id,
@@ -2279,9 +2296,10 @@ def _stream_opencode_ask_generation(
     trace_id: str,
     runtime_options: AgentRuntimeOptions | None,
     retrieval_state: dict[str, Any],
+    runtime_name: str | None = None,
 ) -> Iterator[str]:
     runtime = create_edit_runtime(
-        None,
+        runtime_name,
         provider_auth=_opencode_provider_auth_from_runtime_options(runtime_options),
         account_auth=_opencode_account_auth_from_runtime_options(runtime_options),
         mcp_servers=runtime_options.mcp_endpoints if runtime_options else None,
@@ -2535,7 +2553,9 @@ def _stream_agent_response(
                     yield _sse({"type": "citations", "content": final_state.get("citations")})
 
                 if _opencode_hybrid_ask_enabled():
-                    yield _sse({"type": "status", "message": "Generating answer with OpenCode..."})
+                    ask_runtime_name = _ask_runtime_name()
+                    ask_runtime_label = _ask_runtime_label(ask_runtime_name)
+                    yield _sse({"type": "status", "message": f"Generating fast answer with {ask_runtime_label}..."})
                     try:
                         limit_message = _try_acquire_opencode_slot(
                             trace_id=stream_context["trace_id"],
@@ -2551,6 +2571,7 @@ def _stream_agent_response(
                                 trace_id=stream_context["trace_id"],
                                 runtime_options=runtime_options,
                                 retrieval_state=final_state,
+                                runtime_name=ask_runtime_name or None,
                             )
                         finally:
                             _release_opencode_slot(stream_context["trace_id"])
@@ -2564,13 +2585,13 @@ def _stream_agent_response(
                                 **_failure_log_fields(exc),
                             )
                         )
-                        yield _sse({"type": "status", "message": "OpenCode answer generation failed; using the standard model path."})
+                        yield _sse({"type": "status", "message": f"{ask_runtime_label} answer generation failed; using the standard model path."})
                     else:
                         if opencode_ask_result.ok and str(opencode_ask_result.final_text or "").strip():
                             resolved_model = str(opencode_ask_result.model or get_settings().opencode_model or resolved_model or "")
                             final_response_text = str(opencode_ask_result.final_text or "").strip()
                             final_state["final_response"] = final_response_text
-                            final_state["generation_backend"] = "opencode:hybrid_ask"
+                            final_state["generation_backend"] = f"{str(getattr(opencode_ask_result, 'runtime', 'opencode') or 'opencode')}:hybrid_ask"
                             final_state["generation_usage"] = _opencode_hybrid_ask_usage_payload(
                                 opencode_ask_result,
                                 runtime_options,
@@ -2590,7 +2611,7 @@ def _stream_agent_response(
                             )
                             model_candidates = []
                         else:
-                            yield _sse({"type": "status", "message": "OpenCode answer generation produced no answer; using the standard model path."})
+                            yield _sse({"type": "status", "message": f"{ask_runtime_label} answer generation produced no answer; using the standard model path."})
 
                 if not final_state.get("final_response"):
                     yield _sse({"type": "status", "message": "Streaming answer..."})
