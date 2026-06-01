@@ -247,6 +247,10 @@ class ThreadCreateRequest(BaseModel):
     thread_id: Optional[str] = None
 
 
+class ThreadUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+
+
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -3423,6 +3427,20 @@ def me_create_thread(
         title=payload.title,
         thread_id=payload.thread_id or str(uuid.uuid4()),
     )
+    return _serialize_thread(thread)
+
+
+@app.patch("/api/v1/me/threads/{thread_id}")
+def me_update_thread(
+    thread_id: str,
+    payload: ThreadUpdateRequest,
+    request: Request,
+    session: Session = Depends(get_db_session),
+) -> dict[str, Any]:
+    user_context = _resolve_user_context(request)
+    thread = update_thread_title(session, user_id=user_context.user_id, thread_id=thread_id, title=payload.title)
+    if thread is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.")
     return _serialize_thread(thread)
 
 

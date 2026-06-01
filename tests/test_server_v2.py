@@ -3088,3 +3088,35 @@ def test_opencode_success_response_surfaces_antigravity_tool_schema_error():
 
     assert "antigravity-claude-opus-4-6-thinking rejected one of the MatPortal tool definitions" in message
     assert "provider-safe OntoPortal MCP schema" in message
+
+
+def test_thread_title_can_be_renamed(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    headers = _signed_headers()
+
+    created = client.post("/api/v1/me/threads", json={"title": "Original title"}, headers=headers)
+    assert created.status_code == 200
+    thread_id = created.json()["thread_id"]
+
+    updated = client.patch(f"/api/v1/me/threads/{thread_id}", json={"title": "Renamed chat"}, headers=headers)
+    assert updated.status_code == 200
+    assert updated.json()["title"] == "Renamed chat"
+
+    listed = client.get("/api/v1/me/threads", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["threads"][0]["title"] == "Renamed chat"
+
+
+def test_thread_title_rename_is_user_scoped(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    owner_headers = _signed_headers(user_id="owner", username="owner", email="owner@example.org")
+    other_headers = _signed_headers(user_id="other", username="other", email="other@example.org")
+
+    created = client.post("/api/v1/me/threads", json={"title": "Owner chat"}, headers=owner_headers)
+    assert created.status_code == 200
+    thread_id = created.json()["thread_id"]
+
+    forbidden = client.patch(f"/api/v1/me/threads/{thread_id}", json={"title": "Other rename"}, headers=other_headers)
+    assert forbidden.status_code == 404
