@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
+import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
+
+import requests
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
+
+try:  # Optional until runtime image dependencies are refreshed.
+    from langchain_anthropic import ChatAnthropic
+except Exception:  # pragma: no cover - exercised only in old environments missing the extra package.
+    ChatAnthropic = None  # type: ignore[assignment]
 from pydantic import BaseModel, Field
 
 from ..agent.options import AgentRuntimeOptions
@@ -156,7 +169,12 @@ class DeepAgentsEditRuntime:
         return result
 
     def _run_fast_ask(self, *, request: EditRuntimeRequest, result: OpenCodeExecutionResult) -> Iterator[str]:
-        model = self._build_fast_ask_model()
+        with self._maybe_antigravity_proxy(result=result):
+            model = self._build_fast_ask_model()
+            final_text = yield from self._run_fast_ask_with_model(request=request, result=result, model=model)
+        return final_text
+
+    def _run_fast_ask_with_model(self, *, request: EditRuntimeRequest, result: OpenCodeExecutionResult, model: Any) -> Iterator[str]:
         citations = "\n".join(
             f"- {str(label).strip()}" for label in request.citation_labels if str(label or "").strip()
         )
@@ -194,26 +212,27 @@ class DeepAgentsEditRuntime:
         except Exception as exc:  # pragma: no cover - covered in integration environments with optional dep absent.
             raise DeepAgentsRuntimeError("Python package deepagents is not installed in the assistant runtime.") from exc
 
-        tools = self._tools(workspace=workspace, result=result)
-        model = self.model or self._build_model()
-        agent = create_deep_agent(
-            model=model,
-            tools=tools,
-            system_prompt=self._system_prompt(workspace),
-            backend=StateBackend(),
-            permissions=[FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny")],
-            interrupt_on=None,
-            debug=False,
-            name="matportal-deepagents-edit",
-        )
-        prompt = self._user_prompt(request)
-        self._append_console_line(result, "Deep Agents run started.")
-        yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
-        final_state = agent.invoke({"messages": [HumanMessage(content=prompt)]})
-        final_text = self._extract_final_text(final_state)
-        self._append_console_line(result, "Deep Agents run finished.")
-        yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
-        return final_text
+        with self._maybe_antigravity_proxy(result=result):
+            tools = self._tools(workspace=workspace, result=result)
+            model = self.model or self._build_model()
+            agent = create_deep_agent(
+                model=model,
+                tools=tools,
+                system_prompt=self._system_prompt(workspace),
+                backend=StateBackend(),
+                permissions=[FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="deny")],
+                interrupt_on=None,
+                debug=False,
+                name="matportal-deepagents-edit",
+            )
+            prompt = self._user_prompt(request)
+            self._append_console_line(result, "Deep Agents run started.")
+            yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+            final_state = agent.invoke({"messages": [HumanMessage(content=prompt)]})
+            final_text = self._extract_final_text(final_state)
+            self._append_console_line(result, "Deep Agents run finished.")
+            yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
+            return final_text
 
     def _build_model(self) -> ChatOpenAI:
         return self._build_chat_model(model_override=self.settings.deepagents_model)
@@ -241,25 +260,170 @@ class DeepAgentsEditRuntime:
     def _uses_antigravity_account_auth(self) -> bool:
         return bool(self.account_auth and str(self.account_auth.kind or "").strip().lower() == "gemini_antigravity")
 
-    def _build_antigravity_account_model(self, *, model_override: str | None = None) -> ChatOpenAI:
+    @contextmanager
+    def _maybe_antigravity_proxy(self, *, result: OpenCodeExecutionResult) -> Iterator[None]:
+        if not self._uses_antigravity_account_auth():
+            yield
+            return
+
+        with tempfile.TemporaryDirectory(prefix="matportal-antigravity-proxy-") as temp_dir:
+            home = Path(temp_dir)
+            accounts_path = home / ".config" / "antigravity-proxy" / "accounts.json"
+            accounts_path.parent.mkdir(parents=True, exist_ok=True)
+            accounts_path.write_text(
+                json.dumps(self._antigravity_proxy_accounts_config(), separators=(",", ":"), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            accounts_path.chmod(0o600)
+
+            port = self._select_antigravity_proxy_port()
+            env = dict(os.environ)
+            env.update({"HOME": str(home), "PORT": str(port), "HOST": "127.0.0.1"})
+            process: subprocess.Popen[str] | None = None
+            try:
+                process = subprocess.Popen(
+                    ["antigravity-claude-proxy", "start"],
+                    cwd=str(home),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                base_url = f"http://127.0.0.1:{port}"
+                self._wait_for_antigravity_proxy(base_url=base_url, process=process)
+                self._active_antigravity_proxy_base_url = base_url
+                self._append_console_line(result, f"Deep Agents Antigravity proxy ready on localhost:{port}.")
+                yield
+            except FileNotFoundError as exc:
+                raise DeepAgentsRuntimeError(
+                    "Deep Agents Antigravity account auth requires antigravity-claude-proxy in the runtime image."
+                ) from exc
+            finally:
+                if hasattr(self, "_active_antigravity_proxy_base_url"):
+                    delattr(self, "_active_antigravity_proxy_base_url")
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+
+    def _antigravity_proxy_accounts_config(self) -> dict[str, Any]:
+        raw_auth = str(getattr(self.account_auth, "opencode_auth_json", "") or "").strip()
+        if not raw_auth:
+            raise DeepAgentsRuntimeError("Deep Agents Antigravity account auth requires saved Gemini Antigravity OAuth JSON.")
+        try:
+            auth = json.loads(raw_auth)
+        except json.JSONDecodeError as exc:
+            raise DeepAgentsRuntimeError("Saved Gemini Antigravity OAuth JSON is invalid.") from exc
+        google = auth.get("google") if isinstance(auth, dict) else None
+        if not isinstance(google, dict):
+            raise DeepAgentsRuntimeError("Saved Gemini Antigravity OAuth JSON is missing the google account object.")
+        refresh_token = str(google.get("refresh") or "").strip()
+        if not refresh_token:
+            raise DeepAgentsRuntimeError("Saved Gemini Antigravity OAuth JSON is missing a refresh token.")
+        email = str(google.get("email") or "matportal-antigravity@local").strip() or "matportal-antigravity@local"
+        project_id = str(google.get("projectId") or "").strip()
+        return {
+            "accounts": [
+                {
+                    "email": email,
+                    "source": "oauth",
+                    "enabled": True,
+                    "refreshToken": refresh_token,
+                    "projectId": project_id or None,
+                    "addedAt": datetime.now(timezone.utc).isoformat(),
+                    "modelRateLimits": {},
+                    "lastUsed": None,
+                }
+            ],
+            "settings": {},
+            "activeIndex": 0,
+        }
+
+    def _wait_for_antigravity_proxy(self, *, base_url: str, process: subprocess.Popen[str]) -> None:
+        deadline = time.monotonic() + 20
+        last_error = ""
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise DeepAgentsRuntimeError("Deep Agents Antigravity proxy exited before it became ready.")
+            try:
+                response = requests.get(f"{base_url}/health", timeout=1)
+                if response.status_code < 500:
+                    return
+                last_error = f"status {response.status_code}"
+            except requests.RequestException as exc:
+                last_error = exc.__class__.__name__
+            time.sleep(0.25)
+        raise DeepAgentsRuntimeError(f"Deep Agents Antigravity proxy did not become ready ({last_error or 'timeout'}).")
+
+    def _select_antigravity_proxy_port(self) -> int:
+        preferred = self._configured_antigravity_proxy_port()
+        if preferred and self._port_is_available(preferred):
+            return preferred
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _configured_antigravity_proxy_port(self) -> int:
+        parsed = urlparse(str(self.settings.deepagents_antigravity_base_url or "http://localhost:51200/v1"))
+        try:
+            return int(parsed.port or 51200)
+        except ValueError:
+            return 51200
+
+    def _configured_antigravity_proxy_base_url(self) -> str:
+        parsed = urlparse(str(self.settings.deepagents_antigravity_base_url or "http://localhost:51200/v1"))
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 51200
+        return f"{scheme}://{host}:{port}"
+
+    def _port_is_available(self, port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", int(port)))
+            except OSError:
+                return False
+        return True
+
+    def _build_antigravity_account_model(self, *, model_override: str | None = None) -> Any:
+        if ChatAnthropic is None:
+            raise DeepAgentsRuntimeError(
+                "Deep Agents Antigravity account auth requires the langchain-anthropic package in the runtime image."
+            )
         model = self._antigravity_proxy_model_id(model_override=model_override)
-        return ChatOpenAI(
+        base_url = getattr(self, "_active_antigravity_proxy_base_url", None) or self._configured_antigravity_proxy_base_url()
+        return ChatAnthropic(
             api_key=str(self.settings.deepagents_antigravity_api_key or "proxy-managed"),
-            base_url=str(self.settings.deepagents_antigravity_base_url or "http://localhost:51200/v1"),
+            base_url=base_url,
             model=model,
             temperature=0.0,
+            max_tokens=4096,
         )
 
     def _antigravity_proxy_model_id(self, *, model_override: str | None = None) -> str:
         configured = str(model_override or "").strip()
         if configured:
-            return configured.split("/", 1)[-1].replace("antigravity-", "")
+            return self._normalize_antigravity_proxy_model_id(configured.split("/", 1)[-1])
         raw = str(getattr(self.account_auth, "model_ref", "") or "").strip()
         model_id = raw.split("/", 1)[-1] if raw else ""
-        model_id = model_id.replace("antigravity-", "")
-        if model_id in {"gemini-3-pro", "gemini-3.1-pro", ""}:
+        return self._normalize_antigravity_proxy_model_id(model_id)
+
+    def _normalize_antigravity_proxy_model_id(self, model_id: str) -> str:
+        normalized = str(model_id or "").strip().replace("antigravity-", "")
+        lower = normalized.lower()
+        if not lower or lower in {"gemini-3-pro", "gemini-3.1-pro"}:
             return "gemini-3.1-pro-high"
-        return model_id
+        if lower in {"gemini-3-pro-preview", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools"}:
+            return "gemini-3.1-pro-low"
+        if "flash-lite" in lower or lower in {"gemini-3-flash-preview", "gemini-3.1-flash-preview"}:
+            return "gemini-3.5-flash-low"
+        if lower == "gemini-3-flash":
+            return "gemini-3-flash"
+        return normalized
 
     def _model_label(self) -> str:
         if self._uses_antigravity_account_auth():

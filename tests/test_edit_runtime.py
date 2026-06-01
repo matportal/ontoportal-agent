@@ -11,6 +11,7 @@ if importlib.util.find_spec("ontoportal_agent") is None:
 
 from ontoportal_agent.config import get_settings
 from ontoportal_agent.edit_runtime import DeepAgentsEditRuntime, OpenCodeEditRuntime, PiEditRuntime, create_edit_runtime, normalize_edit_runtime_name
+from ontoportal_agent.edit_runtime import deepagents as deepagents_runtime
 from ontoportal_agent.edit_runtime.base import EditRuntimeRequest
 from ontoportal_agent.opencode_executor import OpenCodeAccountAuth
 
@@ -244,6 +245,111 @@ def test_deepagents_runtime_uses_antigravity_account_bridge(monkeypatch, tmp_pat
     assert isinstance(runtime, DeepAgentsEditRuntime)
     assert runtime.account_auth is account_auth
     assert runtime._antigravity_proxy_model_id() == "gemini-3.1-pro-high"
+
+
+def test_deepagents_runtime_starts_antigravity_proxy_from_saved_account(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_DEEPAGENTS_ENABLED", "true")
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_KEEP_WORKSPACE", "false")
+    monkeypatch.setenv("ONTOAGENT_ASK_RUNTIME_MODEL", "gemini-3.1-flash-lite-preview")
+    get_settings.cache_clear()
+
+    captured: dict[str, object] = {"models": []}
+    original_popen = deepagents_runtime.subprocess.Popen
+
+    class _FakeProcess:
+        def __init__(self, args, cwd=None, env=None, **kwargs):
+            if not args or args[0] != "antigravity-claude-proxy":
+                self._real = original_popen(args, cwd=cwd, env=env, **kwargs)
+                return
+            self._real = None
+            captured["args"] = args
+            captured["cwd"] = cwd
+            captured["env"] = env
+            accounts_path = tmp_path.__class__(env["HOME"]) / ".config" / "antigravity-proxy" / "accounts.json"
+            captured["accounts_config"] = json.loads(accounts_path.read_text(encoding="utf-8"))
+            self.terminated = False
+
+        def __getattr__(self, name):
+            if self._real is not None:
+                return getattr(self._real, name)
+            raise AttributeError(name)
+
+        def __enter__(self):
+            return self._real.__enter__() if self._real is not None else self
+
+        def __exit__(self, exc_type, exc, tb):
+            if self._real is not None:
+                return self._real.__exit__(exc_type, exc, tb)
+            return False
+
+        def poll(self):
+            return self._real.poll() if self._real is not None else None
+
+        def terminate(self):
+            if self._real is not None:
+                return self._real.terminate()
+            captured["terminated"] = True
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return self._real.wait(timeout=timeout) if self._real is not None else 0
+
+    class _FakeResponse:
+        status_code = 200
+
+    class _FakeChatAnthropic:
+        def __init__(self, **kwargs):
+            captured["chat_kwargs"] = kwargs
+
+        def invoke(self, messages):
+            captured["messages"] = messages
+            return AIMessage(content="Antigravity account-auth answer.")
+
+    monkeypatch.setattr(deepagents_runtime.subprocess, "Popen", _FakeProcess)
+    monkeypatch.setattr(deepagents_runtime.requests, "get", lambda *args, **kwargs: _FakeResponse())
+    monkeypatch.setattr(deepagents_runtime, "ChatAnthropic", _FakeChatAnthropic)
+    monkeypatch.setattr(DeepAgentsEditRuntime, "_port_is_available", lambda self, port: True)
+
+    account_auth = OpenCodeAccountAuth(
+        kind="gemini_antigravity",
+        opencode_auth_json=json.dumps(
+            {
+                "google": {
+                    "refresh": "rotated-refresh|user-project",
+                    "access": "access-token-should-not-be-written",
+                    "email": "user@example.test",
+                    "projectId": "user-project",
+                }
+            }
+        ),
+        model_ref="google/antigravity-gemini-3-pro",
+    )
+    runtime = DeepAgentsEditRuntime(account_auth=account_auth)
+    events = list(
+        runtime.stream(
+            EditRuntimeRequest(
+                prompt="What is MATONTO?",
+                thread_id="thread-deepagents-account-ask",
+                trace_id="trace-deepagents-account-ask",
+                task="ask",
+                retrieved_context="MATONTO context.",
+            )
+        )
+    )
+
+    assert captured["args"] == ["antigravity-claude-proxy", "start"]
+    assert captured["env"]["HOST"] == "127.0.0.1"
+    assert captured["env"]["PORT"] == "51200"
+    assert captured["chat_kwargs"]["base_url"] == "http://127.0.0.1:51200"
+    assert captured["chat_kwargs"]["model"] == "gemini-3.5-flash-low"
+    assert captured["accounts_config"]["accounts"][0]["source"] == "oauth"
+    assert captured["accounts_config"]["accounts"][0]["refreshToken"] == "rotated-refresh|user-project"
+    assert "access-token-should-not-be-written" not in json.dumps(captured["accounts_config"])
+    assert captured["terminated"] is True
+    assert any(event["type"] == "terminal_log" and "fast Ask generation" in event["content"]["line"] for event in events)
 
 
 def test_deepagents_runtime_writes_artifacts_and_reuses_validation(monkeypatch, tmp_path):

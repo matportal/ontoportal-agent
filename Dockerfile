@@ -20,7 +20,7 @@ RUN apt-get update \
     && rm -f /tmp/node.tar.xz \
     && node --version \
     && npm --version \
-    && npm install -g @openai/codex opencode-ai @earendil-works/pi-coding-agent \
+    && npm install -g @openai/codex opencode-ai @earendil-works/pi-coding-agent antigravity-claude-proxy \
     && mkdir -p /opt/robot \
     && curl -fsSL -o /opt/robot/robot.jar https://github.com/ontodev/robot/releases/latest/download/robot.jar \
     && npm cache clean --force \
