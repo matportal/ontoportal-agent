@@ -987,6 +987,46 @@ def test_me_chat_stream_persists_messages(monkeypatch, tmp_path):
     assert "Synthetic assistant answer." in messages[1]["content"]
 
 
+def test_me_chat_stream_requires_user_account_configuration(monkeypatch, tmp_path):
+    _configure_env(monkeypatch, tmp_path)
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.runtime_options = SimpleNamespace(
+                openai_api_key="server-default-key",
+                openai_api_base="https://example.test/openai",
+                llm_model="gemini-3-flash-preview",
+                generation_api_key_configured=False,
+                opencode_auth_source="auto",
+                opencode_auth_kind="",
+                opencode_auth_json="",
+                codex_auth_json="",
+                rag_top_k=12,
+                rag_base_url="http://rag.internal",
+                rag_query_path="/api/v1/query",
+                mcp_endpoints=[],
+                mcp_api_key=None,
+                mcp_rag_tool_name="rag_query",
+            )
+
+    monkeypatch.setattr(server, "OntoPortalAgent", _DummyAgent)
+
+    client = TestClient(server.app)
+    headers = _signed_headers(include_internal_token=True)
+
+    response = client.post(
+        "/api/v1/me/chat/stream",
+        json={"prompt": "what is matportal"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert "Assistant account configuration required." in response.text
+    assert "Before using the assistant, open Assistant Settings and configure an account." in response.text
+    assert "Classifying request..." not in response.text
+    assert "[DONE]" in response.text
+
+
+
 def test_me_chat_stream_exposes_and_persists_quota_errors(monkeypatch, tmp_path, caplog):
     _configure_env(monkeypatch, tmp_path)
 
@@ -2310,6 +2350,23 @@ def test_opencode_auth_skips_deployment_default_vertex_account(monkeypatch):
     assert runtime_options.generation_api_key_configured is False
     assert runtime_options.vertex_service_account_json == '{"project_id":"deployment-project"}'
     assert server._opencode_provider_auth_from_runtime_options(runtime_options) is None
+
+
+def test_runtime_failure_status_code_preserves_transient_deepagents_exit_code():
+    result = OpenCodeExecutionResult(
+        ok=False,
+        workspace="/tmp/deepagents-workspace",
+        run_id="run-deepagents-503",
+        expires_at="2999-01-01T00:00:00+00:00",
+        runtime="deepagents",
+        exit_code=503,
+        failure_kind="execution_error",
+        failure_reason="Deep Agents exited with code 503.",
+    )
+
+    assert server._edit_runtime_label(result) == "Deep Agents"
+    assert server._runtime_failure_status_code(result) == 503
+    assert server._opencode_failure_response(result) == "Deep Agents exited with code 503."
 
 
 def test_me_routes_reject_bad_signature(monkeypatch, tmp_path):

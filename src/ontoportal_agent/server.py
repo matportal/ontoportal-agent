@@ -2020,6 +2020,27 @@ def _opencode_auth_source_from_runtime_options(runtime_options: AgentRuntimeOpti
     return auth_source
 
 
+def _assistant_user_auth_configured(runtime_options: AgentRuntimeOptions | None) -> bool:
+    if runtime_options is None:
+        return False
+    if bool(getattr(runtime_options, "generation_api_key_configured", False)):
+        return True
+    account_auth = _opencode_account_auth_from_runtime_options(runtime_options)
+    if account_auth is None:
+        return False
+    return bool(
+        str(account_auth.opencode_auth_json or "").strip()
+        or str(account_auth.codex_auth_json or "").strip()
+    )
+
+
+def _assistant_account_required_message() -> str:
+    return (
+        "Before using the assistant, open Assistant Settings and configure an account. "
+        "Supported options are a provider API key, Codex, or Gemini Antigravity."
+    )
+
+
 def _opencode_account_auth_from_runtime_options(
     runtime_options: AgentRuntimeOptions | None,
 ) -> OpenCodeAccountAuth | None:
@@ -2478,14 +2499,55 @@ def _stream_agent_response(
                 yield event
             final_response_text = str(final_state.get("final_response") or final_state.get("rag_result") or "").strip()
         else:
-            llm = None if _uses_vertex_gemini_provider(runtime_options) else _build_chat_model(runtime_options)
             resolved_model = str(runtime_options.llm_model or get_settings().llm_model or "")
+            logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="runtime", model=resolved_model))
+            if not _assistant_user_auth_configured(runtime_options):
+                final_response_text = _assistant_account_required_message()
+                final_state = {
+                    "final_response": final_response_text,
+                    "generation_backend": "configuration_required",
+                    "generation_usage": {
+                        "model": resolved_model,
+                        "auth_required": True,
+                    },
+                    "generation_reasoning": "",
+                    "citations": [],
+                    "retrieval_backend": "",
+                    "retrieval_error": "",
+                }
+                error_details = {
+                    "trace_id": stream_context["trace_id"],
+                    "status": "Assistant account configuration required.",
+                    "message": final_response_text,
+                    "error_class": "AssistantAccountConfigurationRequired",
+                    "status_code": 412,
+                }
+                logger.info(_log_event("assistant_stream_auth_required", **stream_context, model=resolved_model))
+                yield _sse({"type": "status", "message": error_details["status"]})
+                yield _sse({"type": "error", "content": error_details})
+                for chunk in _iter_text_chunks(final_response_text):
+                    yield _sse({"type": "delta", "content": chunk})
+                if on_completed is not None:
+                    try:
+                        on_completed(final_state, final_response_text)
+                    except Exception as exc:  # pragma: no cover - persistence failure should not poison the response.
+                        logger.exception(
+                            _log_event(
+                                "assistant_stream_persist_failed",
+                                **stream_context,
+                                duration_ms=_elapsed_ms(started_at),
+                                error_class=exc.__class__.__name__,
+                            )
+                        )
+                yield _sse_done()
+                return
+
+            llm = None if _uses_vertex_gemini_provider(runtime_options) else _build_chat_model(runtime_options)
             model_candidates = _generation_model_candidates(
                 resolved_model,
                 generation_provider=getattr(runtime_options, "generation_provider", None),
                 base_url=(runtime_options.openai_api_base if runtime_options else None) or get_settings().openai_api_base,
             )
-            logger.info(_log_event("assistant_stream_mode", **stream_context, execution_mode="runtime", model=resolved_model))
             if _normalize_chat_mode(requested_mode) == "edit":
                 intent = "EDIT"
                 logger.info(

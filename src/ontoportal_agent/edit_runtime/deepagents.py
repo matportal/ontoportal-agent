@@ -598,7 +598,8 @@ class DeepAgentsEditRuntime:
             return [
                 "You are answering a MatPortal assistant Ask request.",
                 "Answer fast. Do not deliberate at length. Do not use tools. Do not create files.",
-                "Use only the retrieved context below; if it is weak or missing, say what is missing.",
+                "For basic portal-help questions, give a short direct product explanation first.",
+                "Use the retrieved context for specifics; if it is weak or missing, say what is missing.",
                 "Keep the answer concise, direct, and operator-facing."
             ]
 
@@ -608,7 +609,13 @@ class DeepAgentsEditRuntime:
             "Answer fast and direct. Do not deliberate. Do not create files unless explicitly requested."
         ]
 
-        if kind == "search":
+        if kind == "general":
+            instructions.extend([
+                "Your focus is general MatPortal portal help.",
+                "When the user asks what MatPortal is, explain that it is a materials-science ontology portal built on OntoPortal for browsing, searching, annotating, mapping, and sharing ontologies.",
+                "Answer in 2-4 sentences unless the user asks for more detail."
+            ])
+        elif kind == "search":
             q = context.get("search_query")
             instructions.extend([
                 "Your focus is Search helper.",
@@ -651,5 +658,5 @@ class DeepAgentsEditRuntime:
                 "Help configure annotator parameters and explain text annotation outputs."
             ])
 
-        instructions.append("Use the retrieved context below; if it is weak or missing, suggest next steps based on your knowledge.")
+        instructions.append("Use the retrieved context below for specifics; if it is weak or missing, answer basic portal-help questions directly and note when deployment-specific details may vary.")
         return instructions
