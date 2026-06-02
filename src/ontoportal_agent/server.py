@@ -182,6 +182,7 @@ class ChatStreamRequest(BaseModel):
     thread_title: Optional[str] = None
     mode: Optional[str] = None
     edit_runtime: Optional[str] = None
+    context: Optional[dict] = None
 
 
 class ProviderConfigIn(BaseModel):
@@ -2048,6 +2049,7 @@ def _stream_opencode_execution(
     resume_workspace: str | None = None,
     resume_session_id: str | None = None,
     runtime_name: str | None = None,
+    context: Optional[dict] = None,
 ) -> Iterator[str]:
     runtime = create_edit_runtime(
         runtime_name,
@@ -2063,6 +2065,7 @@ def _stream_opencode_execution(
             trace_id=trace_id,
             resume_workspace=resume_workspace,
             resume_session_id=resume_session_id,
+            context=context,
         )
     )
     while True:
@@ -2130,6 +2133,21 @@ def _opencode_failure_response(result: OpenCodeExecutionResult) -> str:
             f"in `{result.workspace}` for review."
         )
     return f"{_edit_runtime_label(result)} could not finish the ontology edit proposal."
+
+
+def _runtime_failure_status_code(result: OpenCodeExecutionResult) -> int:
+    try:
+        exit_code = int(getattr(result, "exit_code", 0) or 0)
+    except (TypeError, ValueError):
+        exit_code = 0
+    if exit_code in {400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504}:
+        return exit_code
+    if result.failure_kind == "provider_error":
+        text = "\n".join([str(result.final_text or ""), *[str(line or "") for line in result.console_lines]])
+        parsed = _error_status_code(Exception(text))
+        if parsed in {400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504}:
+            return int(parsed)
+    return 500
 
 
 def _contains_antigravity_verification_error(lines: list[str]) -> bool:
@@ -2323,6 +2341,7 @@ def _stream_opencode_ask_generation(
     runtime_options: AgentRuntimeOptions | None,
     retrieval_state: dict[str, Any],
     runtime_name: str | None = None,
+    context: Optional[dict] = None,
 ) -> Iterator[str]:
     provider_auth = _opencode_provider_auth_from_runtime_options(runtime_options)
     account_auth = _opencode_account_auth_from_runtime_options(runtime_options)
@@ -2331,8 +2350,9 @@ def _stream_opencode_ask_generation(
         thread_id=thread_id,
         trace_id=trace_id,
         task="ask",
-        retrieved_context=str(retrieval_state.get("rag_result") or ""),
+        retrieved_context=str(retrieval_state.get("rag_result") or "").strip(),
         citation_labels=tuple(str(label) for label in (retrieval_state.get("citation_labels") or [])),
+        context=context,
     )
     runtime = create_edit_runtime(
         runtime_name,
@@ -2433,6 +2453,7 @@ def _stream_agent_response(
     opencode_resume: dict[str, Any] | None = None,
     user_id: str | None = None,
     edit_runtime_name: str | None = None,
+    context: Optional[dict] = None,
 ) -> Iterator[str]:
     stream_context = dict(log_context or {})
     stream_context.setdefault("thread_id", thread_id)
@@ -2519,6 +2540,7 @@ def _stream_agent_response(
                         thread_id=thread_id,
                         trace_id=stream_context["trace_id"],
                         runtime_options=runtime_options,
+                        context=context,
                         **stream_kwargs,
                     )
                 finally:
@@ -2544,7 +2566,7 @@ def _stream_agent_response(
                         "status": f"{runtime_label} workspace failed.",
                         "message": final_response_text,
                         "error_class": f"{runtime_error_prefix}ProviderError" if provider_blocked else f"{runtime_error_prefix}ExecutionError",
-                        "status_code": 500,
+                        "status_code": _runtime_failure_status_code(opencode_result),
                     }
                     final_state["generation_usage"]["error"] = error_details
                     final_state["final_response"] = final_response_text
@@ -2603,6 +2625,7 @@ def _stream_agent_response(
                                 runtime_options=runtime_options,
                                 retrieval_state=final_state,
                                 runtime_name=ask_runtime_name or None,
+                                context=context,
                             )
                         finally:
                             _release_opencode_slot(stream_context["trace_id"])
@@ -3791,6 +3814,7 @@ def me_chat_stream(
             opencode_resume=opencode_resume,
             user_id=user_context.user_id,
             edit_runtime_name=payload.edit_runtime,
+            context=payload.context,
         ),
         media_type="text/event-stream",
         headers={
@@ -3827,6 +3851,7 @@ def chat_stream(
             agent_builder=lambda: _get_agent(),
             requested_mode=request.mode,
             edit_runtime_name=request.edit_runtime,
+            context=request.context,
             log_context={
                 "trace_id": uuid.uuid4().hex[:12],
                 "thread_id": request.thread_id,

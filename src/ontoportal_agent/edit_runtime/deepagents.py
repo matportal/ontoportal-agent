@@ -178,25 +178,21 @@ class DeepAgentsEditRuntime:
         citations = "\n".join(
             f"- {str(label).strip()}" for label in request.citation_labels if str(label or "").strip()
         )
-        prompt = "\n".join(
-            [
-                "You are answering a MatPortal assistant Ask request.",
-                "Answer fast. Do not deliberate at length. Do not use tools. Do not create files.",
-                "Use only the retrieved context below; if it is weak or missing, say what is missing.",
-                "Keep the answer concise, direct, and operator-facing.",
-                "",
-                "User question:",
-                request.prompt.strip(),
-                "",
-                "Retrieved context:",
-                str(request.retrieved_context or "").strip() or "(none)",
-                "",
-                "Citations:",
-                citations or "- none",
-                "",
-                "Return only the answer text.",
-            ]
-        )
+        instructions = self._contextual_ask_instructions(request.context)
+        prompt_parts = instructions + [
+            "",
+            "User question:",
+            request.prompt.strip(),
+            "",
+            "Retrieved context:",
+            str(request.retrieved_context or "").strip() or "(none)",
+            "",
+            "Citations:",
+            citations or "- none",
+            "",
+            "Return only the answer text.",
+        ]
+        prompt = "\n".join(prompt_parts)
         self._append_console_line(result, "Deep Agents fast Ask generation started.")
         yield {"type": "terminal_log", "content": {"line": result.console_lines[-1]}}
         reply = model.invoke([HumanMessage(content=prompt)])
@@ -596,3 +592,64 @@ class DeepAgentsEditRuntime:
         max_lines = max(1, int(self.settings.opencode_max_log_lines))
         if len(result.console_lines) > max_lines:
             del result.console_lines[: len(result.console_lines) - max_lines]
+
+    def _contextual_ask_instructions(self, context: dict[str, Any] | None) -> list[str]:
+        if not context:
+            return [
+                "You are answering a MatPortal assistant Ask request.",
+                "Answer fast. Do not deliberate at length. Do not use tools. Do not create files.",
+                "Use only the retrieved context below; if it is weak or missing, say what is missing.",
+                "Keep the answer concise, direct, and operator-facing."
+            ]
+
+        kind = str(context.get("page_kind") or "").strip().lower()
+        instructions = [
+            f"You are a specialized MatPortal assistant for page_kind={kind.upper()}.",
+            "Answer fast and direct. Do not deliberate. Do not create files unless explicitly requested."
+        ]
+
+        if kind == "search":
+            q = context.get("search_query")
+            instructions.extend([
+                "Your focus is Search helper.",
+                "Help the user refine their search, select appropriate ontologies, or recommend search terms.",
+                f"Active search context: query={q or '(none)'}."
+            ])
+        elif kind == "ontology":
+            acr = context.get("ontology_acronym")
+            name = context.get("ontology_name")
+            instructions.extend([
+                f"Your focus is the Ontology summary for: {name} ({acr}).",
+                "Answer questions about this ontology, its metadata, domain, metrics, or import structure."
+            ])
+        elif kind == "concept":
+            acr = context.get("ontology_acronym")
+            cid = context.get("concept_id")
+            clabel = context.get("concept_label")
+            instructions.extend([
+                f"Your focus is the Class details for: {clabel or cid} inside ontology {acr}.",
+                "Help explain this class, recommend parents/children, suggest definition improvements, or map synonyms."
+            ])
+        elif kind == "mappings":
+            instructions.extend([
+                "Your focus is Mappings helper.",
+                "Help the user define mappings, write mapping rationales, and verify equivalence relations."
+            ])
+        elif kind == "sparql":
+            instructions.extend([
+                "Your focus is SPARQL Query helper.",
+                "Write, debug, and explain SPARQL queries for the current ontology or triple store."
+            ])
+        elif kind == "recommender":
+            instructions.extend([
+                "Your focus is Recommender helper.",
+                "Suggest keywords or text structures that produce optimal recommender rankings."
+            ])
+        elif kind == "annotator":
+            instructions.extend([
+                "Your focus is Annotator helper.",
+                "Help configure annotator parameters and explain text annotation outputs."
+            ])
+
+        instructions.append("Use the retrieved context below; if it is weak or missing, suggest next steps based on your knowledge.")
+        return instructions

@@ -16,6 +16,7 @@ class EditRuntimeRequest:
     task: str = "edit"
     retrieved_context: str = ""
     citation_labels: tuple[str, ...] = field(default_factory=tuple)
+    context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
