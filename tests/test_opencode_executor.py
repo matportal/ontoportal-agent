@@ -690,6 +690,31 @@ def test_opencode_stream_rejects_edit_mode_noop(monkeypatch, tmp_path):
     assert result.validation_report["workflow"]["ontology_artifact"]["present"] is False
 
 
+def test_classify_execution_result_uses_runtime_label_for_deepagents(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    result = OpenCodeExecutionResult(
+        ok=False,
+        workspace=str(tmp_path / "workspace"),
+        run_id="run-deepagents-failed",
+        expires_at="2999-01-01T00:00:00+00:00",
+        runtime="deepagents",
+        exit_code=503,
+        validation_report={"ok": True, "status": "passed"},
+    )
+
+    executor._classify_execution_result(result=result, task="edit")
+
+    assert result.ok is False
+    assert result.failure_kind == "execution_error"
+    assert result.failure_reason == "Deep Agents exited with code 503."
+    assert result.validation_report["runtime"]["message"] == "Deep Agents exited with code 503."
+
+
 def test_opencode_stream_allows_ask_mode_without_artifacts(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")

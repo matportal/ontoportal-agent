@@ -81,6 +81,17 @@ _USER_PROVIDER_API_KEY_ENV = "MATPORTAL_OPENCODE_API_KEY"
 _OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible"
 _ONTOLOGY_TOOLKIT_DIR = "matportal-ontology-toolkit"
 _ANTIGRAVITY_AUTH_KIND = "gemini_antigravity"
+
+
+def _runtime_display_name(runtime: str | None) -> str:
+    normalized = str(runtime or "opencode").strip().lower()
+    if normalized == "deepagents":
+        return "Deep Agents"
+    if normalized == "pi":
+        return "Pi"
+    return "OpenCode"
+
+
 _OPENCODE_ENV_PASSTHROUGH = {
     "ALL_PROXY",
     "HTTPS_PROXY",
@@ -1343,18 +1354,19 @@ class OpenCodeExecutor:
 
         provider_failure = self._provider_failure_reason(result)
         task_kind = str(task or "edit").strip().lower()
+        runtime_label = _runtime_display_name(result.runtime)
         if result.blocked:
             result.failure_kind = "blocked"
-            result.failure_reason = str(result.blocked_reason or "OpenCode run was stopped by sandbox policy.").strip()
+            result.failure_reason = str(result.blocked_reason or f"{runtime_label} run was stopped by sandbox policy.").strip()
         elif result.timed_out:
             result.failure_kind = "timeout"
-            result.failure_reason = "OpenCode timed out before completing the workspace run."
+            result.failure_reason = f"{runtime_label} timed out before completing the workspace run."
         elif provider_failure:
             result.failure_kind = "provider_error"
             result.failure_reason = provider_failure
         elif result.exit_code != 0:
             result.failure_kind = "execution_error"
-            result.failure_reason = f"OpenCode exited with code {result.exit_code}."
+            result.failure_reason = f"{runtime_label} exited with code {result.exit_code}."
         elif task_kind == "edit" and not result.changed_files and not result.artifact_candidates:
             result.failure_kind = "no_changes"
             result.failure_reason = "Edit mode completed without producing changed files or downloadable artifacts."
@@ -1377,7 +1389,7 @@ class OpenCodeExecutor:
         return ""
 
     def _annotate_runtime_validation_failure(self, result: OpenCodeExecutionResult) -> None:
-        reason = str(result.failure_reason or "OpenCode runtime failed.").strip()
+        reason = str(result.failure_reason or f"{_runtime_display_name(result.runtime)} runtime failed.").strip()
         kind = str(result.failure_kind or "runtime_error").strip()
         report = dict(result.validation_report or {})
         errors = [item for item in (report.get("errors") or []) if isinstance(item, dict)]
