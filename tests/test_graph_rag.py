@@ -50,6 +50,7 @@ def test_rag_client_graph_query(mock_post):
     mock_post.assert_called_once_with(
         "http://mock-rag:8000/api/v1/graph-query",
         json={"query": "What is class X?", "top_k": 5, "ontology_id": "CHMO"},
+        headers={},
         timeout=60
     )
 
@@ -168,3 +169,39 @@ def test_retrieve_answer_node_falls_back_on_graph_query_failure(
 
     finally:
         settings.graph_rag_enabled = original_enabled
+
+
+@patch("ontoportal_agent.rag_client.requests.post")
+def test_rag_client_passes_api_key_header(mock_post):
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"answer": "Authenticated response", "sources": []}
+    mock_post.return_value = mock_response
+
+    # Test passing api_key in constructor explicitly
+    client = RagClient(base_url="http://mock-rag:8000", api_key="secret-token-key")
+    client.graph_query("test query")
+
+    mock_post.assert_called_with(
+        "http://mock-rag:8000/api/v1/graph-query",
+        json={"query": "test query"},
+        headers={"X-API-Key": "secret-token-key"},
+        timeout=60
+    )
+
+    # Test pulling api_key from settings
+    settings = get_settings()
+    original_key = settings.rag_api_key
+    settings.rag_api_key = "settings-token-key"
+    try:
+        client2 = RagClient(base_url="http://mock-rag:8000")
+        client2.query("test query")
+        
+        mock_post.assert_called_with(
+            "http://mock-rag:8000/api/v1/query",
+            json={"query": "test query"},
+            headers={"X-API-Key": "settings-token-key"},
+            timeout=60
+        )
+    finally:
+        settings.rag_api_key = original_key
+

@@ -25,17 +25,21 @@ class RagResult:
 class RagClient:
     """Simple HTTP client for the OntoPortal-RAG FastAPI service."""
 
-    def __init__(self, *, base_url: str | None = None, query_path: str | None = None):
+    def __init__(self, *, base_url: str | None = None, query_path: str | None = None, api_key: str | None = None):
         settings = get_settings()
         self.base_url = base_url or settings.rag_base_url
         self.query_path = query_path or settings.rag_query_path
+        self.api_key = api_key or settings.rag_api_key
 
     def query(self, question: str, *, top_k: int | None = None) -> RagResult:
         url = f"{self.base_url.rstrip('/')}{self.query_path}"
         payload: dict[str, Any] = {"query": question}
         if top_k is not None:
             payload["top_k"] = int(top_k)
-        response = requests.post(url, json=payload, timeout=60)
+        headers = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         payload = response.json()
         sources = [
@@ -62,7 +66,10 @@ class RagClient:
             payload["top_k"] = int(top_k)
         if ontology_id is not None:
             payload["ontology_id"] = ontology_id
-        response = requests.post(url, json=payload, timeout=60)
+        headers = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         payload = response.json()
         sources = []

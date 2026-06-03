@@ -33,6 +33,7 @@ def test_settings_defaults(tmp_path):
     assert settings.mcp_bot_password == "bot-secret"
     assert settings.mcp_rag_tool_name == "search_ontology_knowledge"
     assert settings.default_mcp_auth_mode == "basic_bot"
+    assert settings.rag_api_key is None
     assert settings.graph_rag_enabled is False
     assert settings.opencode_hybrid_ask_enabled is False
     assert settings.opencode_run_timeout_seconds == 900

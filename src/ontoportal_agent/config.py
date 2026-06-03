@@ -61,6 +61,10 @@ class AgentSettings(BaseSettings):
         default="/api/v1/query",
         validation_alias=AliasChoices("ONTOAGENT_RAG_QUERY_PATH", "RAG_QUERY_PATH"),
     )
+    rag_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ONTOAGENT_RAG_API_KEY", "RAG_API_KEY"),
+    )
     graph_rag_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("ONTOAGENT_GRAPH_RAG_ENABLED", "GRAPH_RAG_ENABLED"),
