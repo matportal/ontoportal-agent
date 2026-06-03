@@ -34,6 +34,9 @@ def test_rag_client_graph_query(mock_post):
                 "ontology_id": "CHMO",
                 "version": "2",
                 "content": "Graph facts about class",
+                "citation_text": "[Ontology Triple: CHMO]",
+                "kind": "ontology_triple",
+                "source_locator": "http://example.org/entity",
                 "metadata": {"type": "owl_class"}
             }
         ]
@@ -56,7 +59,10 @@ def test_rag_client_graph_query(mock_post):
     assert result.sources[0].ontology_id == "CHMO"
     assert result.sources[0].version == "2"
     assert result.sources[0].content == "Graph facts about class"
-    assert result.sources[0].metadata == {"type": "owl_class"}
+    assert result.sources[0].metadata["type"] == "owl_class"
+    assert result.sources[0].metadata["citation_text"] == "[Ontology Triple: CHMO]"
+    assert result.sources[0].metadata["kind"] == "ontology_triple"
+    assert result.sources[0].metadata["source_locator"] == "http://example.org/entity"
 
 
 # ==========================================

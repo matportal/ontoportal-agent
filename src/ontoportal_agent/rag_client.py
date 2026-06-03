@@ -65,13 +65,18 @@ class RagClient:
         response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()
         payload = response.json()
-        sources = [
-            RagChunk(
-                ontology_id=item.get("ontology_id", "unknown"),
-                version=item.get("version", "unknown"),
-                content=item.get("content", ""),
-                metadata=item.get("metadata", {}),
+        sources = []
+        for item in payload.get("sources", []):
+            metadata = dict(item.get("metadata", {}) or {})
+            for key in ("id", "kind", "source_locator", "citation_text", "entity_iri", "named_graph", "authority_level", "score"):
+                if key in item and item[key] is not None:
+                    metadata.setdefault(key, item[key])
+            sources.append(
+                RagChunk(
+                    ontology_id=item.get("ontology_id") or "unknown",
+                    version=item.get("version") or "unknown",
+                    content=item.get("content", ""),
+                    metadata=metadata,
+                )
             )
-            for item in payload.get("sources", [])
-        ]
         return RagResult(answer=payload.get("answer", ""), sources=sources)

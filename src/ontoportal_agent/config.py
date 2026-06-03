@@ -62,7 +62,7 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_RAG_QUERY_PATH", "RAG_QUERY_PATH"),
     )
     graph_rag_enabled: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("ONTOAGENT_GRAPH_RAG_ENABLED", "GRAPH_RAG_ENABLED"),
     )
 

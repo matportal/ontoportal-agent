@@ -16,7 +16,7 @@ from ..intent import classify_user_intent
 from ..mcp_client import McpClient, McpInvocationError
 from ..ontology_repository import OntologyRepository, OntologyArtifact
 from ..publishing import OntoPortalPublisher
-from ..rag_client import RagClient
+from ..rag_client import RagChunk, RagClient
 from ..sandbox import PythonSandbox
 from .options import AgentRuntimeOptions
 from .state import AgentState
@@ -212,6 +212,19 @@ def build_agent_graph(
 
     graph = StateGraph(AgentState)
 
+    def _format_citation(src: RagChunk) -> str:
+        metadata = src.metadata or {}
+        citation_text = metadata.get("citation_text")
+        if citation_text:
+            return str(citation_text)
+        kind = metadata.get("kind")
+        locator = metadata.get("source_locator") or metadata.get("entity_iri")
+        if kind and locator:
+            return f"{kind}: {locator}"
+        if src.ontology_id != "unknown" or src.version != "unknown":
+            return f"{src.ontology_id} v{src.version}"
+        return str(locator or "unknown source")
+
     def classify_intent(state: AgentState) -> AgentState:
         state["intent"] = classify_user_intent(state["user_input"], llm=llm)
         return state
@@ -224,7 +237,7 @@ def build_agent_graph(
                 try:
                     result = rag_client.graph_query(question, top_k=rag_top_k)
                     state["rag_result"] = result.answer
-                    state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+                    state["citations"] = [_format_citation(src) for src in result.sources]
                     state["retrieval_backend"] = "graphrag-http"
                     return state
                 except Exception as g_err:
@@ -234,7 +247,7 @@ def build_agent_graph(
             try:
                 result = rag_client.query(question, top_k=rag_top_k)
                 state["rag_result"] = result.answer
-                state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+                state["citations"] = [_format_citation(src) for src in result.sources]
                 state["retrieval_backend"] = "rag-http"
                 return state
             except Exception as err:  # noqa: BLE001 - we intentionally degrade to MCP or non-RAG response.
