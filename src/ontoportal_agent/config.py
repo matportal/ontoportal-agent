@@ -61,6 +61,10 @@ class AgentSettings(BaseSettings):
         default="/api/v1/query",
         validation_alias=AliasChoices("ONTOAGENT_RAG_QUERY_PATH", "RAG_QUERY_PATH"),
     )
+    graph_rag_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("ONTOAGENT_GRAPH_RAG_ENABLED", "GRAPH_RAG_ENABLED"),
+    )
 
     # OntoPortal REST API
     ontoportal_api_base: str = Field(

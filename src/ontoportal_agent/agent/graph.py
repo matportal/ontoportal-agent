@@ -220,6 +220,17 @@ def build_agent_graph(
         question = state["user_input"]
 
         if rag_base_url and rag_query_path:
+            if settings.graph_rag_enabled:
+                try:
+                    result = rag_client.graph_query(question, top_k=rag_top_k)
+                    state["rag_result"] = result.answer
+                    state["citations"] = [f"{src.ontology_id} v{src.version}" for src in result.sources]
+                    state["retrieval_backend"] = "graphrag-http"
+                    return state
+                except Exception as g_err:
+                    import logging
+                    logging.getLogger(__name__).warning("GraphRAG query failed, falling back to legacy RAG: %s", g_err)
+
             try:
                 result = rag_client.query(question, top_k=rag_top_k)
                 state["rag_result"] = result.answer
