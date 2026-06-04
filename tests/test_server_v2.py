@@ -1021,7 +1021,7 @@ def test_me_chat_stream_requires_user_account_configuration(monkeypatch, tmp_pat
     )
     assert response.status_code == 200
     assert "Assistant account configuration required." in response.text
-    assert "Before using the assistant, open Assistant Settings and configure an account." in response.text
+    assert "Before using the assistant, open [Assistant Settings](/account) and configure an account." in response.text
     assert "Classifying request..." not in response.text
     assert "[DONE]" in response.text
 
