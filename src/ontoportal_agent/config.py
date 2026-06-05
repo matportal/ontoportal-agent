@@ -400,7 +400,7 @@ class AgentSettings(BaseSettings):
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_EMBEDDINGS_PROVIDER", "DEFAULT_EMBEDDINGS_PROVIDER"),
     )
     default_embeddings_model: str = Field(
-        default="text-embedding-005",
+        default="gemini-embedding-001",
         validation_alias=AliasChoices("ONTOAGENT_DEFAULT_EMBEDDINGS_MODEL", "DEFAULT_EMBEDDINGS_MODEL"),
     )
     default_embeddings_base_url: Optional[str] = Field(

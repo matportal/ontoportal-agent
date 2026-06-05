@@ -92,7 +92,7 @@ def test_settings_crud_redacts_secrets(monkeypatch, tmp_path):
             },
             "embeddings": {
                 "provider": "openai_compatible",
-                "model": "text-embedding-005",
+                "model": "gemini-embedding-001",
                 "api_key": "user-embed-key",
                 "base_url": "https://example.test/openai",
             },
@@ -173,7 +173,7 @@ def test_settings_crud_preserves_basic_user_password(monkeypatch, tmp_path):
             },
             "embeddings": {
                 "provider": "openai_compatible",
-                "model": "text-embedding-005",
+                "model": "gemini-embedding-001",
                 "api_key": "",
                 "base_url": "https://example.test/openai",
             },
@@ -244,7 +244,7 @@ def test_switching_provider_does_not_preserve_previous_secret(monkeypatch, tmp_p
             },
             "embeddings": {
                 "provider": "openai_compatible",
-                "model": "text-embedding-005",
+                "model": "gemini-embedding-001",
                 "api_key": "",
                 "base_url": "https://example.test/openai",
             },
@@ -273,7 +273,7 @@ def test_switching_provider_does_not_preserve_previous_secret(monkeypatch, tmp_p
             },
             "embeddings": {
                 "provider": "openai_compatible",
-                "model": "text-embedding-005",
+                "model": "gemini-embedding-001",
                 "api_key": "",
                 "base_url": "https://example.test/openai",
             },
@@ -302,7 +302,7 @@ def test_switching_provider_does_not_preserve_previous_secret(monkeypatch, tmp_p
             },
             "embeddings": {
                 "provider": "openai_compatible",
-                "model": "text-embedding-005",
+                "model": "gemini-embedding-001",
                 "api_key": "",
                 "base_url": "https://example.test/openai",
             },
@@ -337,7 +337,7 @@ def test_gemini_api_settings_preserve_user_api_key(monkeypatch, tmp_path):
             },
             "embeddings": {
                 "provider": "openai_compatible",
-                "model": "text-embedding-005",
+                "model": "gemini-embedding-001",
                 "api_key": "",
                 "base_url": "https://example.test/openai",
             },
@@ -1746,7 +1746,7 @@ def test_default_settings_payload_uses_default_mcp_auth_mode(monkeypatch):
             default_generation_model="gemini-2.5-pro",
             default_generation_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
             default_embeddings_provider="openai_compatible",
-            default_embeddings_model="text-embedding-005",
+            default_embeddings_model="gemini-embedding-001",
             default_embeddings_base_url="",
             default_reranker_provider="cohere",
             default_reranker_model="rerank-v3.5",
@@ -1785,7 +1785,7 @@ def test_normalize_settings_payload_inherits_default_mcp_when_missing(monkeypatc
             default_generation_model="gemini-2.5-pro",
             default_generation_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
             default_embeddings_provider="openai_compatible",
-            default_embeddings_model="text-embedding-005",
+            default_embeddings_model="gemini-embedding-001",
             default_embeddings_base_url="",
             default_reranker_provider="cohere",
             default_reranker_model="rerank-v3.5",
