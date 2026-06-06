@@ -59,6 +59,8 @@ class RagClient:
         *,
         top_k: int | None = None,
         ontology_id: str | None = None,
+        strict_scope: bool | None = None,
+        allow_scope_expansion: bool | None = None,
     ) -> RagResult:
         url = f"{self.base_url.rstrip('/')}/api/v1/graph-query"
         payload: dict[str, Any] = {"query": question}
@@ -66,6 +68,10 @@ class RagClient:
             payload["top_k"] = int(top_k)
         if ontology_id is not None:
             payload["ontology_id"] = ontology_id
+        if strict_scope is not None:
+            payload["strict_scope"] = strict_scope
+        if allow_scope_expansion is not None:
+            payload["allow_scope_expansion"] = allow_scope_expansion
         headers = {}
         if self.api_key:
             headers["X-API-Key"] = self.api_key

@@ -52,6 +52,15 @@ class _RagQueryInput(BaseModel):
     top_k: int | None = Field(default=None, description="Optional number of chunks to retrieve")
 
 
+class _AgenticGraphRagInput(BaseModel):
+    query: str = Field(..., description="Ontology or materials-domain question to retrieve evidence for via agentic search")
+    top_k: int | None = Field(default=None, description="Optional number of chunks to retrieve per search attempt")
+    ontology_id: str | None = Field(default=None, description="Optional target ontology ID to restrict the search to")
+    strict_scope: bool = Field(default=True, description="Strictly limit search to target ontology if ontology_id is provided")
+    allow_scope_expansion: bool = Field(default=False, description="Allow query rewriting to look outside target ontology if initial search fails")
+    max_iterations: int = Field(default=3, description="Maximum iterations for rewriting and retrying unsatisfied queries")
+
+
 class _McpInvokeInput(BaseModel):
     tool_name: str = Field(..., description="Name of the configured MCP tool to invoke")
     arguments_json: str = Field(default="{}", description="JSON object string containing tool arguments")
@@ -469,6 +478,42 @@ class DeepAgentsEditRuntime:
             except Exception as exc:  # noqa: BLE001 - model needs unavailable evidence recorded, not a crash.
                 return {"answer": "", "sources": [], "error": str(exc)}
 
+        def agentic_graphrag_sufficient_evidence(
+            query: str,
+            top_k: int | None = None,
+            ontology_id: str | None = None,
+            strict_scope: bool = True,
+            allow_scope_expansion: bool = False,
+            max_iterations: int = 3,
+        ) -> dict[str, Any]:
+            options = self.runtime_options
+            base_url = str(getattr(options, "rag_base_url", "") or self.settings.rag_base_url or "")
+            query_path = str(getattr(options, "rag_query_path", "") or self.settings.rag_query_path or "")
+            try:
+                model = self.model or self._build_model()
+                client = RagClient(base_url=base_url, query_path=query_path)
+                from ..agentic_graphrag import run_agentic_graphrag
+                return run_agentic_graphrag(
+                    question=query,
+                    rag_client=client,
+                    llm=model,
+                    ontology_id=ontology_id,
+                    strict_scope=strict_scope,
+                    allow_scope_expansion=allow_scope_expansion,
+                    max_iterations=max_iterations,
+                    top_k=top_k,
+                )
+            except Exception as exc:  # noqa: BLE001 - model needs unavailable evidence recorded, not a crash.
+                return {
+                    "sufficient_context": False,
+                    "coverage": [],
+                    "gaps": [query],
+                    "attempts": [],
+                    "sources": [],
+                    "final_context": "",
+                    "error": str(exc),
+                }
+
         def invoke_mcp_tool(tool_name: str, arguments_json: str = "{}") -> dict[str, Any]:
             try:
                 arguments = json.loads(arguments_json or "{}")
@@ -505,6 +550,18 @@ class DeepAgentsEditRuntime:
                 args_schema=_RagQueryInput,
             ),
             StructuredTool.from_function(
+                func=agentic_graphrag_sufficient_evidence,
+                name="matportal_graphrag_sufficient_evidence",
+                description=(
+                    "Retrieve MatPortal ontology evidence using a bounded agentic GraphRAG loop. "
+                    "This tool decomposes the question into atomic needs, iteratively queries and rewrites them "
+                    "up to max_iterations. Preserves guardrails: no raw text-to-SPARQL is performed, no silent "
+                    "scope expansion occurs, all claims are tied to returned evidence source records, and unresolved "
+                    "needs are reported as explicit gaps."
+                ),
+                args_schema=_AgenticGraphRagInput,
+            ),
+            StructuredTool.from_function(
                 func=invoke_mcp_tool,
                 name="matportal_mcp_invoke",
                 description="Invoke a configured MatPortal MCP tool such as ontoportal_api for exact ontology/API evidence.",
@@ -539,7 +596,8 @@ class DeepAgentsEditRuntime:
                 "You are the MatPortal ontology edit runtime running inside LangChain Deep Agents.",
                 "You must prepare reviewable ontology edit artifacts, not publish live data.",
                 f"Workspace root: {workspace}",
-                "Use matportal_rag_query before drafting when semantic evidence is needed.",
+                "Use matportal_graphrag_sufficient_evidence for complex, multi-hop, or term reuse questions to perform a bounded agentic retrieval loop, and record its coverage/gaps in evidence-ledger.json.",
+                "Use matportal_rag_query before drafting when simpler semantic evidence is needed.",
                 "Use matportal_mcp_invoke for exact OntoPortal API/MCP evidence when configured, and record unavailability if it fails.",
                 "Write files only through matportal_write_artifact; do not rely on built-in filesystem scratch files for deliverables.",
                 "Required artifacts for edit tasks: edit-plan.json, evidence-ledger.json, operator-report.md, validation-summary.json, draft-submission.md, and at least one ontology artifact when a content change is requested.",

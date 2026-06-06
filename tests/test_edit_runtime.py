@@ -470,3 +470,53 @@ def test_deepagents_runtime_ask_uses_fast_direct_prompt(monkeypatch, tmp_path):
     assert "MATONTO covers materials ontology terminology." in prompt_text
     validation_event = next(event["content"] for event in events if event["type"] == "validation_report")
     assert validation_event.get("runtime", {}).get("status", "passed") == "passed"
+
+
+def test_deepagents_runtime_exposes_agentic_graphrag_tool(monkeypatch, tmp_path):
+    from unittest.mock import patch, MagicMock
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("ONTOAGENT_DEEPAGENTS_ENABLED", "true")
+    get_settings.cache_clear()
+
+    runtime = DeepAgentsEditRuntime(model=MagicMock())
+    tools = runtime._tools(workspace=tmp_path, result=MagicMock())
+
+    tool_map = {tool.name: tool for tool in tools}
+    assert "matportal_graphrag_sufficient_evidence" in tool_map
+
+    agentic_tool = tool_map["matportal_graphrag_sufficient_evidence"]
+    assert "Retrieve MatPortal ontology evidence using a bounded agentic GraphRAG loop" in agentic_tool.description
+    assert agentic_tool.args_schema is not None
+
+    # Mock run_agentic_graphrag to verify call propagation
+    mock_result = {
+        "sufficient_context": True,
+        "coverage": [],
+        "gaps": [],
+        "attempts": [],
+        "sources": [],
+        "final_context": "Mock agentic graphrag synthesis"
+    }
+
+    with patch("ontoportal_agent.agentic_graphrag.run_agentic_graphrag") as mock_run:
+        mock_run.return_value = mock_result
+        output = agentic_tool.invoke({
+            "query": "Is element X compatible with Y?",
+            "ontology_id": "CHMO",
+            "strict_scope": True,
+            "allow_scope_expansion": False,
+            "max_iterations": 2,
+            "top_k": 7,
+        })
+
+        assert output == mock_result
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        assert kwargs["question"] == "Is element X compatible with Y?"
+        assert kwargs["ontology_id"] == "CHMO"
+        assert kwargs["strict_scope"] is True
+        assert kwargs["allow_scope_expansion"] is False
+        assert kwargs["max_iterations"] == 2
+        assert kwargs["top_k"] == 7
