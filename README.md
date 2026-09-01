@@ -102,7 +102,10 @@ ONTOAGENT_RAG_QUERY_PATH=/api/v1/query
 ONTOAGENT_ONTOLOGY_WORKDIR=/tmp/ontoportal-agent
 ONTOAGENT_MCP_API_KEY=change-me
 ONTOAGENT_MCP_RAG_TOOL_NAME=rag_query
-ONTOAGENT_INTERNAL_API_TOKEN=change-me
+# Required before exposing /api/v1/me/* or either chat stream
+ONTOAGENT_INTERNAL_API_TOKEN=replace-me
+ONTOAGENT_USER_CONTEXT_SECRET=replace-me
+ONTOAGENT_ENCRYPTION_KEY_CURRENT=replace-with-a-valid-32-byte-key
 # Optional overrides
 ONTOAGENT_OPENAI_API_BASE=https://api.openai.com/v1
 ONTOAGENT_LLM_MODEL=gpt-4o-mini
@@ -126,7 +129,10 @@ python -m ontoportal_agent.server
 The endpoint used by the Rails assistant UI is:
 - `POST /api/v1/chat/stream` (Server-Sent Events response)
 
-When `ONTOAGENT_INTERNAL_API_TOKEN` is set, clients must send it as `X-Internal-Token`.
+Before exposing `/api/v1/me/*` or either chat stream, configure non-empty
+`ONTOAGENT_INTERNAL_API_TOKEN`, `ONTOAGENT_USER_CONTEXT_SECRET`, and a valid
+`ONTOAGENT_ENCRYPTION_KEY_CURRENT`. Clients must send the internal token as
+`X-Internal-Token`; `/api/v1/me/*` requests must also carry signed user-context headers.
 
 Sample session:
 ```

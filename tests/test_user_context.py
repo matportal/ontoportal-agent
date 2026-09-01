@@ -27,6 +27,20 @@ def test_verify_user_context_signature_ok():
     assert context.username == "alice"
 
 
+def test_verify_user_context_requires_signing_secret():
+    timestamp = str(int(time.time()))
+    headers = {
+        "X-Assistant-User-Id": "u-1",
+        "X-Assistant-Username": "alice",
+        "X-Assistant-User-Email": "alice@example.org",
+        "X-Assistant-User-Timestamp": timestamp,
+        "X-Assistant-User-Signature": "unsigned",
+    }
+
+    with pytest.raises(ValueError, match="signing secret"):
+        verify_user_context_headers(headers, secret=None, ttl_seconds=300)
+
+
 def test_verify_user_context_signature_expired():
     secret = "test-secret"
     timestamp = str(int(time.time()) - 3600)

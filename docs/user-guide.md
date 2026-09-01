@@ -34,7 +34,10 @@ Create `.env` alongside `pyproject.toml` and set the variables you need. Prefixe
 | `ONTOAGENT_MCP_ENDPOINTS` | `MCP_ENDPOINTS` | `<RAG_BASE_URL>/mcp` | Comma-separated list of MCP base URLs. |
 | `ONTOAGENT_MCP_API_KEY` | `MCP_API_KEY` | _(unset)_ | Optional shared API key sent as `X-API-Key` for protected MCP endpoints. |
 | `ONTOAGENT_MCP_RAG_TOOL_NAME` | `MCP_RAG_TOOL_NAME` | `rag_query` | MCP tool name used for retrieval before HTTP fallback. |
-| `ONTOAGENT_INTERNAL_API_TOKEN` | `INTERNAL_API_TOKEN` | _(unset)_ | Optional shared secret expected as `X-Internal-Token` by the streaming API. |
+| `ONTOAGENT_INTERNAL_API_TOKEN` | `INTERNAL_API_TOKEN` | _required for API/chat_ | Shared secret expected as `X-Internal-Token` by chat and admin cleanup. |
+| `ONTOAGENT_USER_CONTEXT_SECRET` | `USER_CONTEXT_SECRET` | _required for `/api/v1/me/*`_ | Secret used to verify signed user identity headers. |
+| `ONTOAGENT_ENCRYPTION_KEY_CURRENT` | `ENCRYPTION_KEY_CURRENT` | _required for API/chat_ | Current valid 32-byte key for persisted assistant settings. |
+| `ONTOAGENT_ENCRYPTION_KEY_PREVIOUS` | `ENCRYPTION_KEY_PREVIOUS` | _(unset)_ | Optional previous key during encryption-key rotation. |
 
 Example `.env`:
 
@@ -45,7 +48,9 @@ ONTOAGENT_RAG_BASE_URL=http://localhost:8000
 ONTOAGENT_REQUIRE_MANUAL_APPROVAL=true
 ONTOAGENT_MCP_ENDPOINTS=http://localhost:8000/mcp
 ONTOAGENT_MCP_API_KEY=change-me
-ONTOAGENT_INTERNAL_API_TOKEN=change-me
+ONTOAGENT_INTERNAL_API_TOKEN=replace-me
+ONTOAGENT_USER_CONTEXT_SECRET=replace-me
+ONTOAGENT_ENCRYPTION_KEY_CURRENT=replace-with-a-valid-32-byte-key
 ```
 
 ## Launch the Chat Interface
@@ -95,6 +100,8 @@ artifacts automatically after sandbox execution and publish-phase validation.
 - Each endpoint must expose `/tools` and `/invoke` in the same style as the `ontoportal-rag-mcp`
   implementation.
 - Set `ONTOAGENT_MCP_API_KEY` when MCP endpoints enforce key-based authentication.
+- Set `ONTOAGENT_INTERNAL_API_TOKEN`, `ONTOAGENT_USER_CONTEXT_SECRET`, and a valid
+  `ONTOAGENT_ENCRYPTION_KEY_CURRENT` before exposing `/api/v1/me/*` or either chat stream.
 - The agent lists available tools during plan generation. Leverage them in follow-up prompts or
   inside sandbox code to tap into downstream services.
 

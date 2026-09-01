@@ -1,6 +1,7 @@
 import importlib
 import json
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ if importlib.util.find_spec("ontoportal_agent") is None:
     pytest.skip("ontoportal_agent package not available", allow_module_level=True)
 
 from ontoportal_agent.config import get_settings
-from ontoportal_agent.opencode_executor import OpenCodeAccountAuth, OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
+from ontoportal_agent.opencode_executor import OpenCodeExecutionResult, OpenCodeExecutor, OpenCodeProviderAuth
 
 
 def test_prepare_workspace_writes_opencode_mcp_config(monkeypatch, tmp_path):
@@ -28,7 +29,8 @@ def test_prepare_workspace_writes_opencode_mcp_config(monkeypatch, tmp_path):
     server = config["mcp"]["ontoportal_api"]
     assert server["type"] == "remote"
     assert server["enabled"] is True
-    assert "api_key=test-ontoportal-key" in server["url"]
+    assert "api_key={env:MATPORTAL_MCP_API_KEY}" in server["url"]
+    assert "%7Benv%3AMATPORTAL_MCP_API_KEY%7D" not in server["url"]
     assert "base_url=https%3A%2F%2Fdata.dev.matportal.org" in server["url"]
     assert (workspace / ".git").exists()
     assert (workspace / "README.md").exists()
@@ -69,7 +71,34 @@ def test_prepare_workspace_writes_local_opencode_mcp_config(monkeypatch, tmp_pat
     assert "/venv/bin/python mcp_server.py" in server["command"][2]
     assert server["environment"]["MCP_TRANSPORT"] == "stdio"
     assert server["environment"]["ONTO_PORTAL_BASE_URL"] == "https://data.dev.matportal.org"
-    assert server["environment"]["ONTO_PORTAL_API_KEY"] == "test-ontoportal-key"
+    assert server["environment"]["ONTO_PORTAL_API_KEY"] == "{env:MATPORTAL_MCP_API_KEY}"
+
+
+def test_mcp_api_key_is_only_in_child_environment(monkeypatch, tmp_path):
+    marker = "synthetic-mcp-api-key-marker"
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", marker)
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    workspace = executor._prepare_workspace(thread_id="mcp-secret-marker")
+    workspace_files = [
+        path.read_text(encoding="utf-8")
+        for path in workspace.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    ]
+    committed_config = subprocess.check_output(
+        ["git", "show", "HEAD:opencode.json"],
+        cwd=workspace,
+        text=True,
+    )
+    env = executor._opencode_environment(workspace)
+
+    assert marker not in "\n".join(workspace_files)
+    assert marker not in committed_config
+    assert "{env:MATPORTAL_MCP_API_KEY}" in committed_config
+    assert env["MATPORTAL_MCP_API_KEY"] == marker
 
 
 def test_prepare_workspace_writes_user_provider_without_literal_secret(monkeypatch, tmp_path):
@@ -274,31 +303,6 @@ def test_execution_payload_does_not_include_provider_secret(monkeypatch, tmp_pat
     assert "user-gemini-secret" not in payload_text
 
 
-def test_opencode_account_auth_writes_isolated_auth_files(monkeypatch, tmp_path):
-    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "deployment-openai-key")
-    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "ontoportal-secret")
-    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
-    get_settings.cache_clear()
-
-    executor = OpenCodeExecutor(
-        account_auth=OpenCodeAccountAuth(
-            kind="gemini_antigravity",
-            opencode_auth_json='{"provider":"antigravity","token":"antigravity-token"}',
-            codex_auth_json='{"tokens":{"access_token":"codex-token"}}',
-        )
-    )
-    workspace = executor._prepare_workspace(thread_id="account-auth")
-    env = executor._opencode_environment(workspace)
-
-    opencode_auth = workspace / ".opencode-home" / ".local" / "share" / "opencode" / "auth.json"
-    codex_auth = workspace / ".codex-home" / "auth.json"
-    assert json.loads(opencode_auth.read_text(encoding="utf-8"))["token"] == "antigravity-token"
-    assert json.loads(codex_auth.read_text(encoding="utf-8"))["tokens"]["access_token"] == "codex-token"
-    assert env["CODEX_HOME"] == str(workspace / ".codex-home")
-    assert stat.S_IMODE(opencode_auth.stat().st_mode) == 0o600
-    assert stat.S_IMODE(codex_auth.stat().st_mode) == 0o600
-
-
 def test_opencode_environment_is_scoped_to_workspace(monkeypatch, tmp_path):
     monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
@@ -360,6 +364,49 @@ def test_opencode_stream_times_out_and_terminates_process_group(monkeypatch, tmp
     assert result.exit_code == -9
     assert any("timed out after 1 seconds" in str(event) for event in events)
     assert any((event.get("content") or {}).get("timed_out") is True for event in events)
+
+
+@pytest.mark.parametrize(
+    ("artifact", "expected_ok"),
+    [
+        (None, True),
+        ("@prefix ex: <https://example.org/> .\nex:Thing a ex:Class .\n", True),
+        ("not valid Turtle", False),
+    ],
+)
+def test_execution_success_requires_zero_exit_and_valid_artifacts(monkeypatch, tmp_path, artifact, expected_ok):
+    monkeypatch.setenv("ONTOAGENT_OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOPORTAL_API_KEY", "test-ontoportal-key")
+    monkeypatch.setenv("ONTOAGENT_ONTOLOGY_WORKDIR", str(tmp_path))
+    fake_opencode = tmp_path / "fake-opencode"
+    fake_opencode.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "from pathlib import Path",
+                f"artifact = {artifact!r}",
+                "if artifact is not None:",
+                "    Path('proposal.ttl').write_text(artifact, encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_opencode.chmod(0o755)
+    monkeypatch.setenv("ONTOAGENT_OPENCODE_PATH", str(fake_opencode))
+    get_settings.cache_clear()
+
+    executor = OpenCodeExecutor()
+    stream = executor.stream(prompt="Prepare an artifact", thread_id="thread-validation-result")
+    try:
+        while True:
+            next(stream)
+    except StopIteration as stop:
+        result = stop.value
+
+    assert result.exit_code == 0
+    assert result.validation_report["ok"] is expected_ok
+    assert result.ok is expected_ok
+    assert any("artifact validation failed" in line for line in result.console_lines) is not expected_ok
 
 
 def test_validation_report_checks_rdf_json_and_text_artifacts(monkeypatch, tmp_path):

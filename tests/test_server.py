@@ -11,19 +11,29 @@ from fastapi.testclient import TestClient
 from ontoportal_agent import server
 
 
-def test_chat_stream_requires_internal_token_when_configured(monkeypatch):
-    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace(internal_api_token="secret-token"))
+@pytest.mark.parametrize(
+    ("configured_token", "request_token"),
+    [("secret-token", None), ("secret-token", "wrong-token"), (None, "anything")],
+)
+def test_chat_stream_requires_configured_matching_internal_token(monkeypatch, configured_token, request_token):
+    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace(internal_api_token=configured_token))
     client = TestClient(server.app)
+    headers = {"X-Internal-Token": request_token} if request_token is not None else {}
 
     response = client.post(
         "/api/v1/chat/stream",
         json={"prompt": "What is aluminium?", "thread_id": "thread-1"},
+        headers=headers,
     )
     assert response.status_code == 403
 
 
 def test_chat_stream_emits_sse_payload(monkeypatch):
-    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace(internal_api_token=None))
+    monkeypatch.setattr(
+        server,
+        "get_settings",
+        lambda: SimpleNamespace(internal_api_token="secret-token", encryption_key_current="A" * 32, encryption_key_previous=None),
+    )
     dummy_state = {
         "generation_reasoning": "- Picked BWMD because it has explicit Aluminium classes.",
         "generation_usage": {
@@ -54,6 +64,7 @@ def test_chat_stream_emits_sse_payload(monkeypatch):
     response = client.post(
         "/api/v1/chat/stream",
         json={"prompt": "What is aluminium?", "thread_id": "thread-2"},
+        headers={"X-Internal-Token": "secret-token"},
     )
 
     assert response.status_code == 200

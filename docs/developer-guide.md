@@ -47,6 +47,14 @@ Key directories:
 - Register additional MCP endpoints to expose auxiliary tools (e.g. metadata enrichment, validation
   services) without modifying the agent code.
 
+## Authenticated API prerequisites
+
+Before exposing `/api/v1/me/*` or either chat stream, configure all three deployment secrets:
+`ONTOAGENT_INTERNAL_API_TOKEN`, `ONTOAGENT_USER_CONTEXT_SECRET`, and a valid
+`ONTOAGENT_ENCRYPTION_KEY_CURRENT`. The internal token is required as `X-Internal-Token` on
+both chat endpoints and the admin artifact cleanup endpoint. User-context requests are rejected
+unless their identity headers carry a valid signature made with `ONTOAGENT_USER_CONTEXT_SECRET`.
+
 ## Testing
 Install the test dependencies and run the suite:
 

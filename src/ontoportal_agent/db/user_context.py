@@ -35,11 +35,11 @@ def verify_user_context_headers(
     timestamp = (headers.get("X-Assistant-User-Timestamp") or headers.get("x-assistant-user-timestamp") or "").strip()
     signature = (headers.get("X-Assistant-User-Signature") or headers.get("x-assistant-user-signature") or "").strip()
 
+    if not secret or not str(secret).strip():
+        raise ValueError("Assistant user context signing secret is not configured.")
+
     if not user_id or not username or not email:
         raise ValueError("Missing assistant user context headers.")
-
-    if not secret:
-        return AssistantUserContext(user_id=user_id, username=username, email=email)
 
     if not timestamp or not signature:
         raise ValueError("Missing signed assistant user context headers.")
