@@ -40,10 +40,34 @@ class OntologyRepository:
         graph.parse(str(artifact.path), format=artifact.format)
         return graph
 
-    def save_graph(self, graph: Graph, workspace: Path, filename: str, format: str = "turtle") -> OntologyArtifact:
-        outfile = workspace / filename
-        graph.serialize(destination=str(outfile), format=format)
-        return OntologyArtifact(path=outfile, format="ttl" if format == "turtle" else format)
+    def save_graph(
+        self,
+        graph: Graph,
+        workspace: Path,
+        filename: str | Path | OntologyArtifact,
+        format: str = "turtle",
+    ) -> OntologyArtifact:
+        if isinstance(filename, OntologyArtifact):
+            outfile = filename.path
+            inferred_format = filename.format
+        elif isinstance(filename, Path):
+            outfile = filename if filename.is_absolute() else workspace / filename
+            inferred_format = outfile.suffix.lstrip(".")
+        else:
+            outfile = workspace / filename
+            inferred_format = Path(filename).suffix.lstrip(".")
+
+        resolved_format = format
+        if resolved_format == "turtle" and inferred_format in {"ttl", "rdf", "owl", "xml"}:
+            resolved_format = "turtle" if inferred_format == "ttl" else inferred_format
+
+        outfile.parent.mkdir(parents=True, exist_ok=True)
+        graph_format = "xml" if resolved_format == "rdf" else resolved_format
+        graph.serialize(destination=str(outfile), format=graph_format)
+        artifact_format = inferred_format or ("ttl" if graph_format == "turtle" else graph_format)
+        if artifact_format == "xml":
+            artifact_format = "rdf"
+        return OntologyArtifact(path=outfile, format=artifact_format)
 
     def list_artifacts(self, workspace: Path) -> Iterable[OntologyArtifact]:
         for file in workspace.iterdir():

@@ -198,6 +198,7 @@ def test_agent_creates_validates_and_submits_private_polymer_tensile_ontology(mo
     from ontoportal_agent import publishing as publishing_module
     from ontoportal_agent import ontology_repository as repository_module
     from ontoportal_agent import rag_client as rag_module
+    from ontoportal_agent.agent import runtime as runtime_module
     from ontoportal_agent.agent.runtime import OntoPortalAgent
 
     # Configure agent settings for automated publishing during the test.
@@ -214,6 +215,7 @@ def test_agent_creates_validates_and_submits_private_polymer_tensile_ontology(mo
     monkeypatch.setattr(publishing_module, "get_settings", lambda: settings, raising=False)
     monkeypatch.setattr(repository_module, "get_settings", lambda: settings, raising=False)
     monkeypatch.setattr(rag_module, "get_settings", lambda: settings, raising=False)
+    monkeypatch.setattr(runtime_module, "get_settings", lambda: settings, raising=False)
 
     # Stub external dependencies: LLM, RAG, ROBOT CLI, and MatPortal REST API.
     monkeypatch.setattr(graph_module, "ChatOpenAI", StubChatOpenAI, raising=False)

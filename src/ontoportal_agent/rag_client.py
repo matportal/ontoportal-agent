@@ -30,9 +30,12 @@ class RagClient:
         self.base_url = base_url or settings.rag_base_url
         self.query_path = query_path or settings.rag_query_path
 
-    def query(self, question: str) -> RagResult:
+    def query(self, question: str, *, top_k: int | None = None) -> RagResult:
         url = f"{self.base_url.rstrip('/')}{self.query_path}"
-        response = requests.post(url, json={"query": question}, timeout=60)
+        payload: dict[str, Any] = {"query": question}
+        if top_k is not None:
+            payload["top_k"] = int(top_k)
+        response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()
         payload = response.json()
         sources = [
